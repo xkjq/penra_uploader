@@ -98,6 +98,7 @@ async def read_nng_messages():
                                 ui.notify("Export done", color="positive")
                         global REFRESH_TRIGGERED
                         REFRESH_TRIGGERED = True
+                        await sub.asend(b"done")
                         logger.debug("loaded")
                     case _:
                         logger.error("invalid message")
@@ -669,6 +670,8 @@ def launch_app(
             logger.debug("Address in use")
             with pynng.Pair0(dial=SOCKET_PATH) as sub:
                 sub.send(b"loaded")
+                msg = sub.recv()
+                print(msg)
             sys.exit(0)
 
         app.on_startup(read_nng_messages)
