@@ -1,0 +1,16 @@
+.env/*
+.venv/*
+
+logs/*
+
+.pyc
+__pycache__/*
+
+build
+dist
+
+test/*
+
+*.build
+
+C:/* # Windows paths on linux

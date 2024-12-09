@@ -1,0 +1,12 @@
+typer
+wxpython
+pydicom
+dicognito
+python-datauri
+bs4
+requests
+nng
+blake3
+loguru
+dicom2jpg
+pyinstaller
