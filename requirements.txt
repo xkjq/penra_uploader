@@ -1,12 +1,13 @@
 typer
-wxpython
+#wxpython
 pydicom
 dicognito
 python-datauri
 bs4
 requests
-nng
+pynng
 blake3
 loguru
 dicom2jpg
 pyinstaller
+nicegui
