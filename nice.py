@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from PyInstaller.log import DEBUG
 import asyncio
 import pynng
 
@@ -6,14 +7,13 @@ import pynng
 from collections import defaultdict
 from pathlib import Path
 
-from bs4 import BeautifulSoup
-
 from nicegui import ui, app, html, run, Client, native
 
 from datetime import datetime
 
 from loguru import logger
 import sys
+import os
 
 from anonymiser import Anonymizer
 import pydicom
@@ -51,6 +51,7 @@ PROCESS_PATH.mkdir(exist_ok=True, parents=True)
 ANON_PATH.mkdir(exist_ok=True, parents=True)
 
 BASE_SITE_URL = "https://www.penracourses.org.uk"
+TOKEN_AUTH_PATH = "/api/atlas/create_api_token"  # POST {username,password} -> {token: '...'}
 PROD_BASE_SITE_URL = "https://www.penracourses.org.uk"
 
 LOGIN_URL = f"{BASE_SITE_URL}/accounts/login/"
@@ -59,15 +60,90 @@ LOGIN_SUCCESS = False
 
 LOGGED_IN_USER = "None"
 
-
 REFRESH_TRIGGERED = True
 SHUTDOWN = False
 
 DELETE_FILES_ON_UPLOAD = True
-
 DEBUG = False
-
 rqst = None
+API_TOKEN = None
+APP_NAME = "uploader_tool"
+
+try:
+    import keyring
+
+    KEYRING_AVAILABLE = True
+except Exception:
+    KEYRING_AVAILABLE = False
+
+
+def token_file_path() -> Path:
+    home = Path.home()
+    cfg = home / ".uploader"
+    cfg.mkdir(parents=True, exist_ok=True)
+    return cfg / "api_token"
+
+
+def save_api_token(token: str) -> None:
+    global API_TOKEN, rqst
+    API_TOKEN = token
+    if KEYRING_AVAILABLE:
+        try:
+            keyring.set_password(APP_NAME, "api_token", token)
+        except Exception:
+            pass
+    else:
+        try:
+            p = token_file_path()
+            p.write_text(token)
+            try:
+                os.chmod(p, 0o600)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    rqst = requests.session()
+    rqst.headers["Authorization"] = f"Bearer {token}"
+
+
+def load_api_token() -> str | None:
+    global API_TOKEN, rqst
+    if KEYRING_AVAILABLE:
+        try:
+            token = keyring.get_password(APP_NAME, "api_token")
+        except Exception:
+            token = None
+    else:
+        p = token_file_path()
+        token = p.read_text() if p.exists() else None
+
+    if token:
+        API_TOKEN = token
+        rqst = requests.session()
+        rqst.headers["Authorization"] = f"Bearer {token}"
+
+    return token
+
+
+def clear_api_token() -> None:
+    global API_TOKEN, rqst
+    API_TOKEN = None
+    if KEYRING_AVAILABLE:
+        try:
+            keyring.delete_password(APP_NAME, "api_token")
+        except Exception:
+            pass
+    else:
+        p = token_file_path()
+        try:
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+
+    if rqst:
+        rqst.headers.pop("Authorization", None)
 
 
 loaded_files: dict = {}
@@ -445,7 +521,10 @@ def upload_files(q, rqst, case_id=None):
     for n, files in enumerate(chunked_files):
 
         def upload_files_(files):
-            rqst.headers["X-CSRFToken"] = rqst.cookies.get("csrftoken", "")
+            # If we're using token auth, don't set CSRF header
+            if "Authorization" not in rqst.headers:
+                rqst.headers["X-CSRFToken"] = rqst.cookies.get("csrftoken", "")
+
             # choose endpoint based on whether a case_id was supplied
             if case_id:
                 endpoint = f"{BASE_SITE_URL}/api/atlas/upload_dicom_case/{case_id}"
@@ -512,65 +591,36 @@ def login() -> Optional[RedirectResponse]:
     def try_login() -> (
         None
     ):  # local function to avoid passing username and password as arguments
-        # Because I haven't gotten around to implementing a proper login system yet
-        # we just log in via requests and store teh session in the global rqst variable
+        # Token-based login: POST credentials to TOKEN_AUTH_PATH and save returned token
         user = username.value
         pw = password.value
 
         global rqst, LOGIN_SUCCESS, LOGGED_IN_USER
-        rqst = requests.session()
         try:
-            rsp = rqst.get(LOGIN_URL)
-        except requests.exceptions.ConnectionError:
+            resp = requests.post(f"{BASE_SITE_URL}{TOKEN_AUTH_PATH}", json={"username": user, "password": pw}, timeout=10)
+        except requests.exceptions.RequestException as e:
+            logger.debug(f"Token auth request failed: {e}")
             ui.notify("Connection error!", color="negative")
             return
 
-        token = (
-            BeautifulSoup(rsp.content, "html.parser").find("input").attrs["value"]
-        )  # , attr={"name": "csrfmiddlewaretoken"}).attrs("value")
-
-        # token = rsp.cookies["csrftoken"]
-        # header = {"X-CSRFToken": token}
-        # cookies = {"csrftoken": token}
-
-        data = {
-            "username": user,
-            "password": pw,
-            "csrfmiddlewaretoken": token,
-            "next": "/",
-        }
-
-        rqst.headers["Referer"] = LOGIN_URL
-
-        rsp = rqst.post(
-            LOGIN_URL,
-            data=data,
-            # headers=header,
-            # cookies=cookies
-        )
-
-        print(rsp.content)
-
-        soup = BeautifulSoup(rsp.content, "html.parser")
-
-        if soup.find("button") and soup.find("button").find(string="Login"):
-            print("login fail")
-            pass
+        if resp.status_code in (200, 201):
+            try:
+                data = resp.json()
+                token = data.get("token") or data.get("access_token")
+                if token:
+                    save_api_token(token)
+                    LOGIN_SUCCESS = True
+                    LOGGED_IN_USER = user
+                    user_info_ui.refresh()
+                    ui.notify("Logged in (token)!", color="positive")
+                    ui.navigate.to("/")
+                    return
+                else:
+                    logger.debug(f"Token endpoint returned no token: {data}")
+            except Exception as e:
+                logger.debug(f"Failed to parse token response: {e}")
         else:
-            print("login success")
-            LOGIN_SUCCESS = True
-            LOGGED_IN_USER = user
-            user_info_ui.refresh()
-            # user_label.clear()
-            # user_label.text = f"User: {user}"
-        # print(rqst.headers)
-
-        rqst.headers["X-CSRFToken"] = token
-
-        if LOGIN_SUCCESS:
-            ui.notify("Logged in!", color="positive")
-            ui.navigate.to("/")
-        else:
+            logger.debug(f"Token auth failed: {resp.status_code} {resp.text}")
             ui.notify("Wrong username or password", color="negative")
 
     # if app.storage.user.get('authenticated', False):
@@ -646,6 +696,7 @@ def main_page():
     upload_button.bind_visibility_from(globals(), "LOGIN_SUCCESS")
 
     def upload_into_case():
+        logger.debug("upload into case")
         if not rqst:
             ui.notify("Not logged in", color="negative")
             return
@@ -767,6 +818,28 @@ def main_page():
                 OPEN_LINKS_PROD = v.value
 
             open_prod_switch.on('click', set_open_prod)
+            # API token management
+            with ui.row():
+                token_input = ui.input("API token (paste here)")
+                def save_token_from_input():
+                    t = token_input.value
+                    if not t:
+                        ui.notify("No token provided", color="negative")
+                        return
+                    save_api_token(t)
+                    ui.notify("API token saved", color="positive")
+
+                def clear_token_from_input():
+                    token_input.value = ""
+                    clear_api_token()
+                    ui.notify("API token cleared", color="positive")
+
+                ui.button("Save token", on_click=save_token_from_input)
+                ui.button("Clear token", on_click=clear_token_from_input, color="secondary")
+                # populate input from stored token (first 8 chars shown)
+                existing = load_api_token()
+                if existing:
+                    token_input.value = existing[:8] + "..."
         ui.button("Clear anon path", on_click=clear_anonymized_files).tooltip(
             "Delete all files in ANON_PATH"
         )
@@ -821,8 +894,7 @@ def launch_app(
     # allow overriding DEBUG and switch to test endpoints/paths when requested
     DEBUG = debug
     if DEBUG:
-        BASE_SITE_URL = "http://localhost:8000"
-        BASE_SITE_URL = "https://www.penracourses.org.uk"
+        BASE_SITE_URL = "http://localhost:8080"
         EXPORT_PATH = Path("./test/export")
         PROCESS_PATH = Path("./test/to_process")
         ANON_PATH = Path("./test/anon")
