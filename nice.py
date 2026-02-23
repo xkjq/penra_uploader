@@ -620,11 +620,29 @@ def main_page():
 
     async def load_files_from_folder() -> None:
         folder = await local_folder_picker("~")
-        logger.error(folder)
+        logger.debug(folder)
         if folder is not None:
             ui.notify(f"Selected folder: {folder}")
-            await load_files_start(anon_progress, queue, folder, copy=True)
-            # return dir
+
+            # Prompt user whether to copy or move files
+            with ui.dialog() as copy_dialog:
+                with ui.card().classes("absolute-center"):
+                    ui.label("Load files from folder").classes("text-h6")
+                    ui.label(f"Folder: {folder}")
+                    copy_switch = ui.switch("Copy files instead of move", value=True)
+                    with ui.row():
+                        def do_load():
+                            # schedule the load with the chosen copy flag
+                            asyncio.create_task(
+                                load_files_start(anon_progress, queue, folder, copy=copy_switch.value)
+                            )
+                            copy_dialog.close()
+
+                        ui.button("Load", on_click=do_load)
+                        ui.button("Cancel", on_click=copy_dialog.close, color="secondary")
+
+            # show the dialog we just created
+            copy_dialog.open()
         else:
             ui.notify("No folder selected", color="negative")
 
@@ -718,15 +736,6 @@ def launch_app(
 
     global DEBUG, BASE_SITE_URL
 
-    # configure logging verbosity
-    logger.remove()
-    if verbose >= 2:
-        log_level = "DEBUG"
-    elif verbose == 1:
-        log_level = "INFO"
-    else:
-        log_level = "WARNING"
-    logger.add(sys.stderr, level=log_level)
 
     WORK_DIR = work_dir
     EXPORT_PATH = WORK_DIR / Path("export/")
@@ -740,6 +749,18 @@ def launch_app(
         EXPORT_PATH = Path("./test/export")
         PROCESS_PATH = Path("./test/to_process")
         ANON_PATH = Path("./test/anon")
+        verbose = 2  # force debug logging in debug mode
+
+    # configure logging verbosity
+    logger.remove()
+    if verbose >= 2:
+        log_level = "DEBUG"
+    elif verbose == 1:
+        log_level = "INFO"
+    else:
+        log_level = "WARNING"
+
+    logger.add(sys.stderr, level=log_level)
 
     # ensure paths exist
     EXPORT_PATH.mkdir(exist_ok=True, parents=True)
