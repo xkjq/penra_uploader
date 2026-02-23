@@ -642,34 +642,43 @@ def main_page():
         upload_progressbar = ui.linear_progress(value=0).props("instant-feedback")
     upload_progress.visible = False
 
-    # case selector and refresh button
-    with ui.row():
-        case_select = ui.select([], label="Case (optional)")
-        case_select.bind_visibility_from(globals(), "LOGIN_SUCCESS")
-        def refresh_cases():
-            logger.debug("Refreshing cases")
-            if not rqst:
-                ui.notify("Not logged in", color="negative")
-                return
-            try:
-                logger.debug(f"Requesting cases from {BASE_SITE_URL}/api/atlas/get_cases_user")
-                resp = rqst.get(f"{BASE_SITE_URL}/api/atlas/get_cases_user")
-                resp.raise_for_status()
-                data = resp.json()
-                logger.debug(f"Cases: {data}")
-                # Build options as list of (label, value) tuples and set the value
-                options = [(c["title"], c["id"]) for c in data]
-                case_select.options = options
-                if options:
-                    case_select.value = options[0][1]
-            except Exception as e:
-                logger.error(e)
-                ui.notify("Failed to load cases", color="negative")
-
-        ui.button("Refresh cases", on_click=refresh_cases).bind_visibility_from(globals(), "LOGIN_SUCCESS")
-
-    upload_button = ui.button("Upload", on_click=lambda: asyncio.create_task(upload_files_start(upload_progress, upload_queue, case_select.value)))
+    upload_button = ui.button("Upload", on_click=lambda: asyncio.create_task(upload_files_start(upload_progress, upload_queue)))
     upload_button.bind_visibility_from(globals(), "LOGIN_SUCCESS")
+
+    def upload_into_case():
+        if not rqst:
+            ui.notify("Not logged in", color="negative")
+            return
+        try:
+            resp = rqst.get(f"{BASE_SITE_URL}/api/atlas/get_cases_available")
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.error(e)
+            ui.notify("Failed to load cases", color="negative")
+            return
+
+        # build options showing id and title
+        options = [(f"{c['id']} - {c['title']}", c['id']) for c in data]
+
+        with ui.dialog() as case_dialog:
+            with ui.card().classes("absolute-center"):
+                ui.label("Upload into Case").classes("text-h6")
+                case_select_dialog = ui.select(options, label="Select case (searchable)")
+                with ui.row():
+                    def do_upload():
+                        if not case_select_dialog.value:
+                            ui.notify("No case selected", color="negative")
+                            return
+                        asyncio.create_task(upload_files_start(upload_progress, upload_queue, case_select_dialog.value))
+                        case_dialog.close()
+
+                    ui.button("Upload", on_click=do_upload)
+                    ui.button("Cancel", on_click=case_dialog.close, color="secondary")
+
+        case_dialog.open()
+
+    ui.button("Upload into Case", on_click=upload_into_case).bind_visibility_from(globals(), "LOGIN_SUCCESS")
 
     anon_progress = ui.row().classes("w-full place-content-center bg-blue-900")
 
