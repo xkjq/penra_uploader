@@ -67,15 +67,6 @@ DELETE_FILES_ON_UPLOAD = True
 
 DEBUG = False
 
-
-if DEBUG:
-    #BASE_SITE_URL = "http://localhost:8000"
-    BASE_SITE_URL = "https://www.penracourses.org.uk"
-    EXPORT_PATH = Path("./test/export")
-    PROCESS_PATH = Path("./test/to_process")
-    ANON_PATH = Path("./test/anon")
-    WORK_DIR = Path("./test/work")
-
 rqst = None
 
 
@@ -663,11 +654,14 @@ def main_page():
             try:
                 logger.debug(f"Requesting cases from {BASE_SITE_URL}/api/atlas/get_cases_user")
                 resp = rqst.get(f"{BASE_SITE_URL}/api/atlas/get_cases_user")
-                logger.debug(f"Response: {resp}")
                 resp.raise_for_status()
                 data = resp.json()
                 logger.debug(f"Cases: {data}")
-                case_select.options = [(c["title"], c["id"]) for c in data]
+                # Build options as list of (label, value) tuples and set the value
+                options = [(c["title"], c["id"]) for c in data]
+                case_select.options = options
+                if options:
+                    case_select.value = options[0][1]
             except Exception as e:
                 logger.error(e)
                 ui.notify("Failed to load cases", color="negative")
@@ -819,6 +813,7 @@ def launch_app(
     DEBUG = debug
     if DEBUG:
         BASE_SITE_URL = "http://localhost:8000"
+        BASE_SITE_URL = "https://www.penracourses.org.uk"
         EXPORT_PATH = Path("./test/export")
         PROCESS_PATH = Path("./test/to_process")
         ANON_PATH = Path("./test/anon")
