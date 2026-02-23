@@ -52,6 +52,7 @@ ANON_PATH.mkdir(exist_ok=True, parents=True)
 
 BASE_SITE_URL = "https://www.penracourses.org.uk"
 TOKEN_AUTH_PATH = "/api/atlas/create_api_token"  # POST {username,password} -> {token: '...'}
+TOKEN_CHECK_PATH = "/api/atlas/token_check"
 PROD_BASE_SITE_URL = "https://www.penracourses.org.uk"
 
 LOGIN_URL = f"{BASE_SITE_URL}/accounts/login/"
@@ -91,20 +92,33 @@ def save_api_token(token: str) -> None:
         try:
             keyring.set_password(APP_NAME, "api_token", token)
         except Exception:
-            pass
+            logger.error("Failed to save API token to keyring")
     else:
+        logger.warning("Keyring not available, saving API token to file (less secure)")
         try:
             p = token_file_path()
             p.write_text(token)
             try:
                 os.chmod(p, 0o600)
             except Exception:
+                logger.warning("Failed to set file permissions on API token file")
                 pass
         except Exception:
+            logger.error("Failed to save API token to file")
             pass
 
     rqst = requests.session()
     rqst.headers["Authorization"] = f"Bearer {token}"
+
+    # validate token and set login state
+    info = check_token()
+    global LOGIN_SUCCESS, LOGGED_IN_USER
+    if info and info.get("valid"):
+        LOGIN_SUCCESS = True
+        LOGGED_IN_USER = info.get("username") or "API token"
+    else:
+        LOGIN_SUCCESS = False
+        LOGGED_IN_USER = "None"
 
 
 def load_api_token() -> str | None:
@@ -123,7 +137,56 @@ def load_api_token() -> str | None:
         rqst = requests.session()
         rqst.headers["Authorization"] = f"Bearer {token}"
 
+        # validate token
+        info = check_token()
+        logger.debug(f"Token check info: {info}")
+        global LOGIN_SUCCESS, LOGGED_IN_USER
+        if info and info.get("valid"):
+            LOGIN_SUCCESS = True
+            LOGGED_IN_USER = info.get("username")
+        else:
+            logger.debug("Stored API token invalid on load")
+            # invalid token, clear
+            API_TOKEN = None
+            rqst = None
+            try:
+                clear_api_token()
+            except Exception:
+                logger.error("Failed to clear invalid API token")
+
     return token
+
+
+def check_token() -> dict | None:
+    """Call the token_check endpoint and return parsed JSON or None on error."""
+    global rqst
+    try:
+        # Prefer header auth if session exists
+        if rqst and "Authorization" in rqst.headers:
+            resp = rqst.post(f"{BASE_SITE_URL}{TOKEN_CHECK_PATH}")
+        else:
+            # try to read token from storage and POST as json
+            token = None
+            if KEYRING_AVAILABLE:
+                try:
+                    token = keyring.get_password(APP_NAME, "api_token")
+                except Exception:
+                    token = None
+            else:
+                p = token_file_path()
+                token = p.read_text() if p.exists() else None
+
+            if not token:
+                return None
+            resp = requests.post(f"{BASE_SITE_URL}{TOKEN_CHECK_PATH}", json={"token": token}, timeout=5)
+
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data
+    except Exception as e:
+        logger.debug(f"token_check failed: {e}")
+        return None
 
 
 def clear_api_token() -> None:
@@ -144,6 +207,9 @@ def clear_api_token() -> None:
 
     if rqst:
         rqst.headers.pop("Authorization", None)
+    global LOGIN_SUCCESS, LOGGED_IN_USER
+    LOGIN_SUCCESS = False
+    LOGGED_IN_USER = "None"
 
 
 loaded_files: dict = {}
@@ -894,6 +960,7 @@ def launch_app(
     # allow overriding DEBUG and switch to test endpoints/paths when requested
     DEBUG = debug
     if DEBUG:
+        WORK_DIR = Path("./test/work")
         BASE_SITE_URL = "http://localhost:8080"
         EXPORT_PATH = Path("./test/export")
         PROCESS_PATH = Path("./test/to_process")
@@ -917,6 +984,25 @@ def launch_app(
     ANON_PATH.mkdir(exist_ok=True, parents=True)
 
     logger.debug(f"Work dir: {WORK_DIR}")
+
+    # Try to load saved API token at startup
+    existing_token = load_api_token()
+    if existing_token:
+        logger.debug("Loaded API token from storage; validating...")
+        info = check_token()
+        if info and info.get("valid"):
+            LOGIN_SUCCESS = True
+            LOGGED_IN_USER = info.get("username") or "API token"
+            try:
+                user_info_ui.refresh()
+            except Exception:
+                pass
+        else:
+            logger.debug("Stored API token invalid; clearing")
+            try:
+                clear_api_token()
+            except Exception:
+                pass
 
     if nng:
         try:

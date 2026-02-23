@@ -11,3 +11,4 @@ loguru
 dicom2jpg
 pyinstaller
 nicegui
+keyring
