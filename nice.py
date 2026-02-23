@@ -166,7 +166,8 @@ async def upload_files_start(progress, upload_queue):
         ui.notify(f"Failed {len(failed)} files", color="negative")
 
     if DELETE_FILES_ON_UPLOAD:
-        clear_anonymized_files()
+        # clear only files that were part of the successful upload
+        clear_anonymized_files(upload_file_list)
 
     loaded_series_ui.refresh()
     loaded_files_ui.refresh()
@@ -369,12 +370,49 @@ def reload_anonymized(q: Queue):
     return loaded_files, loaded_series, loaded_series_data
 
 
-def clear_anonymized_files():
-    for file in ANON_PATH.iterdir():
-        if file.is_file():
-            file.unlink()
+def clear_anonymized_files(uploaded_file_list=None):
+    """Remove files from ANON_PATH.
 
-    logger.debug("Deleted all files in ANON_PATH")
+    If `uploaded_file_list` is provided (list of filenames or tuples where the
+    first element is the filename), only those files will be removed. If not
+    provided, all files in ANON_PATH are removed.
+    """
+    if uploaded_file_list:
+        # normalize names to remove: handle tuples like (filename, hash)
+        names = set()
+        for item in uploaded_file_list:
+            try:
+                if isinstance(item, (list, tuple)) and len(item) > 0:
+                    candidate = item[0]
+                else:
+                    candidate = item
+                candidate = str(candidate)
+                # take basename if a path was provided
+                names.add(Path(candidate).name)
+            except Exception:
+                continue
+
+        removed = 0
+        for file in ANON_PATH.iterdir():
+            if not file.is_file():
+                continue
+            if file.name in names or str(file) in names:
+                try:
+                    file.unlink()
+                    removed += 1
+                except Exception as e:
+                    logger.error(f"Failed to delete {file}: {e}")
+
+        logger.debug(f"Deleted {removed} files from ANON_PATH (of {len(names)} requested)")
+    else:
+        for file in ANON_PATH.iterdir():
+            if file.is_file():
+                try:
+                    file.unlink()
+                except Exception as e:
+                    logger.error(f"Failed to delete {file}: {e}")
+
+        logger.debug("Deleted all files in ANON_PATH")
 
     return
 
