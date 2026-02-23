@@ -17,6 +17,8 @@ import sys
 
 from anonymiser import Anonymizer
 import pydicom
+import subprocess
+import platform
 
 import requests
 import time
@@ -78,6 +80,19 @@ loaded_series = defaultdict(list)
 loaded_series_data = {}
 uploaded_files: dict = {}
 duplicate_series = set()
+
+
+def human_size(num, suffix="B"):
+    # Convert bytes to human-readable string (KiB, MiB, ...)
+    try:
+        n = float(num)
+    except Exception:
+        return "0 B"
+    for unit in ["","Ki","Mi","Gi","Ti","Pi"]:
+        if abs(n) < 1024.0:
+            return f"{n:3.1f} {unit}{suffix}"
+        n /= 1024.0
+    return f"{n:.1f} Pi{suffix}"
 
 
 async def read_nng_messages():
@@ -221,6 +236,15 @@ def loaded_series_ui() -> None:
                 ui.label(loaded_series_data[key][0])
                 ui.label(loaded_series_data[key][1])
                 ui.label(f"Images: {len(loaded_series[key])}")
+                # compute total size for the series
+                total = 0
+                for p in loaded_series[key]:
+                    try:
+                        total += Path(p).stat().st_size
+                    except Exception:
+                        # ignore missing files or non-path entries
+                        pass
+                ui.label(f"Size: {human_size(total)}")
 
     if loaded_series:
         series_title.visible = True
@@ -611,9 +635,32 @@ def main_page():
 
     with ui.expansion("Settings", icon="settings").classes("w-full"):
         ui.label("Settings").classes("text-h4")
-        ui.label(f"Export path: {EXPORT_PATH}")
-        ui.label(f"Process path: {PROCESS_PATH}")
-        ui.label(f"Anon path: {ANON_PATH}")
+        def open_path(path: Path):
+            try:
+                system = platform.system()
+                if system == "Windows":
+                    subprocess.Popen(["explorer", str(path)])
+                elif system == "Darwin":
+                    subprocess.Popen(["open", str(path)])
+                else:
+                    # assume linux
+                    subprocess.Popen(["xdg-open", str(path)])
+                ui.notify(f"Opened {path}", color="positive")
+            except Exception as e:
+                logger.error(e)
+                ui.notify(f"Failed to open {path}", color="negative")
+
+        with ui.row():
+            ui.label(f"Export path: {EXPORT_PATH}")
+            ui.button("Open", on_click=lambda: open_path(EXPORT_PATH))
+
+        with ui.row():
+            ui.label(f"Process path: {PROCESS_PATH}")
+            ui.button("Open", on_click=lambda: open_path(PROCESS_PATH))
+
+        with ui.row():
+            ui.label(f"Anon path: {ANON_PATH}")
+            ui.button("Open", on_click=lambda: open_path(ANON_PATH))
         ui.button("Clear anon path", on_click=clear_anonymized_files).tooltip(
             "Delete all files in ANON_PATH"
         )
@@ -652,13 +699,29 @@ def launch_app(
     work_dir: Path = typer.Option(WORK_DIR, help="Working directory"),
     nng: bool = typer.Option(True, help="Use nng"),
     native_mode: bool = typer.Option(False, help="Use native mode"),
+    debug: bool = typer.Option(False, help="Enable debug mode"),
 ):
     global WORK_DIR, EXPORT_PATH, PROCESS_PATH, ANON_PATH
+
+    global DEBUG, BASE_SITE_URL
 
     WORK_DIR = work_dir
     EXPORT_PATH = WORK_DIR / Path("export/")
     PROCESS_PATH = WORK_DIR / Path("to_process/")
     ANON_PATH = WORK_DIR / Path("anon/")
+
+    # allow overriding DEBUG and switch to test endpoints/paths when requested
+    DEBUG = debug
+    if DEBUG:
+        BASE_SITE_URL = "http://localhost:8000"
+        EXPORT_PATH = Path("./test/export")
+        PROCESS_PATH = Path("./test/to_process")
+        ANON_PATH = Path("./test/anon")
+
+    # ensure paths exist
+    EXPORT_PATH.mkdir(exist_ok=True, parents=True)
+    PROCESS_PATH.mkdir(exist_ok=True, parents=True)
+    ANON_PATH.mkdir(exist_ok=True, parents=True)
 
     logger.debug(f"Work dir: {WORK_DIR}")
 
