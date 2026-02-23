@@ -71,6 +71,7 @@ if DEBUG:
     EXPORT_PATH = Path("./test/export")
     PROCESS_PATH = Path("./test/to_process")
     ANON_PATH = Path("./test/anon")
+    WORK_DIR = Path("./test/work")
 
 rqst = None
 
