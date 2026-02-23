@@ -19,6 +19,7 @@ from anonymiser import Anonymizer
 import pydicom
 import subprocess
 import platform
+import shutil
 
 import requests
 import time
@@ -172,13 +173,13 @@ async def upload_files_start(progress, upload_queue):
     uploaded_files_ui.refresh()
 
 
-async def load_files_start(progress_bar, queue, custom_path=None):
+async def load_files_start(progress_bar, queue, custom_path=None, copy=False):
     logger.debug("load files start")
     global loaded_files, loaded_series, loaded_series_data
     progress_bar.visible = True
 
     new_loaded_files, new_loaded_series, new_loaded_series_data = await run.cpu_bound(
-        load_files, queue, custom_path
+        load_files, queue, custom_path, copy
     )
 
     for client in Client.instances.values():
@@ -277,7 +278,7 @@ def uploaded_files_ui() -> None:
                 ui.item(f"{file} - {data}")
 
 
-def load_files(q: Queue, src_path: Path | None = None):
+def load_files(q: Queue, src_path: Path | None = None, copy: bool = False):
     loaded_files: dict = {}
     loaded_series = defaultdict(list)
     loaded_series_data = {}
@@ -287,10 +288,20 @@ def load_files(q: Queue, src_path: Path | None = None):
 
     to_process = []
     for file in src_path.glob("**/*.dcm"):
-        logger.debug(f"Moving {file} to {PROCESS_PATH}")
+        if copy:
+            logger.debug(f"Copying {file} to {PROCESS_PATH}")
+        else:
+            logger.debug(f"Moving {file} to {PROCESS_PATH}")
 
         file_to_process = PROCESS_PATH / file.name
-        file.rename(file_to_process)
+        try:
+            if copy:
+                shutil.copy2(file, file_to_process)
+            else:
+                file.rename(file_to_process)
+        except Exception as e:
+            logger.error(f"Failed to copy/move {file}: {e}")
+            continue
 
         to_process.append(file_to_process)
 
@@ -612,7 +623,7 @@ def main_page():
         logger.error(folder)
         if folder is not None:
             ui.notify(f"Selected folder: {folder}")
-            await load_files_start(anon_progress, queue, folder)
+            await load_files_start(anon_progress, queue, folder, copy=True)
             # return dir
         else:
             ui.notify("No folder selected", color="negative")
