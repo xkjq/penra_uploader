@@ -51,6 +51,7 @@ PROCESS_PATH.mkdir(exist_ok=True, parents=True)
 ANON_PATH.mkdir(exist_ok=True, parents=True)
 
 BASE_SITE_URL = "https://www.penracourses.org.uk"
+PROD_BASE_SITE_URL = "https://www.penracourses.org.uk"
 
 LOGIN_URL = f"{BASE_SITE_URL}/accounts/login/"
 
@@ -82,6 +83,7 @@ loaded_series = defaultdict(list)
 loaded_series_data = {}
 uploaded_files: dict = {}
 duplicate_series = set()
+OPEN_LINKS_PROD = False
 
 
 def human_size(num, suffix="B"):
@@ -136,11 +138,12 @@ async def read_nng_messages():
 anonymizer = Anonymizer(ANON_PATH)
 
 
-async def upload_files_start(progress, upload_queue):
+async def upload_files_start(progress, upload_queue, case_id=None):
     global uploaded_files, duplicate_series
     progress.visible = True
 
-    results = await run.cpu_bound(upload_files, upload_queue, rqst)
+    # case_id: optional - if provided files will be uploaded into that case
+    results = await run.cpu_bound(upload_files, upload_queue, rqst, case_id)
     progress.visible = False
 
     if results:
@@ -271,12 +274,11 @@ def uploaded_files_ui() -> None:
         ui.label(f"Items: {len(uploaded_files)}")
         with ui.list():
             for series in duplicate_series:
-                ui.item(
-                    f"Duplicate series: {series}",
-                    on_click=lambda: ui.navigate.to(
-                        f"{BASE_SITE_URL}{series}", new_tab=True
-                    ),
-                ).classes("text-red-500")
+                def _open_series(s=series):
+                    base = PROD_BASE_SITE_URL if OPEN_LINKS_PROD else BASE_SITE_URL
+                    ui.navigate.to(f"{base}{s}", new_tab=True)
+
+                ui.item(f"Duplicate series: {series}", on_click=_open_series).classes("text-red-500")
         with ui.list():
             for file, data in uploaded_files.items():
                 ui.item(f"{file} - {data}")
@@ -420,7 +422,7 @@ def clear_anonymized_files(uploaded_file_list=None):
     return
 
 
-def upload_files(q, rqst):
+def upload_files(q, rqst, case_id=None):
     # global rqst#, uploaded_files
 
     uploaded_files = {}
@@ -451,15 +453,16 @@ def upload_files(q, rqst):
     for n, files in enumerate(chunked_files):
 
         def upload_files_(files):
-            rqst.headers["X-CSRFToken"] = rqst.cookies["csrftoken"]
-            # print(self.rqst.headers)
-            # print(self.rqst.cookies)
-            resp = rqst.post(
-                f"{BASE_SITE_URL}/api/atlas/upload_dicom",
-                # data=data,
-                files=files,
-            )
+            rqst.headers["X-CSRFToken"] = rqst.cookies.get("csrftoken", "")
+            # choose endpoint based on whether a case_id was supplied
+            if case_id:
+                endpoint = f"{BASE_SITE_URL}/api/atlas/upload_dicom_case/{case_id}"
+            else:
+                endpoint = f"{BASE_SITE_URL}/api/atlas/upload_dicom"
 
+            resp = rqst.post(endpoint, files=files)
+
+            logger.debug(f"Endpoint: {endpoint}")
             logger.debug(f"Resp: {resp}")
             logger.debug(f"{resp.content}")
             return resp
@@ -647,9 +650,25 @@ def main_page():
         upload_progressbar = ui.linear_progress(value=0).props("instant-feedback")
     upload_progress.visible = False
 
-    upload_button = ui.button(
-        "Upload", on_click=partial(upload_files_start, upload_progress, upload_queue)
-    )
+    # case selector and refresh button
+    with ui.row():
+        case_select = ui.select([], label="Case (optional)")
+        def refresh_cases():
+            if not rqst:
+                ui.notify("Not logged in", color="negative")
+                return
+            try:
+                resp = rqst.get(f"{BASE_SITE_URL}/api/atlas/get_cases_user")
+                resp.raise_for_status()
+                data = resp.json()
+                case_select.options = [(c["title"], c["id"]) for c in data]
+            except Exception as e:
+                logger.error(e)
+                ui.notify("Failed to load cases", color="negative")
+
+        ui.button("Refresh cases", on_click=refresh_cases).bind_visibility_from(globals(), "LOGIN_SUCCESS")
+
+    upload_button = ui.button("Upload", on_click=lambda: asyncio.create_task(upload_files_start(upload_progress, upload_queue, case_select.value)))
     upload_button.bind_visibility_from(globals(), "LOGIN_SUCCESS")
 
     anon_progress = ui.row().classes("w-full place-content-center bg-blue-900")
@@ -732,6 +751,13 @@ def main_page():
         with ui.row():
             ui.label(f"Anon path: {ANON_PATH}")
             ui.button("Open", on_click=lambda: open_path(ANON_PATH))
+        with ui.row():
+            open_prod_switch = ui.switch("Open external links on production site", value=False)
+            def set_open_prod(v=open_prod_switch):
+                global OPEN_LINKS_PROD
+                OPEN_LINKS_PROD = v.value
+
+            open_prod_switch.on('click', set_open_prod)
         ui.button("Clear anon path", on_click=clear_anonymized_files).tooltip(
             "Delete all files in ANON_PATH"
         )
