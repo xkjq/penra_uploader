@@ -700,10 +700,21 @@ def launch_app(
     nng: bool = typer.Option(True, help="Use nng"),
     native_mode: bool = typer.Option(False, help="Use native mode"),
     debug: bool = typer.Option(False, help="Enable debug mode"),
+    verbose: int = typer.Option(0, "--verbose", "-v", help="Verbosity level (0=warning,1=info,2=debug)"),
 ):
     global WORK_DIR, EXPORT_PATH, PROCESS_PATH, ANON_PATH
 
     global DEBUG, BASE_SITE_URL
+
+    # configure logging verbosity
+    logger.remove()
+    if verbose >= 2:
+        log_level = "DEBUG"
+    elif verbose == 1:
+        log_level = "INFO"
+    else:
+        log_level = "WARNING"
+    logger.add(sys.stderr, level=log_level)
 
     WORK_DIR = work_dir
     EXPORT_PATH = WORK_DIR / Path("export/")
