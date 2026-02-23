@@ -166,8 +166,11 @@ async def upload_files_start(progress, upload_queue):
         ui.notify(f"Failed {len(failed)} files", color="negative")
 
     if DELETE_FILES_ON_UPLOAD:
-        # clear only files that were part of the successful upload
-        clear_anonymized_files(upload_file_list)
+        # clear only files that were part of the successful upload or marked duplicate
+        files_to_clear = []
+        files_to_clear.extend(upload_file_list or [])
+        files_to_clear.extend(duplicate_file_list or [])
+        clear_anonymized_files(files_to_clear)
 
     loaded_series_ui.refresh()
     loaded_files_ui.refresh()
