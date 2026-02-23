@@ -69,7 +69,8 @@ DEBUG = False
 
 
 if DEBUG:
-    BASE_SITE_URL = "http://localhost:8000"
+    #BASE_SITE_URL = "http://localhost:8000"
+    BASE_SITE_URL = "https://www.penracourses.org.uk"
     EXPORT_PATH = Path("./test/export")
     PROCESS_PATH = Path("./test/to_process")
     ANON_PATH = Path("./test/anon")
@@ -653,14 +654,19 @@ def main_page():
     # case selector and refresh button
     with ui.row():
         case_select = ui.select([], label="Case (optional)")
+        case_select.bind_visibility_from(globals(), "LOGIN_SUCCESS")
         def refresh_cases():
+            logger.debug("Refreshing cases")
             if not rqst:
                 ui.notify("Not logged in", color="negative")
                 return
             try:
+                logger.debug(f"Requesting cases from {BASE_SITE_URL}/api/atlas/get_cases_user")
                 resp = rqst.get(f"{BASE_SITE_URL}/api/atlas/get_cases_user")
+                logger.debug(f"Response: {resp}")
                 resp.raise_for_status()
                 data = resp.json()
+                logger.debug(f"Cases: {data}")
                 case_select.options = [(c["title"], c["id"]) for c in data]
             except Exception as e:
                 logger.error(e)
