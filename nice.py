@@ -65,7 +65,6 @@ REFRESH_TRIGGERED = True
 SHUTDOWN = False
 
 DELETE_FILES_ON_UPLOAD = True
-DEBUG = False
 rqst = None
 API_TOKEN = None
 APP_NAME = "uploader_tool"
@@ -289,18 +288,26 @@ async def upload_files_start(progress, upload_queue, case_id=None):
             duplicate_series,
         ) = results
     else:
-        ui.notify("No files to upload", color="negative")
+        for client in Client.instances.values():
+            if not client.has_socket_connection:
+                continue
+            with client:
+                ui.notify("No files to upload", color="negative")
         return
 
     uploaded_files.update(new_uploaded_files)
 
-    ui.notify(f"Uploaded {len(upload_file_list)} files", color="positive")
+    for client in Client.instances.values():
+        if not client.has_socket_connection:
+            continue
+        with client:
+            ui.notify(f"Uploaded {len(upload_file_list)} files", color="positive")
 
-    if duplicate_file_list:
-        ui.notify(f"Duplicate {len(duplicate_file_list)} files", color="warning")
+            if duplicate_file_list:
+                ui.notify(f"Duplicate {len(duplicate_file_list)} files", color="warning")
 
-    if failed:
-        ui.notify(f"Failed {len(failed)} files", color="negative")
+            if failed:
+                ui.notify(f"Failed {len(failed)} files", color="negative")
 
     if DELETE_FILES_ON_UPLOAD:
         # clear only files that were part of the successful upload or marked duplicate
@@ -346,8 +353,11 @@ async def reload_anonymized_start(progress_bar, queue):
         reload_anonymized, queue
     )
     progress_bar.visible = False
-
-    ui.notify(f"Files reloaded: {len(loaded_files)}, [Series: {len(loaded_series)}] ", color="positive")
+    for client in Client.instances.values():
+        if not client.has_socket_connection:
+            continue
+        with client:
+            ui.notify(f"Files reloaded: {len(loaded_files)}, [Series: {len(loaded_series)}] ", color="positive")
     # load_series_view(loaded_series, loaded_series_data)
     loaded_series_ui.refresh()
     loaded_files_ui.refresh()
@@ -781,7 +791,7 @@ def main_page():
         with ui.dialog() as case_dialog:
             with ui.card().classes("absolute-center"):
                 ui.label("Upload into Case").classes("text-h6")
-                case_select_dialog = ui.select(options, label="Select case (searchable)")
+                case_select_dialog = ui.select(options, label="Select case (searchable)").classes("w-96")
                 with ui.row():
                     def do_upload():
                         if not case_select_dialog.value:
@@ -949,7 +959,7 @@ def launch_app(
 ):
     global WORK_DIR, EXPORT_PATH, PROCESS_PATH, ANON_PATH
 
-    global DEBUG, BASE_SITE_URL
+    global BASE_SITE_URL
 
 
     WORK_DIR = work_dir
@@ -958,8 +968,7 @@ def launch_app(
     ANON_PATH = WORK_DIR / Path("anon/")
 
     # allow overriding DEBUG and switch to test endpoints/paths when requested
-    DEBUG = debug
-    if DEBUG:
+    if debug:
         WORK_DIR = Path("./test/work")
         BASE_SITE_URL = "http://localhost:8080"
         EXPORT_PATH = Path("./test/export")
