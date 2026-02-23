@@ -268,7 +268,9 @@ async def read_nng_messages():
     # asyncio.create_task(read_nng_messages())
 
 
-anonymizer = Anonymizer(ANON_PATH)
+# anonymizer will be initialized at startup inside `launch_app` so debug
+# mode can override the paths before the object is created.
+anonymizer = None
 
 
 async def upload_files_start(progress, upload_queue, case_id=None):
@@ -785,8 +787,16 @@ def main_page():
             ui.notify("Failed to load cases", color="negative")
             return
 
-        # build options showing id and title
-        options = [(f"{c['id']} - {c['title']}", c['id']) for c in data]
+        # build options showing id and title and a mapping from label->id
+        case_options_map = {}
+        options = []
+        for c in data:
+            label = f"{c['id']} - {c['title']}"
+            try:
+                case_options_map[label] = int(c["id"])
+            except Exception:
+                case_options_map[label] = c["id"]
+            options.append(label)
 
         with ui.dialog() as case_dialog:
             with ui.card().classes("absolute-center"):
@@ -794,10 +804,27 @@ def main_page():
                 case_select_dialog = ui.select(options, label="Select case (searchable)").classes("w-96")
                 with ui.row():
                     def do_upload():
-                        if not case_select_dialog.value:
+                        raw = case_select_dialog.value
+                        if not raw:
                             ui.notify("No case selected", color="negative")
                             return
-                        asyncio.create_task(upload_files_start(upload_progress, upload_queue, case_select_dialog.value))
+
+                        # Prefer a direct integer selection; otherwise map label->id
+                        case_id_val = None
+                        if isinstance(raw, int):
+                            case_id_val = raw
+                        else:
+                            case_id_val = case_options_map.get(str(raw))
+
+                        # final fallback: try to parse an integer from the selection
+                        if case_id_val is None:
+                            try:
+                                case_id_val = int(str(raw).split("-", 1)[0].strip())
+                            except Exception:
+                                ui.notify("Invalid case selection", color="negative")
+                                return
+
+                        asyncio.create_task(upload_files_start(upload_progress, upload_queue, case_id_val))
                         case_dialog.close()
 
                     ui.button("Upload", on_click=do_upload)
@@ -991,6 +1018,13 @@ def launch_app(
     EXPORT_PATH.mkdir(exist_ok=True, parents=True)
     PROCESS_PATH.mkdir(exist_ok=True, parents=True)
     ANON_PATH.mkdir(exist_ok=True, parents=True)
+
+    # initialize anonymizer now that ANON_PATH is final
+    global anonymizer
+    try:
+        anonymizer = Anonymizer(ANON_PATH)
+    except Exception as e:
+        logger.error(f"Failed to initialize Anonymizer: {e}")
 
     logger.debug(f"Work dir: {WORK_DIR}")
 
