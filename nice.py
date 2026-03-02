@@ -23,6 +23,7 @@ import shutil
 
 import requests
 import time
+import blake3
 
 from multiprocessing import Manager, Queue, freeze_support
 
@@ -53,6 +54,7 @@ ANON_PATH.mkdir(exist_ok=True, parents=True)
 BASE_SITE_URL = "https://www.penracourses.org.uk"
 TOKEN_AUTH_PATH = "/api/atlas/create_api_token"  # POST {username,password} -> {token: '...'}
 TOKEN_CHECK_PATH = "/api/atlas/token_check"
+HASH_CHECK_PATH = "/api/atlas/check_image_hashes/"
 PROD_BASE_SITE_URL = "https://www.penracourses.org.uk"
 
 LOGIN_URL = f"{BASE_SITE_URL}/accounts/login/"
@@ -214,6 +216,8 @@ def clear_api_token() -> None:
 loaded_files: dict = {}
 loaded_series = defaultdict(list)
 loaded_series_data = {}
+loaded_duplicate_series = set()
+loaded_duplicate_series_links = defaultdict(set)
 uploaded_files: dict = {}
 duplicate_series = set()
 OPEN_LINKS_PROD = False
@@ -407,11 +411,17 @@ async def upload_files_start(progress, upload_queue, case_id=None):
 
 async def load_files_start(progress_bar, queue, custom_path=None, copy=False):
     logger.debug("load files start")
-    global loaded_files, loaded_series, loaded_series_data
+    global loaded_files, loaded_series, loaded_series_data, loaded_duplicate_series, loaded_duplicate_series_links
     progress_bar.visible = True
 
-    new_loaded_files, new_loaded_series, new_loaded_series_data = await run.cpu_bound(
-        load_files, queue, custom_path, copy
+    (
+        new_loaded_files,
+        new_loaded_series,
+        new_loaded_series_data,
+        new_loaded_duplicate_series,
+        new_loaded_duplicate_series_links,
+    ) = await run.cpu_bound(
+        load_files, queue, custom_path, copy, rqst
     )
 
     for client in Client.instances.values():
@@ -423,6 +433,9 @@ async def load_files_start(progress_bar, queue, custom_path=None, copy=False):
     loaded_files.update(new_loaded_files)
     loaded_series.update(new_loaded_series)
     loaded_series_data.update(new_loaded_series_data)
+    loaded_duplicate_series.update(new_loaded_duplicate_series)
+    for series_uid, links in new_loaded_duplicate_series_links.items():
+        loaded_duplicate_series_links[series_uid].update(links)
 
     progress_bar.visible = False
     # load_series_view(loaded_series, loaded_series_data)
@@ -431,11 +444,13 @@ async def load_files_start(progress_bar, queue, custom_path=None, copy=False):
 
 
 async def reload_anonymized_start(progress_bar, queue):
-    global loaded_files, loaded_series, loaded_series_data
+    global loaded_files, loaded_series, loaded_series_data, loaded_duplicate_series, loaded_duplicate_series_links
     progress_bar.visible = True
     loaded_files, loaded_series, loaded_series_data = await run.cpu_bound(
         reload_anonymized, queue
     )
+    loaded_duplicate_series = set()
+    loaded_duplicate_series_links = defaultdict(set)
     progress_bar.visible = False
     for client in Client.instances.values():
         if not client.has_socket_connection:
@@ -456,7 +471,7 @@ def user_info_ui():
 
 @ui.refreshable
 def loaded_series_ui() -> None:
-    global loaded_series, loaded_series_data
+    global loaded_series, loaded_series_data, loaded_duplicate_series, loaded_duplicate_series_links
 
     series_title = ui.label("Series to upload").classes("text-h3")
     series_title.visible = False
@@ -472,6 +487,16 @@ def loaded_series_ui() -> None:
             with ui.card():
                 ui.label(loaded_series_data[key][0])
                 ui.label(loaded_series_data[key][1])
+                if key in loaded_duplicate_series:
+                    ui.label("Duplicate detected on server").classes("text-red-500")
+                    series_links = loaded_duplicate_series_links.get(key, set())
+                    if series_links:
+                        base = PROD_BASE_SITE_URL if OPEN_LINKS_PROD else BASE_SITE_URL
+                        for link in sorted(series_links):
+                            series_link = link if str(link).startswith("http") else f"{base}{link}"
+                            ui.link(f"Open duplicate series: {link}", series_link, new_tab=True).classes("text-red-500")
+                    else:
+                        ui.label("Series link not available yet (pending import)").classes("text-orange-500")
                 ui.label(f"Images: {len(loaded_series[key])}")
                 # compute total size for the series
                 total = 0
@@ -501,16 +526,21 @@ def uploaded_files_ui() -> None:
         with ui.list():
             for series in duplicate_series:
                 base = PROD_BASE_SITE_URL if OPEN_LINKS_PROD else BASE_SITE_URL
-                ui.link(f"Duplicate series: {series}", f"{base}{series}", new_tab=True).classes("text-red-500 block")
+                series_link = series if str(series).startswith("http") else f"{base}{series}"
+                ui.link(f"Duplicate series: {series}", series_link, new_tab=True).classes("text-red-500 block")
         with ui.list():
             for file, data in uploaded_files.items():
                 ui.item(f"{file} - {data}")
 
 
-def load_files(q: Queue, src_path: Path | None = None, copy: bool = False):
+def load_files(q: Queue, src_path: Path | None = None, copy: bool = False, rqst=None):
     loaded_files: dict = {}
     loaded_series = defaultdict(list)
     loaded_series_data = {}
+    loaded_duplicate_series = set()
+    loaded_duplicate_series_links = defaultdict(set)
+    output_file_hashes = {}
+    output_file_series = {}
     # Move files
     if src_path is None:
         src_path = EXPORT_PATH
@@ -551,12 +581,67 @@ def load_files(q: Queue, src_path: Path | None = None, copy: bool = False):
             dataset.StudyDescription,
             dataset.SeriesDescription,
         )
+        output_file_series[output_file] = dataset.SeriesInstanceUID
+
+        try:
+            with pydicom.dcmread(str(output_file), force=True) as hashed_dataset:
+                if "PixelData" in hashed_dataset and hashed_dataset.PixelData:
+                    hash_payload = hashed_dataset.PixelData
+                else:
+                    hash_payload = Path(output_file).read_bytes()
+            output_file_hashes[output_file] = blake3.blake3(hash_payload).hexdigest()
+        except Exception:
+            try:
+                output_file_hashes[output_file] = blake3.blake3(Path(output_file).read_bytes()).hexdigest()
+            except Exception as e:
+                logger.warning(f"Hashing failed for {output_file}: {e}")
 
         q.put_nowait((n + 1) / to_process_len)
 
         # time.sleep(0.01)
 
-    return loaded_files, loaded_series, loaded_series_data
+    if rqst and output_file_hashes:
+        try:
+            if "Authorization" not in rqst.headers:
+                rqst.headers["X-CSRFToken"] = rqst.cookies.get("csrftoken", "")
+
+            hash_payload = list(set(output_file_hashes.values()))
+            resp = rqst.post(f"{BASE_SITE_URL}{HASH_CHECK_PATH}", json=hash_payload)
+            if resp.status_code in (400, 422):
+                resp = rqst.post(f"{BASE_SITE_URL}{HASH_CHECK_PATH}", json={"hashes": hash_payload})
+
+            if resp.status_code == 200:
+                hash_status = resp.json()
+                if isinstance(hash_status, dict):
+                    for output_file, file_hash in output_file_hashes.items():
+                        hash_info = hash_status.get(file_hash)
+                        if not isinstance(hash_info, dict):
+                            continue
+                        if not hash_info.get("id"):
+                            continue
+
+                        series_uid = output_file_series.get(output_file)
+                        if not series_uid:
+                            continue
+
+                        loaded_duplicate_series.add(series_uid)
+                        hash_url = hash_info.get("url")
+                        if hash_url:
+                            loaded_duplicate_series_links[series_uid].add(hash_url)
+
+                    logger.debug(
+                        f"Load hash check summary: checked={len(output_file_hashes)}, duplicate_series={len(loaded_duplicate_series)}"
+                    )
+        except Exception as e:
+            logger.warning(f"Load-time hash check failed: {e}")
+
+    return (
+        loaded_files,
+        loaded_series,
+        loaded_series_data,
+        loaded_duplicate_series,
+        loaded_duplicate_series_links,
+    )
 
 
 def reload_anonymized(q: Queue):
@@ -650,12 +735,90 @@ def upload_files(q, rqst, case_id=None):
 
     uploaded_files = {}
 
-    files_to_upload = []
-    for file in ANON_PATH.iterdir():
-        files_to_upload.append(("files", open(str(file), "rb")))
-
-    if not files_to_upload:
+    files_in_anon = [file for file in ANON_PATH.iterdir() if file.is_file()]
+    if not files_in_anon:
         return None
+
+    def calculate_dicom_image_hash(file_path: Path) -> str | None:
+        try:
+            dataset = pydicom.dcmread(str(file_path), force=True)
+            if "PixelData" in dataset and dataset.PixelData:
+                payload = dataset.PixelData
+            else:
+                payload = file_path.read_bytes()
+            return blake3.blake3(payload).hexdigest()
+        except Exception:
+            try:
+                return blake3.blake3(file_path.read_bytes()).hexdigest()
+            except Exception as e:
+                logger.error(f"Failed to hash {file_path}: {e}")
+                return None
+
+    def precheck_duplicate_hashes(file_paths: list[Path]):
+        hash_to_paths = defaultdict(list)
+        path_to_hash = {}
+
+        for file_path in file_paths:
+            file_hash = calculate_dicom_image_hash(file_path)
+            if not file_hash:
+                continue
+            path_to_hash[file_path] = file_hash
+            hash_to_paths[file_hash].append(file_path)
+
+        if not hash_to_paths:
+            return file_paths, [], set()
+
+        try:
+            if "Authorization" not in rqst.headers:
+                rqst.headers["X-CSRFToken"] = rqst.cookies.get("csrftoken", "")
+
+            hash_payload = list(hash_to_paths.keys())
+            resp = rqst.post(f"{BASE_SITE_URL}{HASH_CHECK_PATH}", json=hash_payload)
+            if resp.status_code in (400, 422):
+                resp = rqst.post(f"{BASE_SITE_URL}{HASH_CHECK_PATH}", json={"hashes": hash_payload})
+            if resp.status_code != 200:
+                logger.warning(f"Pre-upload hash check failed: {resp.status_code}")
+                return file_paths, [], set()
+
+            status = resp.json()
+            duplicate_hashes = set()
+            pre_duplicate_files = []
+            pre_duplicate_series = set()
+
+            if isinstance(status, dict):
+                for hash_value, hash_info in status.items():
+                    if not isinstance(hash_info, dict):
+                        continue
+                    if not hash_info.get("id"):
+                        continue
+
+                    duplicate_hashes.add(hash_value)
+                    hash_url = hash_info.get("url")
+                    if hash_url:
+                        pre_duplicate_series.add(hash_url)
+
+                    for duplicate_path in hash_to_paths.get(hash_value, []):
+                        pre_duplicate_files.append((duplicate_path.name, hash_value))
+
+            files_after_precheck = [
+                file_path
+                for file_path in file_paths
+                if path_to_hash.get(file_path) not in duplicate_hashes
+            ]
+
+            logger.debug(
+                f"Pre-upload hash check summary: checked={len(hash_to_paths)}, pre_duplicates={len(pre_duplicate_files)}, remaining={len(files_after_precheck)}"
+            )
+            return files_after_precheck, pre_duplicate_files, pre_duplicate_series
+        except Exception as e:
+            logger.warning(f"Pre-upload hash check error: {e}")
+            return file_paths, [], set()
+
+    files_after_precheck, pre_duplicate_file_list, pre_duplicate_series = precheck_duplicate_hashes(files_in_anon)
+
+    files_to_upload = []
+    for file in files_after_precheck:
+        files_to_upload.append(("files", open(str(file), "rb")))
 
     # chunck files
     n = 10
@@ -664,12 +827,25 @@ def upload_files(q, rqst, case_id=None):
     ]
 
     upload_file_list = []
-    duplicate_file_list = []
+    duplicate_file_list = list(pre_duplicate_file_list)
     failed = []
-    duplicate_series = set()
+    duplicate_series = set(pre_duplicate_series)
 
     logger.debug("START UPLOAD")
-    logger.debug(files_to_upload)
+    logger.debug(f"Files queued for upload after pre-check: {len(files_to_upload)}")
+
+    if not files_to_upload:
+        logger.debug("All files were identified as duplicates by pre-upload hash check")
+        for f, hash in duplicate_file_list:
+            uploaded_files[f] = "duplicate"
+
+        return (
+            uploaded_files,
+            upload_file_list,
+            duplicate_file_list,
+            failed,
+            duplicate_series,
+        )
 
     to_process_len = len(chunked_files)
 
