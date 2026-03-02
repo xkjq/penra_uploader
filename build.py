@@ -1,6 +1,7 @@
 import shutil
 from pathlib import Path
 import importlib.util
+from datetime import datetime
 import PyInstaller.__main__
 import typer
 from rich import print
