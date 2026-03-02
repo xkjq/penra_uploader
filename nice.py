@@ -1139,10 +1139,38 @@ def main_page():
 
         case_dialog.open()
 
+    def clear_queue():
+        global loaded_files, loaded_series, loaded_series_data
+        global loaded_duplicate_series, loaded_duplicate_series_links
+
+        clear_anonymized_files()
+        loaded_files = {}
+        loaded_series = defaultdict(list)
+        loaded_series_data = {}
+        loaded_duplicate_series = set()
+        loaded_duplicate_series_links = defaultdict(set)
+
+        loaded_series_ui.refresh()
+        loaded_files_ui.refresh()
+        ui.notify("Queue cleared", color="warning")
+
+    with ui.dialog() as clear_queue_dialog:
+        with ui.card().classes("w-96"):
+            ui.label("Clear queue?").classes("text-h6")
+            ui.label("This will remove all queued anonymized files and clear loaded studies.")
+            with ui.row().classes("items-center gap-2"):
+                ui.button("Cancel", on_click=clear_queue_dialog.close, color="secondary")
+                ui.button(
+                    "Clear",
+                    on_click=lambda: (clear_queue_dialog.close(), clear_queue()),
+                    color="negative",
+                )
+
     with ui.row().classes("items-center gap-2 flex-wrap"):
         upload_button = ui.button("Upload", on_click=lambda: asyncio.create_task(upload_files_start(upload_progress, upload_queue)))
         upload_button.bind_visibility_from(globals(), "LOGIN_SUCCESS")
         ui.button("Upload into Case", on_click=upload_into_case).bind_visibility_from(globals(), "LOGIN_SUCCESS")
+        ui.button("Clear queue", on_click=clear_queue_dialog.open, color="warning").bind_visibility_from(globals(), "LOGIN_SUCCESS")
 
     anon_progress = ui.row().classes("w-full place-content-center bg-blue-900")
 
