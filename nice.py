@@ -1050,7 +1050,7 @@ def login() -> Optional[RedirectResponse]:
 
 
 @ui.page("/")
-def main_page():
+async def main_page():
     async def watch_for_shutdown():
         global SHUTDOWN
         while not app.is_stopped:
