@@ -274,7 +274,7 @@ anonymizer = None
 
 
 async def upload_files_start(progress, upload_queue, case_id=None):
-    global uploaded_files, duplicate_series
+    global uploaded_files, duplicate_series, loaded_files, loaded_series, loaded_series_data
     progress.visible = True
 
     # case_id: optional - if provided files will be uploaded into that case
@@ -300,16 +300,45 @@ async def upload_files_start(progress, upload_queue, case_id=None):
     uploaded_files.update(new_uploaded_files)
 
     for client in Client.instances.values():
+        logger.debug(f"Notify client of upload results: {len(upload_file_list)} uploaded, {len(duplicate_file_list)} duplicates, {len(failed)} failed")
         if not client.has_socket_connection:
+            logger.debug("Client has no socket connection, skipping notification")
             continue
         with client:
-            ui.notify(f"Uploaded {len(upload_file_list)} files", color="positive")
+            uploaded_count = len(upload_file_list)
+            duplicate_count = len(duplicate_file_list)
+            failed_count = len(failed)
+            logger.debug(f"Upload summary: {uploaded_count} uploaded, {duplicate_count} duplicates, {failed_count} failed")
 
-            if duplicate_file_list:
-                ui.notify(f"Duplicate {len(duplicate_file_list)} files", color="warning")
+            if duplicate_count or failed_count:
+                notification_color = "negative" if failed_count else "warning"
+                summary = (
+                    f"Upload complete: {uploaded_count} uploaded, "
+                    f"{duplicate_count} skipped as duplicates, {failed_count} failed"
+                )
 
-            if failed:
-                ui.notify(f"Failed {len(failed)} files", color="negative")
+                if duplicate_series:
+                    logger.debug(f"Duplicate series: {duplicate_series}")
+                    series_text = "\n".join(sorted(duplicate_series))
+                    ui.notify(
+                        f"{summary}\n\nDuplicate series:\n{series_text}\n\nUse Uploaded files to open links.",
+                        color=notification_color,
+                        timeout=0,
+                        close_button="Dismiss",
+                        multi_line=True,
+                    )
+                else:
+                    logger.debug("No duplicate series")
+                    ui.notify(
+                        summary,
+                        color=notification_color,
+                        timeout=0,
+                        close_button="Dismiss",
+                        multi_line=True,
+                    )
+            else:
+                logger.debug("All files uploaded successfully with no duplicates or failures")
+                ui.notify(f"Uploaded {uploaded_count} files", color="positive")
 
     if DELETE_FILES_ON_UPLOAD:
         # clear only files that were part of the successful upload or marked duplicate
@@ -318,9 +347,56 @@ async def upload_files_start(progress, upload_queue, case_id=None):
         files_to_clear.extend(duplicate_file_list or [])
         clear_anonymized_files(files_to_clear)
 
-    loaded_series_ui.refresh()
-    loaded_files_ui.refresh()
-    uploaded_files_ui.refresh()
+        # keep in-memory loaded state in sync with files that actually still exist
+        loaded_files = {
+            file: data for file, data in loaded_files.items() if Path(file).exists()
+        }
+
+        filtered_loaded_series = defaultdict(list)
+        for series_uid, series_files in loaded_series.items():
+            remaining_series_files = [
+                series_file for series_file in series_files if Path(series_file).exists()
+            ]
+            if remaining_series_files:
+                filtered_loaded_series[series_uid] = remaining_series_files
+
+        loaded_series = filtered_loaded_series
+        loaded_series_data = {
+            series_uid: series_data
+            for series_uid, series_data in loaded_series_data.items()
+            if series_uid in loaded_series
+        }
+
+    for client in Client.instances.values():
+        if not client.has_socket_connection:
+            continue
+        with client:
+            logger.debug("Refreshing post-upload UI sections")
+            loaded_series_ui.refresh()
+            loaded_files_ui.refresh()
+            uploaded_files_ui.refresh()
+            ui.run_javascript(
+                """
+                setTimeout(() => {
+                    const openExpansionIfClosed = (id) => {
+                        const section = document.getElementById(id);
+                        if (!section) return null;
+                        const toggle = section.querySelector('.q-item[aria-expanded]');
+                        if (toggle && toggle.getAttribute('aria-expanded') !== 'true') {
+                            toggle.click();
+                        }
+                        return section;
+                    };
+
+                    openExpansionIfClosed('file-status-section');
+                    const uploadedSection = document.getElementById('uploaded-files-section');
+                    openExpansionIfClosed('uploaded-files-section');
+                    if (uploadedSection) {
+                        uploadedSection.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    }
+                }, 0);
+                """
+            )
 
 
 async def load_files_start(progress_bar, queue, custom_path=None, copy=False):
@@ -383,7 +459,7 @@ def loaded_series_ui() -> None:
 
     # def load_series_view(loaded_series, loaded_series_data):
     logger.debug("load series view")
-    logger.debug(loaded_series)
+    logger.debug(f"Loaded series count: {len(loaded_series)}")
     for key in loaded_series:
         logger.debug(f"load series: {key}")
         with series:
@@ -394,11 +470,9 @@ def loaded_series_ui() -> None:
                 # compute total size for the series
                 total = 0
                 for p in loaded_series[key]:
-                    try:
-                        total += Path(p).stat().st_size
-                    except Exception:
-                        # ignore missing files or non-path entries
-                        pass
+                    file_path = Path(p)
+                    if file_path.exists():
+                        total += file_path.stat().st_size
                 ui.label(f"Size: {human_size(total)}")
 
     if loaded_series:
@@ -416,15 +490,12 @@ def loaded_files_ui() -> None:
 
 @ui.refreshable
 def uploaded_files_ui() -> None:
-    with ui.expansion("Uploaded files", icon="file_upload").classes("w-full"):
+    with ui.expansion("Uploaded files", icon="file_upload").classes("w-full").props("id=uploaded-files-section"):
         ui.label(f"Items: {len(uploaded_files)}")
         with ui.list():
             for series in duplicate_series:
-                def _open_series(s=series):
-                    base = PROD_BASE_SITE_URL if OPEN_LINKS_PROD else BASE_SITE_URL
-                    ui.navigate.to(f"{base}{s}", new_tab=True)
-
-                ui.item(f"Duplicate series: {series}", on_click=_open_series).classes("text-red-500")
+                base = PROD_BASE_SITE_URL if OPEN_LINKS_PROD else BASE_SITE_URL
+                ui.link(f"Duplicate series: {series}", f"{base}{series}", new_tab=True).classes("text-red-500 block")
         with ui.list():
             for file, data in uploaded_files.items():
                 ui.item(f"{file} - {data}")
@@ -596,49 +667,56 @@ def upload_files(q, rqst, case_id=None):
 
     to_process_len = len(chunked_files)
 
-    for n, files in enumerate(chunked_files):
+    try:
+        for n, files in enumerate(chunked_files):
 
-        def upload_files_(files):
-            # If we're using token auth, don't set CSRF header
-            if "Authorization" not in rqst.headers:
-                rqst.headers["X-CSRFToken"] = rqst.cookies.get("csrftoken", "")
+            def upload_files_(files):
+                # If we're using token auth, don't set CSRF header
+                if "Authorization" not in rqst.headers:
+                    rqst.headers["X-CSRFToken"] = rqst.cookies.get("csrftoken", "")
 
-            # choose endpoint based on whether a case_id was supplied
-            if case_id:
-                endpoint = f"{BASE_SITE_URL}/api/atlas/upload_dicom_case/{case_id}"
-            else:
-                endpoint = f"{BASE_SITE_URL}/api/atlas/upload_dicom"
+                # choose endpoint based on whether a case_id was supplied
+                if case_id:
+                    endpoint = f"{BASE_SITE_URL}/api/atlas/upload_dicom_case/{case_id}"
+                else:
+                    endpoint = f"{BASE_SITE_URL}/api/atlas/upload_dicom"
 
-            resp = rqst.post(endpoint, files=files)
+                resp = rqst.post(endpoint, files=files)
 
-            logger.debug(f"Endpoint: {endpoint}")
-            logger.debug(f"Resp: {resp}")
-            logger.debug(f"{resp.content}")
-            return resp
+                logger.debug(f"Endpoint: {endpoint}")
+                logger.debug(f"Resp: {resp}")
+                logger.debug(f"Resp bytes: {len(resp.content)}")
+                return resp
 
-        # progress_dialog.Update(n, f"Uploading batch {n}/{len(chunked_files)}")
+            # progress_dialog.Update(n, f"Uploading batch {n}/{len(chunked_files)}")
 
-        logger.debug(f"n: {n}")
-        # try to upload the files
+            logger.debug(f"n: {n}")
+            # try to upload the files
 
-        for i in range(3):
-            resp = upload_files_(files)
-            if resp.status_code == 200:
-                upload_file_list.extend(resp.json()["uploaded"])
-                duplicate_file_list.extend(resp.json()["duplicates"])
-                failed.extend(resp.json()["failed"])
-                duplicate_series.update(resp.json()["duplicate_series"])
+            for i in range(3):
+                resp = upload_files_(files)
+                if resp.status_code == 200:
+                    upload_file_list.extend(resp.json()["uploaded"])
+                    duplicate_file_list.extend(resp.json()["duplicates"])
+                    failed.extend(resp.json()["failed"])
+                    duplicate_series.update(resp.json()["duplicate_series"])
 
-                break
+                    break
 
-            logger.error(f"i: {i}")
-            logger.debug(f"n: {n} fail (attempt {i})")
+                logger.error(f"i: {i}")
+                logger.debug(f"n: {n} fail (attempt {i})")
 
-        q.put_nowait((n + 1) / to_process_len)
-        # progress_dialog.Destroy()
-    print(upload_file_list)
-    print("dup", duplicate_file_list)
-    print("failed", failed)
+            q.put_nowait((n + 1) / to_process_len)
+            # progress_dialog.Destroy()
+    finally:
+        for _, file_handle in files_to_upload:
+            try:
+                file_handle.close()
+            except Exception:
+                pass
+    logger.debug(
+        f"Upload result summary: uploaded={len(upload_file_list)}, duplicates={len(duplicate_file_list)}, failed={len(failed)}, duplicate_series={len(duplicate_series)}"
+    )
 
     for f, hash in upload_file_list:
         uploaded_files[f] = "success"
@@ -879,7 +957,7 @@ def main_page():
             on_click=partial(reload_anonymized_start, anon_progress, queue),
         )
 
-    with ui.expansion("File status", icon="view_list").classes("w-full"):
+    with ui.expansion("File status", icon="view_list").classes("w-full").props("id=file-status-section"):
         loaded_files_ui()
         uploaded_files_ui()
 
