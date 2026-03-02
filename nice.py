@@ -471,7 +471,7 @@ def user_info_ui():
 
 @ui.refreshable
 def loaded_series_ui() -> None:
-    global loaded_series, loaded_series_data, loaded_duplicate_series, loaded_duplicate_series_links
+    global loaded_series, loaded_series_data, loaded_duplicate_series, loaded_duplicate_series_links, loaded_files
 
     series_title = ui.label("Series to upload").classes("text-h3")
     series_title.visible = False
@@ -485,6 +485,40 @@ def loaded_series_ui() -> None:
         logger.debug(f"load series: {key}")
         with series:
             with ui.card():
+                def remove_series(series_uid=key):
+                    global loaded_series, loaded_series_data, loaded_duplicate_series, loaded_duplicate_series_links, loaded_files
+
+                    series_files = list(loaded_series.get(series_uid, []))
+                    removed_count = 0
+                    for series_file in series_files:
+                        try:
+                            series_path = Path(series_file)
+                            if series_path.exists():
+                                series_path.unlink()
+                                removed_count += 1
+                        except Exception as e:
+                            logger.error(f"Failed to delete file {series_file}: {e}")
+
+                    series_file_paths = {Path(series_file) for series_file in series_files}
+                    loaded_files = {
+                        file_path: file_data
+                        for file_path, file_data in loaded_files.items()
+                        if Path(file_path) not in series_file_paths
+                    }
+
+                    loaded_series.pop(series_uid, None)
+                    loaded_series_data.pop(series_uid, None)
+                    loaded_duplicate_series.discard(series_uid)
+                    loaded_duplicate_series_links.pop(series_uid, None)
+
+                    ui.notify(
+                        f"Removed series {series_uid} and {removed_count} file(s)",
+                        color="warning",
+                    )
+
+                    loaded_series_ui.refresh()
+                    loaded_files_ui.refresh()
+
                 ui.label(loaded_series_data[key][0])
                 ui.label(loaded_series_data[key][1])
                 if key in loaded_duplicate_series:
@@ -505,6 +539,22 @@ def loaded_series_ui() -> None:
                     if file_path.exists():
                         total += file_path.stat().st_size
                 ui.label(f"Size: {human_size(total)}")
+
+                with ui.dialog() as remove_series_dialog:
+                    with ui.card().classes("w-96"):
+                        ui.label("Remove series?").classes("text-h6")
+                        ui.label(f"Series: {key}")
+                        ui.label(f"This will delete {len(loaded_series[key])} file(s).")
+
+                        def confirm_remove_series(series_uid=key, dialog=remove_series_dialog):
+                            dialog.close()
+                            remove_series(series_uid)
+
+                        with ui.row().classes("items-center gap-2"):
+                            ui.button("Cancel", on_click=remove_series_dialog.close, color="secondary")
+                            ui.button("Remove", on_click=confirm_remove_series, color="negative")
+
+                ui.button("Remove series", on_click=remove_series_dialog.open, color="negative")
 
     if loaded_series:
         series_title.visible = True
