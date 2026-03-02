@@ -329,6 +329,12 @@ async def upload_files_start(progress, upload_queue, case_id=None):
                     )
                 else:
                     logger.debug("No duplicate series")
+                    if duplicate_count > 0:
+                        summary = (
+                            f"{summary}\n\n"
+                            "Duplicate series are not available yet. "
+                            "Files were are already waiting to be imported on the server."
+                        )
                     ui.notify(
                         summary,
                         color=notification_color,
