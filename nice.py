@@ -854,9 +854,6 @@ def main_page():
         upload_progressbar = ui.linear_progress(value=0).props("instant-feedback")
     upload_progress.visible = False
 
-    upload_button = ui.button("Upload", on_click=lambda: asyncio.create_task(upload_files_start(upload_progress, upload_queue)))
-    upload_button.bind_visibility_from(globals(), "LOGIN_SUCCESS")
-
     def upload_into_case():
         logger.debug("upload into case")
         if not rqst:
@@ -916,7 +913,10 @@ def main_page():
 
         case_dialog.open()
 
-    ui.button("Upload into Case", on_click=upload_into_case).bind_visibility_from(globals(), "LOGIN_SUCCESS")
+    with ui.row().classes("items-center gap-2 flex-wrap"):
+        upload_button = ui.button("Upload", on_click=lambda: asyncio.create_task(upload_files_start(upload_progress, upload_queue)))
+        upload_button.bind_visibility_from(globals(), "LOGIN_SUCCESS")
+        ui.button("Upload into Case", on_click=upload_into_case).bind_visibility_from(globals(), "LOGIN_SUCCESS")
 
     anon_progress = ui.row().classes("w-full place-content-center bg-blue-900")
 
@@ -954,14 +954,15 @@ def main_page():
             ui.notify("No folder selected", color="negative")
 
     with ui.expansion("Extra", icon="build").classes("w-full"):
-        ui.button(
-            "Load files", on_click=partial(load_files_start, anon_progress, queue)
-        )
-        ui.button("Load files from folder", on_click=load_files_from_folder)
-        ui.button(
-            "Reload anon",
-            on_click=partial(reload_anonymized_start, anon_progress, queue),
-        )
+        with ui.row().classes("items-center gap-2 flex-wrap"):
+            ui.button(
+                "Load files", on_click=partial(load_files_start, anon_progress, queue)
+            )
+            ui.button("Load files from folder", on_click=load_files_from_folder)
+            ui.button(
+                "Reload anon",
+                on_click=partial(reload_anonymized_start, anon_progress, queue),
+            )
 
     with ui.expansion("File status", icon="view_list").classes("w-full").props("id=file-status-section"):
         loaded_files_ui()
