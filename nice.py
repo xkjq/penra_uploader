@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-from PyInstaller.log import DEBUG
 import asyncio
 import pynng
 
@@ -37,6 +36,7 @@ from fastapi import Request
 from fastapi.responses import RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 import typer
+import logging
 
 SOCKET_PATH = "tcp://localhost:9976"
 
@@ -76,6 +76,29 @@ try:
 except Exception:
     KEYRING_AVAILABLE = False
 
+logging.getLogger('niceGUI').setLevel(logging.INFO)
+
+# Choose a log file path that works both during development and when the
+# application is frozen into a single executable (PyInstaller --onefile).
+try:
+    if getattr(sys, "frozen", False):
+        # When frozen by PyInstaller, data files are extracted to a temporary
+        # folder available as sys._MEIPASS. Fall back to the executable
+        # directory when _MEIPASS is not present.
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            base_path = Path(meipass)
+        else:
+            base_path = Path(sys.executable).resolve().parent
+    else:
+        base_path = Path(__file__).resolve().parent
+except Exception:
+    base_path = Path.cwd()
+
+log_path = base_path / "uploader.log"
+logger.add(str(log_path), rotation="10 MB", level="DEBUG", enqueue=True, catch=True)
+print(f"Logging to: {log_path}")
+logger.debug("TEST LOG")
 
 def token_file_path() -> Path:
     home = Path.home()
@@ -661,11 +684,13 @@ def upload_files(q, rqst, case_id=None):
 
 
 
+@logger.catch
 @ui.page("/login")
 def login() -> Optional[RedirectResponse]:
     dark = ui.dark_mode()
     dark.enable()
 
+    @logger.catch
     def try_login() -> (
         None
     ):  # local function to avoid passing username and password as arguments
