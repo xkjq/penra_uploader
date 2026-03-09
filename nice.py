@@ -1115,12 +1115,34 @@ def login() -> Optional[RedirectResponse]:
 
         global rqst, LOGIN_SUCCESS, LOGGED_IN_USER
         logger.debug(f"Attempting token auth login for user: {user}")
+
+        # Use a session so we can configure SSL verification or CA bundle
+        # to handle corporate SSL proxies. By default requests will respect
+        # HTTP(S)_PROXY environment variables; to provide a custom CA bundle
+        # set `UPLOADER_CACERT=/path/to/ca_bundle.pem`. To disable verification
+        # (NOT RECOMMENDED) set `UPLOADER_SKIP_SSL_VERIFY=1`.
+        session = requests.Session()
+        # honor explicit CA bundle path
+        ca_bundle = os.environ.get("UPLOADER_CACERT")
+        if ca_bundle:
+            session.verify = ca_bundle
+        elif os.environ.get("UPLOADER_SKIP_SSL_VERIFY", "").lower() in ("1", "true", "yes", "y"):
+            session.verify = False
+
         try:
-            resp = requests.post(
+            resp = session.post(
                 f"{BASE_SITE_URL}{TOKEN_AUTH_PATH}",
                 json={"username": user, "password": pw},
                 timeout=10,
             )
+        except requests.exceptions.SSLError as e:
+            logger.debug(f"Token auth SSL error: {e}")
+            logger.error(
+                "SSL error when connecting to token endpoint; if you're behind a corporate proxy, "
+                "set UPLOADER_CACERT to your proxy CA bundle or set UPLOADER_SKIP_SSL_VERIFY=1 to disable verification (not recommended)."
+            )
+            ui.notify("SSL connection error (proxy?). See logs.", color="negative")
+            return
         except requests.exceptions.RequestException as e:
             logger.debug(f"Token auth request failed: {e}")
             ui.notify("Connection error!", color="negative")
