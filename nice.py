@@ -1539,35 +1539,56 @@ def launch_app(
 
     def setup_logging(level: str):
         # If running as a PyInstaller frozen executable on Windows (no console),
-        # write logs to a rotating file in the user's app data; otherwise write to stderr.
-        try:
-            is_frozen = getattr(sys, "frozen", False)
-            system = platform.system().lower()
-            if is_frozen and system.startswith("win"):
-                # prefer APPDATA, fallback to HOME
-                appdata = os.getenv("APPDATA") or str(Path.home())
-                log_dir = Path(appdata) / APP_NAME
-                log_dir.mkdir(parents=True, exist_ok=True)
-                log_file = log_dir / "uploader.log"
-                logger.add(
-                    str(log_file),
-                    level=level,
-                    rotation="10 MB",
-                    retention="7 days",
-                    enqueue=True,
-                    backtrace=True,
-                    diagnose=False,
-                )
-            else:
-                logger.add(sys.stderr, level=level, enqueue=True)
-        except Exception:
-            # last resort: write to a temp file
+        # Prefer writing to an AppData-based file when frozen on Windows.
+        is_frozen = getattr(sys, "frozen", False)
+        system = platform.system().lower()
+
+        # Candidate directories to try for log file (Windows frozen: prefer APPDATA/LOCALAPPDATA)
+        candidates = []
+        if is_frozen and system.startswith("win"):
+            appdata = os.getenv("APPDATA")
+            localapp = os.getenv("LOCALAPPDATA")
+            if appdata:
+                candidates.append(Path(appdata) / APP_NAME)
+            if localapp:
+                candidates.append(Path(localapp) / APP_NAME)
+            # Try typical fallback locations under the user profile
+            home = Path.home()
+            candidates.append(home / "AppData" / "Roaming" / APP_NAME)
+            candidates.append(home / "AppData" / "Local" / APP_NAME)
+
+        # Always include cwd and tmp as fallbacks
+        candidates.append(Path.cwd())
+        candidates.append(Path(os.getenv("TMP", "/tmp")))
+
+        chosen = None
+        for d in candidates:
             try:
-                tmp = Path(os.getenv("TMP", "/tmp"))
-                log_file = tmp / f"{APP_NAME}.log"
-                logger.add(str(log_file), level=level, enqueue=True)
+                d.mkdir(parents=True, exist_ok=True)
+                test_file = d / "uploader.log"
+                # try opening for append to ensure writable
+                with open(test_file, "a"):
+                    pass
+                chosen = test_file
+                break
             except Exception:
-                pass
+                continue
+
+        if chosen:
+            logger.add(
+                str(chosen),
+                level=level,
+                rotation="10 MB",
+                retention="7 days",
+                enqueue=True,
+                backtrace=True,
+                diagnose=False,
+            )
+            # also emit a console line so users can find the path when running GUI-only
+            print(f"Logging to: {chosen}")
+        else:
+            # final fallback to stderr
+            logger.add(sys.stderr, level=level, enqueue=True)
 
     setup_logging(log_level)
 
