@@ -10,6 +10,8 @@ from nicegui import ui, app, html, run, Client, native
 
 from datetime import datetime
 
+import logging
+
 from loguru import logger
 import sys
 import os
@@ -41,7 +43,6 @@ import logging
 
 from socket_helpers import contact_socket_owner, ensure_run as _ensure_run
 
-SOCKET_PATH = "tcp://localhost:9976"
 
 WORK_DIR = Path("C:/uploader")
 
@@ -53,11 +54,15 @@ EXPORT_PATH.mkdir(exist_ok=True, parents=True)
 PROCESS_PATH.mkdir(exist_ok=True, parents=True)
 ANON_PATH.mkdir(exist_ok=True, parents=True)
 
+
+# Server endpoints and defaults
 BASE_SITE_URL = "https://www.penracourses.org.uk"
 TOKEN_AUTH_PATH = "/api/atlas/create_api_token"  # POST {username,password} -> {token: '...'}
 TOKEN_CHECK_PATH = "/api/atlas/token_check"
 HASH_CHECK_PATH = "/api/atlas/check_image_hashes/"
 PROD_BASE_SITE_URL = "https://www.penracourses.org.uk"
+
+SOCKET_PATH = "tcp://localhost:9976"
 
 LOGIN_URL = f"{BASE_SITE_URL}/accounts/login/"
 
@@ -80,7 +85,7 @@ try:
 except Exception:
     KEYRING_AVAILABLE = False
 
-logging.getLogger('niceGUI').setLevel(logging.INFO)
+logging.getLogger("niceGUI").setLevel(logging.INFO)
 
 # Choose a log file path that works both during development and when the
 # application is frozen into a single executable (PyInstaller --onefile).
@@ -103,6 +108,7 @@ log_path = base_path / "uploader.log"
 logger.add(str(log_path), rotation="10 MB", level="DEBUG", enqueue=True, catch=True)
 print(f"Logging to: {log_path}")
 logger.debug("TEST LOG")
+
 
 def token_file_path() -> Path:
     home = Path.home()
@@ -204,7 +210,9 @@ def check_token() -> dict | None:
 
             if not token:
                 return None
-            resp = requests.post(f"{BASE_SITE_URL}{TOKEN_CHECK_PATH}", json={"token": token}, timeout=5)
+            resp = requests.post(
+                f"{BASE_SITE_URL}{TOKEN_CHECK_PATH}", json={"token": token}, timeout=5
+            )
 
         if resp.status_code != 200:
             return None
@@ -246,6 +254,7 @@ loaded_duplicate_series_links = defaultdict(set)
 uploaded_files: dict = {}
 duplicate_series = set()
 OPEN_LINKS_PROD = False
+AUTSELECT_NNG_PORT = False
 
 
 def human_size(num, suffix="B"):
@@ -254,11 +263,32 @@ def human_size(num, suffix="B"):
         n = float(num)
     except Exception:
         return "0 B"
-    for unit in ["","Ki","Mi","Gi","Ti","Pi"]:
+    for unit in ["", "Ki", "Mi", "Gi", "Ti", "Pi"]:
         if abs(n) < 1024.0:
             return f"{n:3.1f} {unit}{suffix}"
         n /= 1024.0
     return f"{n:.1f} Pi{suffix}"
+
+
+import socket
+
+
+def find_free_tcp_port(start_port: int, max_tries: int = 100) -> int | None:
+    """Scan forward from start_port to find a free TCP port on localhost.
+    Returns the first free port found or None if none available within max_tries.
+    """
+    for p in range(start_port, start_port + max_tries):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("127.0.0.1", p))
+                return p
+            except OSError:
+                continue
+    return None
+
+
+from socket_helpers import contact_socket_owner, ensure_run as _ensure_run
 
 
 async def read_nng_messages():
@@ -285,7 +315,7 @@ async def read_nng_messages():
                         logger.error("invalid message")
     except pynng.exceptions.AddressInUse:
         logger.debug("Address in use")
-        await contact_socket_owner(SOCKET_PATH, timeout=10)
+        await contact_socket_owner(SOCKET_PATH, timeout=10, allow_terminate=(not AUTSELECT_NNG_PORT))
 
         # Trigger shutdown from in the async loop
         global SHUTDOWN
@@ -301,7 +331,12 @@ anonymizer = None
 
 
 async def upload_files_start(progress, upload_queue, case_id=None):
-    global uploaded_files, duplicate_series, loaded_files, loaded_series, loaded_series_data
+    global \
+        uploaded_files, \
+        duplicate_series, \
+        loaded_files, \
+        loaded_series, \
+        loaded_series_data
     progress.visible = True
 
     # case_id: optional - if provided files will be uploaded into that case
@@ -327,7 +362,9 @@ async def upload_files_start(progress, upload_queue, case_id=None):
     uploaded_files.update(new_uploaded_files)
 
     for client in Client.instances.values():
-        logger.debug(f"Notify client of upload results: {len(upload_file_list)} uploaded, {len(duplicate_file_list)} duplicates, {len(failed)} failed")
+        logger.debug(
+            f"Notify client of upload results: {len(upload_file_list)} uploaded, {len(duplicate_file_list)} duplicates, {len(failed)} failed"
+        )
         if not client.has_socket_connection:
             logger.debug("Client has no socket connection, skipping notification")
             continue
@@ -335,7 +372,9 @@ async def upload_files_start(progress, upload_queue, case_id=None):
             uploaded_count = len(upload_file_list)
             duplicate_count = len(duplicate_file_list)
             failed_count = len(failed)
-            logger.debug(f"Upload summary: {uploaded_count} uploaded, {duplicate_count} duplicates, {failed_count} failed")
+            logger.debug(
+                f"Upload summary: {uploaded_count} uploaded, {duplicate_count} duplicates, {failed_count} failed"
+            )
 
             if duplicate_count or failed_count:
                 notification_color = "negative" if failed_count else "warning"
@@ -370,7 +409,9 @@ async def upload_files_start(progress, upload_queue, case_id=None):
                         multi_line=True,
                     )
             else:
-                logger.debug("All files uploaded successfully with no duplicates or failures")
+                logger.debug(
+                    "All files uploaded successfully with no duplicates or failures"
+                )
                 ui.notify(f"Uploaded {uploaded_count} files", color="positive")
 
     if DELETE_FILES_ON_UPLOAD:
@@ -388,7 +429,9 @@ async def upload_files_start(progress, upload_queue, case_id=None):
         filtered_loaded_series = defaultdict(list)
         for series_uid, series_files in loaded_series.items():
             remaining_series_files = [
-                series_file for series_file in series_files if Path(series_file).exists()
+                series_file
+                for series_file in series_files
+                if Path(series_file).exists()
             ]
             if remaining_series_files:
                 filtered_loaded_series[series_uid] = remaining_series_files
@@ -434,7 +477,12 @@ async def upload_files_start(progress, upload_queue, case_id=None):
 
 async def load_files_start(progress_bar, queue, custom_path=None, copy=False):
     logger.debug("load files start")
-    global loaded_files, loaded_series, loaded_series_data, loaded_duplicate_series, loaded_duplicate_series_links
+    global \
+        loaded_files, \
+        loaded_series, \
+        loaded_series_data, \
+        loaded_duplicate_series, \
+        loaded_duplicate_series_links
     progress_bar.visible = True
 
     (
@@ -443,15 +491,16 @@ async def load_files_start(progress_bar, queue, custom_path=None, copy=False):
         new_loaded_series_data,
         new_loaded_duplicate_series,
         new_loaded_duplicate_series_links,
-    ) = await run.cpu_bound(
-        load_files, queue, custom_path, copy, rqst
-    )
+    ) = await run.cpu_bound(load_files, queue, custom_path, copy, rqst)
 
     for client in Client.instances.values():
         if not client.has_socket_connection:
             continue
         with client:
-            ui.notify(f"Files loaded: {len(new_loaded_files)}, [Series: {len(new_loaded_series)}] ", color="positive")
+            ui.notify(
+                f"Files loaded: {len(new_loaded_files)}, [Series: {len(new_loaded_series)}] ",
+                color="positive",
+            )
 
     loaded_files.update(new_loaded_files)
     loaded_series.update(new_loaded_series)
@@ -467,7 +516,12 @@ async def load_files_start(progress_bar, queue, custom_path=None, copy=False):
 
 
 async def reload_anonymized_start(progress_bar, queue):
-    global loaded_files, loaded_series, loaded_series_data, loaded_duplicate_series, loaded_duplicate_series_links
+    global \
+        loaded_files, \
+        loaded_series, \
+        loaded_series_data, \
+        loaded_duplicate_series, \
+        loaded_duplicate_series_links
     progress_bar.visible = True
     loaded_files, loaded_series, loaded_series_data = await run.cpu_bound(
         reload_anonymized, queue
@@ -479,7 +533,10 @@ async def reload_anonymized_start(progress_bar, queue):
         if not client.has_socket_connection:
             continue
         with client:
-            ui.notify(f"Files reloaded: {len(loaded_files)}, [Series: {len(loaded_series)}] ", color="positive")
+            ui.notify(
+                f"Files reloaded: {len(loaded_files)}, [Series: {len(loaded_series)}] ",
+                color="positive",
+            )
     # load_series_view(loaded_series, loaded_series_data)
     await loaded_series_ui.refresh()
     await loaded_files_ui.refresh()
@@ -494,7 +551,12 @@ def user_info_ui():
 
 @ui.refreshable
 def loaded_series_ui() -> None:
-    global loaded_series, loaded_series_data, loaded_duplicate_series, loaded_duplicate_series_links, loaded_files
+    global \
+        loaded_series, \
+        loaded_series_data, \
+        loaded_duplicate_series, \
+        loaded_duplicate_series_links, \
+        loaded_files
 
     series_title = ui.label("Series to upload").classes("text-h3")
     series_title.visible = False
@@ -508,8 +570,14 @@ def loaded_series_ui() -> None:
         logger.debug(f"load series: {key}")
         with series:
             with ui.card():
+
                 def remove_series(series_uid=key):
-                    global loaded_series, loaded_series_data, loaded_duplicate_series, loaded_duplicate_series_links, loaded_files
+                    global \
+                        loaded_series, \
+                        loaded_series_data, \
+                        loaded_duplicate_series, \
+                        loaded_duplicate_series_links, \
+                        loaded_files
 
                     series_files = list(loaded_series.get(series_uid, []))
                     removed_count = 0
@@ -522,7 +590,9 @@ def loaded_series_ui() -> None:
                         except Exception as e:
                             logger.error(f"Failed to delete file {series_file}: {e}")
 
-                    series_file_paths = {Path(series_file) for series_file in series_files}
+                    series_file_paths = {
+                        Path(series_file) for series_file in series_files
+                    }
                     loaded_files = {
                         file_path: file_data
                         for file_path, file_data in loaded_files.items()
@@ -550,10 +620,20 @@ def loaded_series_ui() -> None:
                     if series_links:
                         base = PROD_BASE_SITE_URL if OPEN_LINKS_PROD else BASE_SITE_URL
                         for link in sorted(series_links):
-                            series_link = link if str(link).startswith("http") else f"{base}{link}"
-                            ui.link(f"Open duplicate series: {link}", series_link, new_tab=True).classes("text-red-500")
+                            series_link = (
+                                link
+                                if str(link).startswith("http")
+                                else f"{base}{link}"
+                            )
+                            ui.link(
+                                f"Open duplicate series: {link}",
+                                series_link,
+                                new_tab=True,
+                            ).classes("text-red-500")
                     else:
-                        ui.label("Series link not available yet (pending import)").classes("text-orange-500")
+                        ui.label(
+                            "Series link not available yet (pending import)"
+                        ).classes("text-orange-500")
                 ui.label(f"Images: {len(loaded_series[key])}")
                 # compute total size for the series
                 total = 0
@@ -569,15 +649,29 @@ def loaded_series_ui() -> None:
                         ui.label(f"Series: {key}")
                         ui.label(f"This will delete {len(loaded_series[key])} file(s).")
 
-                        def confirm_remove_series(series_uid=key, dialog=remove_series_dialog):
+                        def confirm_remove_series(
+                            series_uid=key, dialog=remove_series_dialog
+                        ):
                             dialog.close()
                             remove_series(series_uid)
 
                         with ui.row().classes("items-center gap-2"):
-                            ui.button("Cancel", on_click=remove_series_dialog.close, color="secondary")
-                            ui.button("Remove", on_click=confirm_remove_series, color="negative")
+                            ui.button(
+                                "Cancel",
+                                on_click=remove_series_dialog.close,
+                                color="secondary",
+                            )
+                            ui.button(
+                                "Remove",
+                                on_click=confirm_remove_series,
+                                color="negative",
+                            )
 
-                ui.button("Remove series", on_click=remove_series_dialog.open, color="negative")
+                ui.button(
+                    "Remove series",
+                    on_click=remove_series_dialog.open,
+                    color="negative",
+                )
 
     if loaded_series:
         series_title.visible = True
@@ -594,13 +688,21 @@ def loaded_files_ui() -> None:
 
 @ui.refreshable
 def uploaded_files_ui() -> None:
-    with ui.expansion("Uploaded files", icon="file_upload").classes("w-full").props("id=uploaded-files-section"):
+    with (
+        ui.expansion("Uploaded files", icon="file_upload")
+        .classes("w-full")
+        .props("id=uploaded-files-section")
+    ):
         ui.label(f"Items: {len(uploaded_files)}")
         with ui.list():
             for series in duplicate_series:
                 base = PROD_BASE_SITE_URL if OPEN_LINKS_PROD else BASE_SITE_URL
-                series_link = series if str(series).startswith("http") else f"{base}{series}"
-                ui.link(f"Duplicate series: {series}", series_link, new_tab=True).classes("text-red-500 block")
+                series_link = (
+                    series if str(series).startswith("http") else f"{base}{series}"
+                )
+                ui.link(
+                    f"Duplicate series: {series}", series_link, new_tab=True
+                ).classes("text-red-500 block")
         with ui.list():
             for file, data in uploaded_files.items():
                 ui.item(f"{file} - {data}")
@@ -665,7 +767,9 @@ def load_files(q: Queue, src_path: Path | None = None, copy: bool = False, rqst=
             output_file_hashes[output_file] = blake3.blake3(hash_payload).hexdigest()
         except Exception:
             try:
-                output_file_hashes[output_file] = blake3.blake3(Path(output_file).read_bytes()).hexdigest()
+                output_file_hashes[output_file] = blake3.blake3(
+                    Path(output_file).read_bytes()
+                ).hexdigest()
             except Exception as e:
                 logger.warning(f"Hashing failed for {output_file}: {e}")
 
@@ -681,7 +785,9 @@ def load_files(q: Queue, src_path: Path | None = None, copy: bool = False, rqst=
             hash_payload = list(set(output_file_hashes.values()))
             resp = rqst.post(f"{BASE_SITE_URL}{HASH_CHECK_PATH}", json=hash_payload)
             if resp.status_code in (400, 422):
-                resp = rqst.post(f"{BASE_SITE_URL}{HASH_CHECK_PATH}", json={"hashes": hash_payload})
+                resp = rqst.post(
+                    f"{BASE_SITE_URL}{HASH_CHECK_PATH}", json={"hashes": hash_payload}
+                )
 
             if resp.status_code == 200:
                 hash_status = resp.json()
@@ -789,7 +895,9 @@ def clear_anonymized_files(uploaded_file_list=None):
                 except Exception as e:
                     logger.error(f"Failed to delete {file}: {e}")
 
-        logger.debug(f"Deleted {removed} files from ANON_PATH (of {len(names)} requested)")
+        logger.debug(
+            f"Deleted {removed} files from ANON_PATH (of {len(names)} requested)"
+        )
     else:
         for file in ANON_PATH.iterdir():
             if file.is_file():
@@ -848,7 +956,9 @@ def upload_files(q, rqst, case_id=None):
             hash_payload = list(hash_to_paths.keys())
             resp = rqst.post(f"{BASE_SITE_URL}{HASH_CHECK_PATH}", json=hash_payload)
             if resp.status_code in (400, 422):
-                resp = rqst.post(f"{BASE_SITE_URL}{HASH_CHECK_PATH}", json={"hashes": hash_payload})
+                resp = rqst.post(
+                    f"{BASE_SITE_URL}{HASH_CHECK_PATH}", json={"hashes": hash_payload}
+                )
             if resp.status_code != 200:
                 logger.warning(f"Pre-upload hash check failed: {resp.status_code}")
                 return file_paths, [], set()
@@ -887,7 +997,9 @@ def upload_files(q, rqst, case_id=None):
             logger.warning(f"Pre-upload hash check error: {e}")
             return file_paths, [], set()
 
-    files_after_precheck, pre_duplicate_file_list, pre_duplicate_series = precheck_duplicate_hashes(files_in_anon)
+    files_after_precheck, pre_duplicate_file_list, pre_duplicate_series = (
+        precheck_duplicate_hashes(files_in_anon)
+    )
 
     files_to_upload = []
     for file in files_after_precheck:
@@ -991,9 +1103,6 @@ def upload_files(q, rqst, case_id=None):
     )
 
 
-
-
-
 @logger.catch
 @ui.page("/login")
 def login() -> Optional[RedirectResponse]:
@@ -1011,7 +1120,11 @@ def login() -> Optional[RedirectResponse]:
         global rqst, LOGIN_SUCCESS, LOGGED_IN_USER
         logger.debug(f"Attempting token auth login for user: {user}")
         try:
-            resp = requests.post(f"{BASE_SITE_URL}{TOKEN_AUTH_PATH}", json={"username": user, "password": pw}, timeout=10)
+            resp = requests.post(
+                f"{BASE_SITE_URL}{TOKEN_AUTH_PATH}",
+                json={"username": user, "password": pw},
+                timeout=10,
+            )
         except requests.exceptions.RequestException as e:
             logger.debug(f"Token auth request failed: {e}")
             ui.notify("Connection error!", color="negative")
@@ -1135,8 +1248,11 @@ async def main_page():
         with ui.dialog() as case_dialog:
             with ui.card().classes("absolute-center"):
                 ui.label("Upload into Case").classes("text-h6")
-                case_select_dialog = ui.select(options, label="Select case (searchable)").classes("w-96")
+                case_select_dialog = ui.select(
+                    options, label="Select case (searchable)"
+                ).classes("w-96")
                 with ui.row():
+
                     def do_upload():
                         raw = case_select_dialog.value
                         if not raw:
@@ -1158,7 +1274,11 @@ async def main_page():
                                 ui.notify("Invalid case selection", color="negative")
                                 return
 
-                        asyncio.create_task(upload_files_start(upload_progress, upload_queue, case_id_val))
+                        asyncio.create_task(
+                            upload_files_start(
+                                upload_progress, upload_queue, case_id_val
+                            )
+                        )
                         case_dialog.close()
 
                     ui.button("Upload", on_click=do_upload)
@@ -1184,9 +1304,13 @@ async def main_page():
     with ui.dialog() as clear_queue_dialog:
         with ui.card().classes("w-96"):
             ui.label("Clear queue?").classes("text-h6")
-            ui.label("This will remove all queued anonymized files and clear loaded studies.")
+            ui.label(
+                "This will remove all queued anonymized files and clear loaded studies."
+            )
             with ui.row().classes("items-center gap-2"):
-                ui.button("Cancel", on_click=clear_queue_dialog.close, color="secondary")
+                ui.button(
+                    "Cancel", on_click=clear_queue_dialog.close, color="secondary"
+                )
                 ui.button(
                     "Clear",
                     on_click=lambda: (clear_queue_dialog.close(), clear_queue()),
@@ -1194,10 +1318,19 @@ async def main_page():
                 )
 
     with ui.row().classes("items-center gap-2 flex-wrap"):
-        upload_button = ui.button("Upload", on_click=lambda: asyncio.create_task(upload_files_start(upload_progress, upload_queue)))
+        upload_button = ui.button(
+            "Upload",
+            on_click=lambda: asyncio.create_task(
+                upload_files_start(upload_progress, upload_queue)
+            ),
+        )
         upload_button.bind_visibility_from(globals(), "LOGIN_SUCCESS")
-        ui.button("Upload into Case", on_click=upload_into_case).bind_visibility_from(globals(), "LOGIN_SUCCESS")
-        ui.button("Clear queue", on_click=clear_queue_dialog.open, color="warning").bind_visibility_from(globals(), "LOGIN_SUCCESS")
+        ui.button("Upload into Case", on_click=upload_into_case).bind_visibility_from(
+            globals(), "LOGIN_SUCCESS"
+        )
+        ui.button(
+            "Clear queue", on_click=clear_queue_dialog.open, color="warning"
+        ).bind_visibility_from(globals(), "LOGIN_SUCCESS")
 
     anon_progress = ui.row().classes("w-full place-content-center bg-blue-900")
 
@@ -1219,15 +1352,20 @@ async def main_page():
                     ui.label(f"Folder: {folder}")
                     copy_switch = ui.switch("Copy files instead of move", value=True)
                     with ui.row():
+
                         def do_load():
                             # schedule the load with the chosen copy flag
                             asyncio.create_task(
-                                load_files_start(anon_progress, queue, folder, copy=copy_switch.value)
+                                load_files_start(
+                                    anon_progress, queue, folder, copy=copy_switch.value
+                                )
                             )
                             copy_dialog.close()
 
                         ui.button("Load", on_click=do_load)
-                        ui.button("Cancel", on_click=copy_dialog.close, color="secondary")
+                        ui.button(
+                            "Cancel", on_click=copy_dialog.close, color="secondary"
+                        )
 
             # show the dialog we just created
             copy_dialog.open()
@@ -1245,7 +1383,11 @@ async def main_page():
                 on_click=partial(reload_anonymized_start, anon_progress, queue),
             )
 
-    with ui.expansion("File status", icon="view_list").classes("w-full").props("id=file-status-section"):
+    with (
+        ui.expansion("File status", icon="view_list")
+        .classes("w-full")
+        .props("id=file-status-section")
+    ):
         loaded_files_ui()
         uploaded_files_ui()
 
@@ -1254,6 +1396,7 @@ async def main_page():
 
     with ui.expansion("Settings", icon="settings").classes("w-full"):
         ui.label("Settings").classes("text-h4")
+
         def open_path(path: Path):
             try:
                 system = platform.system()
@@ -1281,15 +1424,19 @@ async def main_page():
             ui.label(f"Anon path: {ANON_PATH}")
             ui.button("Open", on_click=lambda: open_path(ANON_PATH))
         with ui.row():
-            open_prod_switch = ui.switch("Open external links on production site", value=False)
+            open_prod_switch = ui.switch(
+                "Open external links on production site", value=False
+            )
+
             def set_open_prod(v=open_prod_switch):
                 global OPEN_LINKS_PROD
                 OPEN_LINKS_PROD = v.value
 
-            open_prod_switch.on('click', set_open_prod)
+            open_prod_switch.on("click", set_open_prod)
             # API token management
             with ui.row():
                 token_input = ui.input("API token (paste here)")
+
                 def save_token_from_input():
                     t = token_input.value
                     if not t:
@@ -1304,7 +1451,9 @@ async def main_page():
                     ui.notify("API token cleared", color="positive")
 
                 ui.button("Save token", on_click=save_token_from_input)
-                ui.button("Clear token", on_click=clear_token_from_input, color="secondary")
+                ui.button(
+                    "Clear token", on_click=clear_token_from_input, color="secondary"
+                )
                 # populate input from stored token (first 8 chars shown)
                 existing = load_api_token()
                 if existing:
@@ -1335,8 +1484,10 @@ async def main_page():
             ui.label("Version: 0.1")
             ui.label("Author: Ross Kruger")
 
-            ui.button("Close", on_click=about_dialog.close, icon="close", color="secondary")
-    
+            ui.button(
+                "Close", on_click=about_dialog.close, icon="close", color="secondary"
+            )
+
     with ui.footer():
         with ui.row():
             ui.button("Shutdown", on_click=shutdown_app).props("outline color=white")
@@ -1348,12 +1499,20 @@ def launch_app(
     nng: bool = typer.Option(True, help="Use nng"),
     native_mode: bool = typer.Option(False, help="Use native mode"),
     debug: bool = typer.Option(False, help="Enable debug mode"),
-    verbose: int = typer.Option(0, "--verbose", "-v", help="Verbosity level (0=warning,1=info,2=debug)"),
+    verbose: int = typer.Option(
+        0, "--verbose", "-v", help="Verbosity level (0=warning,1=info,2=debug)"
+    ),
+    autoselect_nng_port: bool = typer.Option(
+        False,
+        help="If the configured nng port is in use, auto-select the next free port",
+    ),
+    autoselect_nng_maxtries: int = typer.Option(
+        100, help="How many ports to probe when auto-selecting"
+    ),
 ):
     global WORK_DIR, EXPORT_PATH, PROCESS_PATH, ANON_PATH
 
     global BASE_SITE_URL
-
 
     WORK_DIR = work_dir
     EXPORT_PATH = WORK_DIR / Path("export/")
@@ -1452,24 +1611,65 @@ def launch_app(
                 pass
 
     if nng:
-        try:
-            with pynng.Pair0(listen=SOCKET_PATH) as sub:
-                pass
-        except pynng.exceptions.AddressInUse:
-            logger.debug("Address in use")
+        # Attempt to bind the NNG listening socket. If it's already in use we can
+        # optionally autoselect the next free TCP port and retry.
+        # record autoselect flag globally for other code to reference
+        global AUTSELECT_NNG_PORT, SOCKET_PATH
+        AUTSELECT_NNG_PORT = autoselect_nng_port
+        bound = False
+        attempt_count = 0
+        while not bound:
             try:
-                # run the async helper from sync context
-                asyncio.run(contact_socket_owner(SOCKET_PATH, timeout=10))
-            except Exception:
-                logger.debug("Failed to contact socket owner from sync context")
-            sys.exit(0)
+                with pynng.Pair0(listen=SOCKET_PATH) as sub:
+                    bound = True
+            except pynng.exceptions.AddressInUse:
+                logger.debug("Address in use")
+                # contact owner but do not block forever; suppress terminate if autoselect requested
+                try:
+                    asyncio.run(contact_socket_owner(SOCKET_PATH, timeout=10, allow_terminate=(not AUTSELECT_NNG_PORT)))
+                except Exception:
+                    logger.debug("Failed to contact socket owner from sync context")
+
+                if autoselect_nng_port:
+                    # parse the numeric port out of SOCKET_PATH and try to find a free one
+                    try:
+                        current_port = int(SOCKET_PATH.split(":")[-1])
+                    except Exception:
+                        current_port = None
+                    if current_port is None:
+                        logger.error("Could not parse numeric port from SOCKET_PATH")
+                        sys.exit(1)
+
+                    attempt_count += 1
+                    new_port = find_free_tcp_port(
+                        current_port + attempt_count, max_tries=autoselect_nng_maxtries
+                    )
+                    if new_port:
+                        old = SOCKET_PATH
+                        SOCKET_PATH = f"tcp://localhost:{new_port}"
+                        logger.info(
+                            f"Autoselected new NNG socket port: {SOCKET_PATH} (was {old})"
+                        )
+                        # loop and try to bind to the new SOCKET_PATH
+                        continue
+                    else:
+                        logger.error("Autoselect requested but no free port found")
+                        sys.exit(1)
+                else:
+                    sys.exit(0)
 
         app.on_startup(read_nng_messages)
 
     app.on_exception(logger.debug)
 
     try:
-        ui.run(reload=False, show=True, port=native.find_open_port(), native=native_mode, favicon="icon/icon1.ico")
+        ui.run(
+            reload=False,
+            show=True,
+            port=native.find_open_port(),
+            native=native_mode,
+            favicon="icon/icon1.ico",
+        )
     except Exception as e:
         logger.error(e)
         pass

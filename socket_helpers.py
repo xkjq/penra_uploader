@@ -83,7 +83,7 @@ def _find_pid_by_port(port: int) -> int | None:
     return None
 
 
-async def contact_socket_owner(socket_path: str, timeout: int = 10) -> bool:
+async def contact_socket_owner(socket_path: str, timeout: int = 10, allow_terminate: bool = True) -> bool:
     """Dial the given socket_path, send a ping and wait up to `timeout` seconds for a reply.
     If no reply, prompt the user to terminate the process holding the port and attempt to send SIGTERM.
     Returns True if a response was received, False otherwise.
@@ -96,6 +96,11 @@ async def contact_socket_owner(socket_path: str, timeout: int = 10) -> bool:
                 logger.debug(f"Received response from socket owner: {msg.bytes}")
                 return True
             except asyncio.TimeoutError:
+                # If termination is not allowed (e.g. autoselect enabled), don't prompt
+                if not allow_terminate:
+                    logger.info("No response from socket owner and termination suppressed by settings")
+                    return False
+
                 loop = asyncio.get_event_loop()
                 prompt = (
                     f"No response from socket owner within {timeout}s. "
