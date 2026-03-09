@@ -104,10 +104,6 @@ try:
 except Exception:
     base_path = Path.cwd()
 
-log_path = base_path / "uploader.log"
-logger.add(str(log_path), rotation="10 MB", level="DEBUG", enqueue=True, catch=True)
-print(f"Logging to: {log_path}")
-logger.debug("TEST LOG")
 
 
 def token_file_path() -> Path:
@@ -1494,6 +1490,7 @@ async def main_page():
             ui.button("About", on_click=about_dialog.open).props("outline color=white")
 
 
+@logger.catch
 def launch_app(
     work_dir: Path = typer.Option(WORK_DIR, help="Working directory"),
     nng: bool = typer.Option(True, help="Use nng"),
@@ -1513,6 +1510,7 @@ def launch_app(
     global WORK_DIR, EXPORT_PATH, PROCESS_PATH, ANON_PATH
 
     global BASE_SITE_URL
+    logger.debug(f"launch_app called with work_dir={work_dir}, nng={nng}, native_mode={native_mode}, debug={debug}, verbose={verbose}, autoselect_nng_port={autoselect_nng_port}, autoselect_nng_maxtries={autoselect_nng_maxtries}")
 
     WORK_DIR = work_dir
     EXPORT_PATH = WORK_DIR / Path("export/")
@@ -1584,11 +1582,9 @@ def launch_app(
                 backtrace=True,
                 diagnose=False,
             )
-            # also emit a console line so users can find the path when running GUI-only
-            print(f"Logging to: {chosen}")
-        else:
-            # final fallback to stderr
-            logger.add(sys.stderr, level=level, enqueue=True)
+        logger.add(sys.stderr, level=level, enqueue=True)
+
+        logger.debug(f"Logging initialized at {level} level")
 
     setup_logging(log_level)
 
@@ -1614,16 +1610,13 @@ def launch_app(
         if info and info.get("valid"):
             LOGIN_SUCCESS = True
             LOGGED_IN_USER = info.get("username") or "API token"
+            maybe = user_info_ui.refresh()
             try:
-                maybe = user_info_ui.refresh()
-                try:
-                    if asyncio.iscoroutine(maybe) or hasattr(maybe, "__await__"):
-                        asyncio.run(maybe)
-                except RuntimeError:
-                    loop = asyncio.get_event_loop()
-                    loop.run_until_complete(maybe)
-            except Exception:
-                pass
+                if asyncio.iscoroutine(maybe) or hasattr(maybe, "__await__"):
+                    asyncio.run(maybe)
+            except RuntimeError:
+                loop = asyncio.get_event_loop()
+                loop.run_until_complete(maybe)
         else:
             logger.debug("Stored API token invalid; clearing")
             try:
@@ -1681,7 +1674,7 @@ def launch_app(
 
         app.on_startup(read_nng_messages)
 
-    app.on_exception(logger.debug)
+    #app.on_exception(logger.debug)
 
     try:
         ui.run(
