@@ -1525,11 +1525,14 @@ async def main_page():
                 if v:
                     os.environ["UPLOADER_SKIP_SSL_VERIFY"] = "1"
                     enable_skip_verify()
+                    ui.notify("Insecure connections enabled (verification disabled)", color="warning")
                 else:
                     os.environ.pop("UPLOADER_SKIP_SSL_VERIFY", None)
                     disable_skip_verify()
+                    ui.notify("Insecure connections disabled (verification enabled)", color="positive")
 
-            skip_verify_switch.on("update", on_skip_verify_change)
+            # use 'click' event to catch toggle changes reliably
+            skip_verify_switch.on("click", on_skip_verify_change)
 
             def set_open_prod(v=open_prod_switch):
                 global OPEN_LINKS_PROD
