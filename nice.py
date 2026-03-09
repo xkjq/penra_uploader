@@ -1614,6 +1614,7 @@ def launch_app(
         bound = False
         attempt_count = 0
         while not bound:
+            logger.debug(f"Binding attempt {attempt_count} to {SOCKET_PATH}")
             try:
                 with pynng.Pair0(listen=SOCKET_PATH) as sub:
                     bound = True
