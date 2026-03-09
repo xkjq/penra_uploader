@@ -1603,31 +1603,6 @@ def launch_app(
 
     logger.debug(f"Work dir: {WORK_DIR}")
 
-    # Try to load saved API token at startup
-    existing_token = load_api_token()
-    if existing_token:
-        logger.debug("Loaded API token from storage; validating...")
-        info = check_token()
-        if info and info.get("valid"):
-            logger.debug(f"Stored API token is valid for user: {info.get('username')}")
-            LOGIN_SUCCESS = True
-            LOGGED_IN_USER = info.get("username") or "API token"
-            maybe = user_info_ui.refresh()
-            try:
-                logger.debug("Refreshing user info UI with loaded token")
-                if asyncio.iscoroutine(maybe) or hasattr(maybe, "__await__"):
-                    asyncio.run(maybe)
-            except RuntimeError:
-                logger.debug("Event loop already running; scheduling refresh in existing loop")
-                loop = asyncio.get_event_loop()
-                loop.run_until_complete(maybe)
-        else:
-            logger.debug("Stored API token invalid; clearing")
-            try:
-                clear_api_token()
-            except Exception:
-                logger.error("Failed to clear invalid API token from storage")
-
     logger.debug(f"NNG enabled: {nng}")
     if nng:
         # Attempt to bind the NNG listening socket. If it's already in use we can
@@ -1680,6 +1655,31 @@ def launch_app(
 
         app.on_startup(read_nng_messages)
 
+
+    # Try to load saved API token at startup
+    existing_token = load_api_token()
+    if existing_token:
+        logger.debug("Loaded API token from storage; validating...")
+        info = check_token()
+        if info and info.get("valid"):
+            logger.debug(f"Stored API token is valid for user: {info.get('username')}")
+            LOGIN_SUCCESS = True
+            LOGGED_IN_USER = info.get("username") or "API token"
+            #maybe = user_info_ui.refresh()
+            #try:
+            #    logger.debug("Refreshing user info UI with loaded token")
+            #    if asyncio.iscoroutine(maybe) or hasattr(maybe, "__await__"):
+            #        asyncio.run(maybe)
+            #except RuntimeError:
+            #    logger.debug("Event loop already running; scheduling refresh in existing loop")
+            #    loop = asyncio.get_event_loop()
+            #    loop.run_until_complete(maybe)
+        else:
+            logger.debug("Stored API token invalid; clearing")
+            try:
+                clear_api_token()
+            except Exception:
+                logger.error("Failed to clear invalid API token from storage")
     #app.on_exception(logger.debug)
 
     try:
