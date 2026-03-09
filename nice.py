@@ -1697,7 +1697,7 @@ def launch_app(
         pass
 
 
-if __name__ in {"__main__", "__mp_main__"}:
+if __name__ == "__main__":
     freeze_support()
 
     typer.run(launch_app)
