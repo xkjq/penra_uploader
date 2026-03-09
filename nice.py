@@ -1513,6 +1513,11 @@ async def main_page():
         with ui.row():
             # initialize skip-verify switch based on env var
             skip_verify_initial = os.environ.get("UPLOADER_SKIP_SSL_VERIFY", "").lower() in ("1", "true", "yes", "y")
+
+            if skip_verify_initial:
+                logger.debug("SSL verification is initially disabled based on environment variable")
+                enable_skip_verify()
+
             skip_verify_switch = ui.switch("Allow insecure connections (disable SSL verification)", value=skip_verify_initial)
 
             def on_skip_verify_change(e=None):
