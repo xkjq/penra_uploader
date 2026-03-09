@@ -259,6 +259,91 @@ def human_size(num, suffix="B"):
     return f"{n:.1f} Pi{suffix}"
 
 
+def _find_pid_by_port(port: int) -> int | None:
+    """Try to find a pid listening on TCP port using `ss` or `lsof`. Returns pid or None."""
+    try:
+        res = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True)
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                if f":{port} " in line or f":{port}\n" in line:
+                    import re
+
+                    m = re.search(r"pid=(\d+)", line)
+                    if m:
+                        return int(m.group(1))
+    except Exception:
+        pass
+    try:
+        res = subprocess.run(["lsof", f"-iTCP:{port}", "-sTCP:LISTEN", "-P", "-n"], capture_output=True, text=True)
+        if res.returncode == 0:
+            for line in res.stdout.splitlines()[1:]:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    return int(parts[1])
+    except Exception:
+        pass
+    return None
+
+
+async def contact_socket_owner(timeout: int = 10) -> bool:
+    """Dial the configured SOCKET_PATH, send a ping and wait up to `timeout` seconds for a reply.
+    If no reply, prompt the user to terminate the process holding the port and attempt to send SIGTERM.
+    Returns True if a response was received, False otherwise.
+    """
+    try:
+        with pynng.Pair0(dial=SOCKET_PATH) as sub:
+            await sub.asend(b"loaded")
+            try:
+                msg = await asyncio.wait_for(sub.arecv_msg(), timeout=timeout)
+                logger.debug(f"Received response from socket owner: {msg.bytes}")
+                return True
+            except asyncio.TimeoutError:
+                loop = asyncio.get_event_loop()
+                prompt = (
+                    f"No response from socket owner within {timeout}s. "
+                    f"Terminate process using {SOCKET_PATH.split(':')[-1]}? [y/N]: "
+                )
+                answer = await loop.run_in_executor(None, lambda: input(prompt))
+                if answer and answer.strip().lower().startswith("y"):
+                    import signal
+
+                    # find pid in executor to avoid blocking the event loop
+                    pid = await loop.run_in_executor(None, _find_pid_by_port, int(SOCKET_PATH.split(":")[-1]))
+                    if pid:
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                            logger.info(f"Sent SIGTERM to process {pid} holding port {SOCKET_PATH.split(':')[-1]}")
+                        except Exception as e:
+                            logger.error(f"Failed to kill process {pid}: {e}")
+                    else:
+                        logger.error("Could not determine PID of the process holding the socket")
+                else:
+                    logger.info("User declined to terminate existing process (or no input)")
+    except Exception as e:
+        logger.debug(f"Error while contacting existing socket owner: {e}")
+    return False
+
+
+def _ensure_run(maybe) -> None:
+    """If `maybe` is a coroutine, run or schedule it depending on event loop state."""
+    if not (asyncio.iscoroutine(maybe) or hasattr(maybe, "__await__")):
+        return
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            try:
+                asyncio.create_task(maybe)
+            except Exception:
+                pass
+        else:
+            loop.run_until_complete(maybe)
+    except RuntimeError:
+        try:
+            asyncio.run(maybe)
+        except Exception:
+            pass
+
+
 async def read_nng_messages():
     print("start nng")
     try:
@@ -283,70 +368,7 @@ async def read_nng_messages():
                         logger.error("invalid message")
     except pynng.exceptions.AddressInUse:
         logger.debug("Address in use")
-        # Try to contact the existing process and wait up to 10s for a response.
-        try:
-            # try to send a ping and wait for a reply
-            with pynng.Pair0(dial=SOCKET_PATH) as sub:
-                await sub.asend(b"loaded")
-                try:
-                    msg = await asyncio.wait_for(sub.arecv_msg(), timeout=10)
-                    logger.debug(f"Received response from socket owner: {msg.bytes}")
-                    return
-                except asyncio.TimeoutError:
-                    # no response within timeout -> offer to terminate owner
-                    loop = asyncio.get_event_loop()
-                    prompt = (
-                        f"No response from socket owner within 10s. "
-                        f"Terminate process using {SOCKET_PATH.split(':')[-1]}? [y/N]: "
-                    )
-                    answer = await loop.run_in_executor(None, lambda: input(prompt))
-                    if answer and answer.strip().lower().startswith("y"):
-                        import signal
-
-                        def _find_pid_by_port(port: int) -> int | None:
-                            # Try ss first, fallback to lsof. Return first pid found or None.
-                            try:
-                                res = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True)
-                                if res.returncode == 0:
-                                    for line in res.stdout.splitlines():
-                                        if f":{port} " in line or f":{port}\n" in line:
-                                            # pid=NUMBER, or users:("user",pid=PID,fd=")
-                                            import re
-
-                                            m = re.search(r"pid=(\d+)", line)
-                                            if m:
-                                                return int(m.group(1))
-                            except Exception:
-                                pass
-                            try:
-                                res = subprocess.run(["lsof", "-iTCP:%d" % port, "-sTCP:LISTEN", "-P", "-n"], capture_output=True, text=True)
-                                if res.returncode == 0:
-                                    for line in res.stdout.splitlines()[1:]:
-                                        parts = line.split()
-                                        if len(parts) >= 2 and parts[1].isdigit():
-                                            return int(parts[1])
-                            except Exception:
-                                pass
-                            return None
-
-                        try:
-                            port = int(SOCKET_PATH.split(":")[-1])
-                        except Exception:
-                            port = None
-
-                        pid = _find_pid_by_port(port) if port else None
-                        if pid:
-                            try:
-                                os.kill(pid, signal.SIGTERM)
-                                logger.info(f"Sent SIGTERM to process {pid} holding port {port}")
-                            except Exception as e:
-                                logger.error(f"Failed to kill process {pid}: {e}")
-                        else:
-                            logger.error("Could not determine PID of the process holding the socket")
-                    else:
-                        logger.info("User declined to terminate existing process (or no input)")
-        except Exception as e:
-            logger.debug(f"Error while contacting existing socket owner: {e}")
+        await contact_socket_owner(timeout=10)
 
         # Trigger shutdown from in the async loop
         global SHUTDOWN
@@ -466,9 +488,9 @@ async def upload_files_start(progress, upload_queue, case_id=None):
             continue
         with client:
             logger.debug("Refreshing post-upload UI sections")
-            loaded_series_ui.refresh()
-            loaded_files_ui.refresh()
-            uploaded_files_ui.refresh()
+            await loaded_series_ui.refresh()
+            await loaded_files_ui.refresh()
+            await uploaded_files_ui.refresh()
             ui.run_javascript(
                 """
                 setTimeout(() => {
@@ -523,8 +545,8 @@ async def load_files_start(progress_bar, queue, custom_path=None, copy=False):
 
     progress_bar.visible = False
     # load_series_view(loaded_series, loaded_series_data)
-    loaded_series_ui.refresh()
-    loaded_files_ui.refresh()
+    await loaded_series_ui.refresh()
+    await loaded_files_ui.refresh()
 
 
 async def reload_anonymized_start(progress_bar, queue):
@@ -542,8 +564,8 @@ async def reload_anonymized_start(progress_bar, queue):
         with client:
             ui.notify(f"Files reloaded: {len(loaded_files)}, [Series: {len(loaded_series)}] ", color="positive")
     # load_series_view(loaded_series, loaded_series_data)
-    loaded_series_ui.refresh()
-    loaded_files_ui.refresh()
+    await loaded_series_ui.refresh()
+    await loaded_files_ui.refresh()
 
 
 @ui.refreshable
@@ -600,8 +622,8 @@ def loaded_series_ui() -> None:
                         color="warning",
                     )
 
-                    loaded_series_ui.refresh()
-                    loaded_files_ui.refresh()
+                    _ensure_run(loaded_series_ui.refresh())
+                    _ensure_run(loaded_files_ui.refresh())
 
                 ui.label(loaded_series_data[key][0])
                 ui.label(loaded_series_data[key][1])
@@ -1086,7 +1108,8 @@ def login() -> Optional[RedirectResponse]:
                     save_api_token(token)
                     LOGIN_SUCCESS = True
                     LOGGED_IN_USER = user
-                    user_info_ui.refresh()
+                    maybe = user_info_ui.refresh()
+                    _ensure_run(maybe)
                     ui.notify("Logged in (token)!", color="positive")
                     ui.navigate.to("/")
                     return
@@ -1237,8 +1260,8 @@ async def main_page():
         loaded_duplicate_series = set()
         loaded_duplicate_series_links = defaultdict(set)
 
-        loaded_series_ui.refresh()
-        loaded_files_ui.refresh()
+        _ensure_run(loaded_series_ui.refresh())
+        _ensure_run(loaded_files_ui.refresh())
         ui.notify("Queue cleared", color="warning")
 
     with ui.dialog() as clear_queue_dialog:
@@ -1463,7 +1486,13 @@ def launch_app(
             LOGIN_SUCCESS = True
             LOGGED_IN_USER = info.get("username") or "API token"
             try:
-                user_info_ui.refresh()
+                maybe = user_info_ui.refresh()
+                try:
+                    if asyncio.iscoroutine(maybe) or hasattr(maybe, "__await__"):
+                        asyncio.run(maybe)
+                except RuntimeError:
+                    loop = asyncio.get_event_loop()
+                    loop.run_until_complete(maybe)
             except Exception:
                 pass
         else:
@@ -1479,10 +1508,11 @@ def launch_app(
                 pass
         except pynng.exceptions.AddressInUse:
             logger.debug("Address in use")
-            with pynng.Pair0(dial=SOCKET_PATH) as sub:
-                sub.send(b"loaded")
-                msg = sub.recv()
-                print(msg)
+            try:
+                # run the async helper from sync context
+                asyncio.run(contact_socket_owner(timeout=10))
+            except Exception:
+                logger.debug("Failed to contact socket owner from sync context")
             sys.exit(0)
 
         app.on_startup(read_nng_messages)

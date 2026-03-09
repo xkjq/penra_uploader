@@ -18,3 +18,5 @@ C:/* # Windows paths on linux
 launcher/debug/
 launcher/target/
 launcher/Cargo.lock
+
+uploader.log
