@@ -1,3 +1,4 @@
+from markdown2 import log
 import asyncio
 import subprocess
 import platform
@@ -83,12 +84,14 @@ def _find_pid_by_port(port: int) -> int | None:
     return None
 
 
+@logger.catch
 async def contact_socket_owner(socket_path: str, timeout: int = 10, allow_terminate: bool = True) -> bool:
     """Dial the given socket_path, send a ping and wait up to `timeout` seconds for a reply.
     If no reply, prompt the user to terminate the process holding the port and attempt to send SIGTERM.
     Returns True if a response was received, False otherwise.
     """
     try:
+        logger.debug(f"Attempting to contact socket owner at {socket_path} with timeout {timeout}s")    
         with pynng.Pair0(dial=socket_path) as sub:
             await sub.asend(b"loaded")
             try:
@@ -101,6 +104,42 @@ async def contact_socket_owner(socket_path: str, timeout: int = 10, allow_termin
                     logger.info("No response from socket owner and termination suppressed by settings")
                     return False
 
+                # Attempt to determine owner PID and describe both owner and current process
+                try:
+                    port = None
+                    try:
+                        port = int(socket_path.split(":")[-1])
+                    except Exception:
+                        port = None
+
+                    owner_pid = None
+                    if port:
+                        owner_pid = _find_pid_by_port(port)
+
+                    owner_desc = None
+                    if owner_pid:
+                        try:
+                            res = subprocess.run(["ps", "-p", str(owner_pid), "-o", "pid=,cmd="], capture_output=True, text=True)
+                            owner_desc = res.stdout.strip() if res and res.stdout else None
+                        except Exception:
+                            owner_desc = None
+
+                    our_pid = os.getpid()
+                    our_desc = None
+                    try:
+                        res2 = subprocess.run(["ps", "-p", str(our_pid), "-o", "pid=,cmd="], capture_output=True, text=True)
+                        our_desc = res2.stdout.strip() if res2 and res2.stdout else None
+                    except Exception:
+                        our_desc = None
+
+                    if owner_pid:
+                        logger.info(f"Requested socket {socket_path} appears held by pid {owner_pid}: {owner_desc}")
+                    else:
+                        logger.info(f"Requested socket {socket_path} appears in use, but owner pid not found")
+                    logger.info(f"Current process pid {our_pid}: {our_desc}")
+                except Exception as e:
+                    logger.debug(f"Failed to determine socket owner info: {e}")
+
                 loop = asyncio.get_event_loop()
                 prompt = (
                     f"No response from socket owner within {timeout}s. "
@@ -111,10 +150,6 @@ async def contact_socket_owner(socket_path: str, timeout: int = 10, allow_termin
                     import signal
 
                     # find pid in executor to avoid blocking the event loop
-                    try:
-                        port = int(socket_path.split(":")[-1])
-                    except Exception:
-                        port = None
                     pid = None
                     if port:
                         pid = await loop.run_in_executor(None, _find_pid_by_port, port)
