@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-from PyInstaller.log import DEBUG
 import asyncio
 import pynng
 
@@ -260,11 +259,72 @@ async def read_nng_messages():
                         logger.error("invalid message")
     except pynng.exceptions.AddressInUse:
         logger.debug("Address in use")
-        with pynng.Pair0(dial=SOCKET_PATH) as sub:
-            await sub.asend(b"loaded")
+        # Try to contact the existing process and wait up to 10s for a response.
+        try:
+            # try to send a ping and wait for a reply
+            with pynng.Pair0(dial=SOCKET_PATH) as sub:
+                await sub.asend(b"loaded")
+                try:
+                    msg = await asyncio.wait_for(sub.arecv_msg(), timeout=10)
+                    logger.debug(f"Received response from socket owner: {msg.bytes}")
+                    return
+                except asyncio.TimeoutError:
+                    # no response within timeout -> offer to terminate owner
+                    loop = asyncio.get_event_loop()
+                    prompt = (
+                        f"No response from socket owner within 10s. "
+                        f"Terminate process using {SOCKET_PATH.split(':')[-1]}? [y/N]: "
+                    )
+                    answer = await loop.run_in_executor(None, lambda: input(prompt))
+                    if answer and answer.strip().lower().startswith("y"):
+                        import signal
+
+                        def _find_pid_by_port(port: int) -> int | None:
+                            # Try ss first, fallback to lsof. Return first pid found or None.
+                            try:
+                                res = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True)
+                                if res.returncode == 0:
+                                    for line in res.stdout.splitlines():
+                                        if f":{port} " in line or f":{port}\n" in line:
+                                            # pid=NUMBER, or users:("user",pid=PID,fd=")
+                                            import re
+
+                                            m = re.search(r"pid=(\d+)", line)
+                                            if m:
+                                                return int(m.group(1))
+                            except Exception:
+                                pass
+                            try:
+                                res = subprocess.run(["lsof", "-iTCP:%d" % port, "-sTCP:LISTEN", "-P", "-n"], capture_output=True, text=True)
+                                if res.returncode == 0:
+                                    for line in res.stdout.splitlines()[1:]:
+                                        parts = line.split()
+                                        if len(parts) >= 2 and parts[1].isdigit():
+                                            return int(parts[1])
+                            except Exception:
+                                pass
+                            return None
+
+                        try:
+                            port = int(SOCKET_PATH.split(":")[-1])
+                        except Exception:
+                            port = None
+
+                        pid = _find_pid_by_port(port) if port else None
+                        if pid:
+                            try:
+                                os.kill(pid, signal.SIGTERM)
+                                logger.info(f"Sent SIGTERM to process {pid} holding port {port}")
+                            except Exception as e:
+                                logger.error(f"Failed to kill process {pid}: {e}")
+                        else:
+                            logger.error("Could not determine PID of the process holding the socket")
+                    else:
+                        logger.info("User declined to terminate existing process (or no input)")
+        except Exception as e:
+            logger.debug(f"Error while contacting existing socket owner: {e}")
 
         # Trigger shutdown from in the async loop
-        # This shouldn't be necessary
         global SHUTDOWN
         SHUTDOWN = True
         return
@@ -984,6 +1044,7 @@ def login() -> Optional[RedirectResponse]:
         pw = password.value
 
         global rqst, LOGIN_SUCCESS, LOGGED_IN_USER
+        logger.debug(f"Attempting token auth login for user: {user}")
         try:
             resp = requests.post(f"{BASE_SITE_URL}{TOKEN_AUTH_PATH}", json={"username": user, "password": pw}, timeout=10)
         except requests.exceptions.RequestException as e:
