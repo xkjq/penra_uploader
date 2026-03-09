@@ -284,13 +284,13 @@ def find_free_tcp_port(start_port: int, max_tries: int = 100) -> int | None:
     return None
 
 
-from socket_helpers import contact_socket_owner, ensure_run as _ensure_run
 
 
 async def read_nng_messages():
-    print("start nng")
+    logger.debug("start nng")
     try:
         with pynng.Pair0(listen=SOCKET_PATH) as sub:
+            logger.debug(f"Successfully bound NNG socket at {SOCKET_PATH}")
             # sub.subscribe('')
             while not app.is_stopped:
                 msg = await sub.arecv_msg()
@@ -1617,6 +1617,7 @@ def launch_app(
             logger.debug(f"Binding attempt {attempt_count} to {SOCKET_PATH}")
             try:
                 with pynng.Pair0(listen=SOCKET_PATH) as sub:
+                    logger.debug(f"Successfully bound NNG socket at {SOCKET_PATH}")
                     bound = True
             except pynng.exceptions.AddressInUse:
                 logger.debug("Address in use")
