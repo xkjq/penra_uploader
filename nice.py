@@ -1609,13 +1609,16 @@ def launch_app(
         logger.debug("Loaded API token from storage; validating...")
         info = check_token()
         if info and info.get("valid"):
+            logger.debug(f"Stored API token is valid for user: {info.get('username')}")
             LOGIN_SUCCESS = True
             LOGGED_IN_USER = info.get("username") or "API token"
             maybe = user_info_ui.refresh()
             try:
+                logger.debug("Refreshing user info UI with loaded token")
                 if asyncio.iscoroutine(maybe) or hasattr(maybe, "__await__"):
                     asyncio.run(maybe)
             except RuntimeError:
+                logger.debug("Event loop already running; scheduling refresh in existing loop")
                 loop = asyncio.get_event_loop()
                 loop.run_until_complete(maybe)
         else:
