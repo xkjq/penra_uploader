@@ -251,7 +251,47 @@ uploaded_files: dict = {}
 duplicate_series = set()
 OPEN_LINKS_PROD = False
 AUTSELECT_NNG_PORT = False
+ALLOW_INSECURE_RETRY = False
+_requests_orig_request = None
 
+def enable_skip_verify():
+    """Globally disable SSL verification for requests.
+    Monkeypatches `requests.sessions.Session.request` to default `verify=False`
+    and silences the InsecureRequestWarning.
+    """
+    global _requests_orig_request
+    try:
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
+
+    if _requests_orig_request is None:
+        try:
+            _requests_orig_request = requests.sessions.Session.request
+
+            def _patched_request(self, method, url, *args, **kwargs):
+                if "verify" not in kwargs:
+                    kwargs["verify"] = False
+                return _requests_orig_request(self, method, url, *args, **kwargs)
+
+            requests.sessions.Session.request = _patched_request
+            logger.warning("Global requests verification disabled (skip-verify enabled)")
+        except Exception as e:
+            logger.debug(f"Failed to enable global skip-verify: {e}")
+
+
+def disable_skip_verify():
+    """Restore original requests behavior (re-enable verification)."""
+    global _requests_orig_request
+    try:
+        if _requests_orig_request is not None:
+            requests.sessions.Session.request = _requests_orig_request
+            _requests_orig_request = None
+            logger.info("Global requests verification re-enabled")
+    except Exception as e:
+        logger.debug(f"Failed to disable global skip-verify: {e}")
 
 def human_size(num, suffix="B"):
     # Convert bytes to human-readable string (KiB, MiB, ...)
@@ -1139,9 +1179,33 @@ def login() -> Optional[RedirectResponse]:
             logger.debug(f"Token auth SSL error: {e}")
             logger.error(
                 "SSL error when connecting to token endpoint; if you're behind a corporate proxy, "
-                "set UPLOADER_CACERT to your proxy CA bundle or set UPLOADER_SKIP_SSL_VERIFY=1 to disable verification (not recommended)."
+                "set UPLOADER_CACERT to your proxy CA bundle or enable 'Allow insecure connections' in Settings to disable verification (not recommended)."
             )
-            ui.notify("SSL connection error (proxy?). See logs.", color="negative")
+            ui.notify("SSL connection error (proxy?). Redirecting to Settings...", color="negative")
+            try:
+                # Navigate user to main page where Settings expansion lives and
+                # attempt to scroll to/open it for quick access.
+                ui.navigate.to("/")
+                ui.run_javascript(
+                    """
+                    (function(){
+                        // Find an element with text 'Settings' and try to open/scroll it
+                        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT, null, false);
+                        let node;
+                        while(node = walker.nextNode()){
+                            try{
+                                if(node.innerText && node.innerText.trim().startsWith('Settings')){
+                                    node.scrollIntoView({behavior:'smooth', block:'center'});
+                                    try{ node.click(); } catch(e){}
+                                    break;
+                                }
+                            } catch(e){}
+                        }
+                    })();
+                    """,
+                )
+            except Exception:
+                logger.debug("Failed to navigate to settings after SSL error")
             return
         except requests.exceptions.RequestException as e:
             logger.debug(f"Token auth request failed: {e}")
@@ -1446,6 +1510,22 @@ async def main_page():
                 "Open external links on production site", value=False
             )
 
+        with ui.row():
+            # initialize skip-verify switch based on env var
+            skip_verify_initial = os.environ.get("UPLOADER_SKIP_SSL_VERIFY", "").lower() in ("1", "true", "yes", "y")
+            skip_verify_switch = ui.switch("Allow insecure connections (disable SSL verification)", value=skip_verify_initial)
+
+            def on_skip_verify_change(e=None):
+                v = skip_verify_switch.value
+                if v:
+                    os.environ["UPLOADER_SKIP_SSL_VERIFY"] = "1"
+                    enable_skip_verify()
+                else:
+                    os.environ.pop("UPLOADER_SKIP_SSL_VERIFY", None)
+                    disable_skip_verify()
+
+            skip_verify_switch.on("update", on_skip_verify_change)
+
             def set_open_prod(v=open_prod_switch):
                 global OPEN_LINKS_PROD
                 OPEN_LINKS_PROD = v.value
@@ -1528,11 +1608,14 @@ def launch_app(
     autoselect_nng_maxtries: int = typer.Option(
         100, help="How many ports to probe when auto-selecting"
     ),
+    allow_insecure_retry: bool = typer.Option(
+        False, help="If an SSL error occurs, retry the request with verification disabled"
+    ),
 ):
     global WORK_DIR, EXPORT_PATH, PROCESS_PATH, ANON_PATH
 
     global BASE_SITE_URL
-    logger.debug(f"launch_app called with work_dir={work_dir}, nng={nng}, native_mode={native_mode}, debug={debug}, verbose={verbose}, autoselect_nng_port={autoselect_nng_port}, autoselect_nng_maxtries={autoselect_nng_maxtries}")
+    logger.debug(f"launch_app called with work_dir={work_dir}, nng={nng}, native_mode={native_mode}, debug={debug}, verbose={verbose}, autoselect_nng_port={autoselect_nng_port}, autoselect_nng_maxtries={autoselect_nng_maxtries}, allow_insecure_retry={allow_insecure_retry}")
 
     WORK_DIR = work_dir
     EXPORT_PATH = WORK_DIR / Path("export/")
@@ -1624,6 +1707,19 @@ def launch_app(
         logger.error(f"Failed to initialize Anonymizer: {e}")
 
     logger.debug(f"Work dir: {WORK_DIR}")
+
+    # allow insecure retry behavior to be controlled via CLI or env var
+    global ALLOW_INSECURE_RETRY
+    ALLOW_INSECURE_RETRY = allow_insecure_retry or os.environ.get("UPLOADER_ALLOW_INSECURE_RETRY", "").lower() in ("1", "true", "yes", "y")
+    # Configure global requests behavior for CA bundle or disabling verification
+    ca_bundle = os.environ.get("UPLOADER_CACERT")
+    if ca_bundle:
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", ca_bundle)
+
+    # If verification is disabled, enable skip-verify globally
+    skip_verify = os.environ.get("UPLOADER_SKIP_SSL_VERIFY", "").lower() in ("1", "true", "yes", "y")
+    if skip_verify:
+        enable_skip_verify()
 
     logger.debug(f"NNG enabled: {nng}")
     if nng:
