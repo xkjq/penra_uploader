@@ -260,26 +260,80 @@ def human_size(num, suffix="B"):
 
 
 def _find_pid_by_port(port: int) -> int | None:
-    """Try to find a pid listening on TCP port using `ss` or `lsof`. Returns pid or None."""
+    """Try to find a pid listening on TCP port using platform-appropriate tools.
+    On Windows use `netstat -ano`. On Unix try `ss`, `netstat`, `lsof`, or `fuser`.
+    Returns pid or None.
+    """
+    import re
+    system = platform.system().lower()
+
+    # Windows: use netstat -ano and parse PID in last column
+    if system.startswith("win"):
+        try:
+            res = subprocess.run(["netstat", "-ano"], capture_output=True, text=True)
+            if res.returncode == 0 and res.stdout:
+                for line in res.stdout.splitlines():
+                    if f":{port}" in line:
+                        parts = line.split()
+                        if parts:
+                            # last token should be PID on Windows netstat
+                            pid_token = parts[-1]
+                            if pid_token.isdigit():
+                                return int(pid_token)
+        except Exception:
+            pass
+        return None
+
+    # 1) try ss
     try:
         res = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True)
-        if res.returncode == 0:
+        if res.returncode == 0 and res.stdout:
+            # look for pid=NNN anywhere on lines mentioning the port
             for line in res.stdout.splitlines():
-                if f":{port} " in line or f":{port}\n" in line:
-                    import re
-
+                if f":{port}" in line:
                     m = re.search(r"pid=(\d+)", line)
                     if m:
                         return int(m.group(1))
     except Exception:
         pass
+
+    # 2) try netstat
+    try:
+        res = subprocess.run(["netstat", "-ltnp"], capture_output=True, text=True)
+        if res.returncode == 0 and res.stdout:
+            for line in res.stdout.splitlines():
+                if f":{port}" in line:
+                    m = re.search(r"(\d+)/(?:[\w\-\.]+)", line)
+                    if m:
+                        return int(m.group(1))
+    except Exception:
+        pass
+
+    # 3) try lsof
     try:
         res = subprocess.run(["lsof", f"-iTCP:{port}", "-sTCP:LISTEN", "-P", "-n"], capture_output=True, text=True)
-        if res.returncode == 0:
-            for line in res.stdout.splitlines()[1:]:
+        if res.returncode == 0 and res.stdout:
+            lines = res.stdout.splitlines()
+            for line in lines[1:]:
                 parts = line.split()
+                # lsof columns: COMMAND PID USER ...
                 if len(parts) >= 2 and parts[1].isdigit():
                     return int(parts[1])
+    except Exception:
+        pass
+
+    # 4) try fuser
+    try:
+        res = subprocess.run(["fuser", f"{port}/tcp"], capture_output=True, text=True)
+        if res.returncode == 0 and res.stdout:
+            m = re.search(r"(\d+)", res.stdout)
+            if m:
+                return int(m.group(1))
+    except Exception:
+        pass
+
+    try:
+        logger.debug(f"_find_pid_by_port: no pid found for port {port}")
     except Exception:
         pass
     return None
