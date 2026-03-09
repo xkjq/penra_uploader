@@ -1597,6 +1597,7 @@ def launch_app(
     global anonymizer
     try:
         anonymizer = Anonymizer(ANON_PATH)
+        logger.debug("Anonymizer initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize Anonymizer: {e}")
 
@@ -1622,14 +1623,16 @@ def launch_app(
             try:
                 clear_api_token()
             except Exception:
-                pass
+                logger.error("Failed to clear invalid API token from storage")
 
+    logger.debug(f"NNG enabled: {nng}")
     if nng:
         # Attempt to bind the NNG listening socket. If it's already in use we can
         # optionally autoselect the next free TCP port and retry.
         # record autoselect flag globally for other code to reference
         global AUTSELECT_NNG_PORT, SOCKET_PATH
         AUTSELECT_NNG_PORT = autoselect_nng_port
+        logger.debug(f"Attempting to bind NNG socket at {SOCKET_PATH} (autoselect={AUTSELECT_NNG_PORT})")
         bound = False
         attempt_count = 0
         while not bound:
