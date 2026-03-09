@@ -12,3 +12,4 @@ loguru
 pyinstaller
 nicegui
 keyring
+pywin32 ; sys_platform == 'win32'

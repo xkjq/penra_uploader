@@ -1378,7 +1378,39 @@ def launch_app(
     else:
         log_level = "WARNING"
 
-    logger.add(sys.stderr, level=log_level)
+    def setup_logging(level: str):
+        # If running as a PyInstaller frozen executable on Windows (no console),
+        # write logs to a rotating file in the user's app data; otherwise write to stderr.
+        try:
+            is_frozen = getattr(sys, "frozen", False)
+            system = platform.system().lower()
+            if is_frozen and system.startswith("win"):
+                # prefer APPDATA, fallback to HOME
+                appdata = os.getenv("APPDATA") or str(Path.home())
+                log_dir = Path(appdata) / APP_NAME
+                log_dir.mkdir(parents=True, exist_ok=True)
+                log_file = log_dir / "uploader.log"
+                logger.add(
+                    str(log_file),
+                    level=level,
+                    rotation="10 MB",
+                    retention="7 days",
+                    enqueue=True,
+                    backtrace=True,
+                    diagnose=False,
+                )
+            else:
+                logger.add(sys.stderr, level=level, enqueue=True)
+        except Exception:
+            # last resort: write to a temp file
+            try:
+                tmp = Path(os.getenv("TMP", "/tmp"))
+                log_file = tmp / f"{APP_NAME}.log"
+                logger.add(str(log_file), level=level, enqueue=True)
+            except Exception:
+                pass
+
+    setup_logging(log_level)
 
     # ensure paths exist
     EXPORT_PATH.mkdir(exist_ok=True, parents=True)
