@@ -272,6 +272,7 @@ def enable_skip_verify():
             _requests_orig_request = requests.sessions.Session.request
 
             def _patched_request(self, method, url, *args, **kwargs):
+                logger.debug(f"Patched request called: {method} {url} verify={kwargs.get('verify', 'not set')}")
                 if "verify" not in kwargs:
                     kwargs["verify"] = False
                 return _requests_orig_request(self, method, url, *args, **kwargs)
