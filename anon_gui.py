@@ -9,6 +9,7 @@ from typing import Iterable
 from bs4 import BeautifulSoup
 import numpy as np
 import requests
+import config as cfg
 import webbrowser
 
 # from blake3 import blake3
@@ -564,10 +565,12 @@ class AnonGui(wx.App):
         logger.debug(f"Input dir: {input_dir}")
         logger.debug(f"Output dir: {output_dir}")
 
-        self.base_site_url = "https://www.penracourses.org.uk"
+        # use central config value by default
+        self.base_site_url = cfg.BASE_SITE_URL
 
         if dev:
-            self.base_site_url = "http://localhost:8000"
+            cfg.BASE_SITE_URL = "http://localhost:8000"
+            self.base_site_url = cfg.BASE_SITE_URL
 
         self.login_success = False
 

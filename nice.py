@@ -42,6 +42,7 @@ import typer
 import logging
 
 from socket_helpers import contact_socket_owner, ensure_run as _ensure_run
+import config as cfg
 
 
 WORK_DIR = Path("C:/uploader")
@@ -56,15 +57,14 @@ ANON_PATH.mkdir(exist_ok=True, parents=True)
 
 
 # Server endpoints and defaults
-BASE_SITE_URL = "https://www.penracourses.org.uk"
 TOKEN_AUTH_PATH = "/api/atlas/create_api_token"  # POST {username,password} -> {token: '...'}
 TOKEN_CHECK_PATH = "/api/atlas/token_check"
 HASH_CHECK_PATH = "/api/atlas/check_image_hashes/"
-PROD_BASE_SITE_URL = "https://www.penracourses.org.uk"
 
 SOCKET_PATH = "tcp://localhost:9976"
 
-LOGIN_URL = f"{BASE_SITE_URL}/accounts/login/"
+# Use cfg.BASE_SITE_URL or cfg.PROD_BASE_SITE_URL where needed; LOGIN URL is
+# constructed at time of use (e.g. f"{cfg.BASE_SITE_URL}/accounts/login/").
 
 LOGIN_SUCCESS = False
 
@@ -191,7 +191,7 @@ def check_token() -> dict | None:
     try:
         # Prefer header auth if session exists
         if rqst and "Authorization" in rqst.headers:
-            resp = rqst.post(f"{BASE_SITE_URL}{TOKEN_CHECK_PATH}")
+            resp = rqst.post(f"{cfg.BASE_SITE_URL}{TOKEN_CHECK_PATH}")
         else:
             # try to read token from storage and POST as json
             token = None
@@ -207,7 +207,7 @@ def check_token() -> dict | None:
             if not token:
                 return None
             resp = requests.post(
-                f"{BASE_SITE_URL}{TOKEN_CHECK_PATH}", json={"token": token}, timeout=5
+                f"{cfg.BASE_SITE_URL}{TOKEN_CHECK_PATH}", json={"token": token}, timeout=5
             )
 
         if resp.status_code != 200:
@@ -655,7 +655,7 @@ def loaded_series_ui() -> None:
                     ui.label("Duplicate detected on server").classes("text-red-500")
                     series_links = loaded_duplicate_series_links.get(key, set())
                     if series_links:
-                        base = PROD_BASE_SITE_URL if OPEN_LINKS_PROD else BASE_SITE_URL
+                        base = cfg.PROD_BASE_SITE_URL if OPEN_LINKS_PROD else cfg.BASE_SITE_URL
                         for link in sorted(series_links):
                             series_link = (
                                 link
@@ -733,7 +733,7 @@ def uploaded_files_ui() -> None:
         ui.label(f"Items: {len(uploaded_files)}")
         with ui.list():
             for series in duplicate_series:
-                base = PROD_BASE_SITE_URL if OPEN_LINKS_PROD else BASE_SITE_URL
+                base = cfg.PROD_BASE_SITE_URL if OPEN_LINKS_PROD else cfg.BASE_SITE_URL
                 series_link = (
                     series if str(series).startswith("http") else f"{base}{series}"
                 )
@@ -820,10 +820,10 @@ def load_files(q: Queue, src_path: Path | None = None, copy: bool = False, rqst=
                 rqst.headers["X-CSRFToken"] = rqst.cookies.get("csrftoken", "")
 
             hash_payload = list(set(output_file_hashes.values()))
-            resp = rqst.post(f"{BASE_SITE_URL}{HASH_CHECK_PATH}", json=hash_payload)
+            resp = rqst.post(f"{cfg.BASE_SITE_URL}{HASH_CHECK_PATH}", json=hash_payload)
             if resp.status_code in (400, 422):
                 resp = rqst.post(
-                    f"{BASE_SITE_URL}{HASH_CHECK_PATH}", json={"hashes": hash_payload}
+                    f"{cfg.BASE_SITE_URL}{HASH_CHECK_PATH}", json={"hashes": hash_payload}
                 )
 
             if resp.status_code == 200:
@@ -991,10 +991,10 @@ def upload_files(q, rqst, case_id=None):
                 rqst.headers["X-CSRFToken"] = rqst.cookies.get("csrftoken", "")
 
             hash_payload = list(hash_to_paths.keys())
-            resp = rqst.post(f"{BASE_SITE_URL}{HASH_CHECK_PATH}", json=hash_payload)
+            resp = rqst.post(f"{cfg.BASE_SITE_URL}{HASH_CHECK_PATH}", json=hash_payload)
             if resp.status_code in (400, 422):
                 resp = rqst.post(
-                    f"{BASE_SITE_URL}{HASH_CHECK_PATH}", json={"hashes": hash_payload}
+                    f"{cfg.BASE_SITE_URL}{HASH_CHECK_PATH}", json={"hashes": hash_payload}
                 )
             if resp.status_code != 200:
                 logger.warning(f"Pre-upload hash check failed: {resp.status_code}")
@@ -1081,9 +1081,9 @@ def upload_files(q, rqst, case_id=None):
 
                 # choose endpoint based on whether a case_id was supplied
                 if case_id:
-                    endpoint = f"{BASE_SITE_URL}/api/atlas/upload_dicom_case/{case_id}"
+                    endpoint = f"{cfg.BASE_SITE_URL}/api/atlas/upload_dicom_case/{case_id}"
                 else:
-                    endpoint = f"{BASE_SITE_URL}/api/atlas/upload_dicom"
+                    endpoint = f"{cfg.BASE_SITE_URL}/api/atlas/upload_dicom"
 
                 resp = rqst.post(endpoint, files=files)
 
@@ -1172,7 +1172,7 @@ def login() -> Optional[RedirectResponse]:
 
         try:
             resp = session.post(
-                f"{BASE_SITE_URL}{TOKEN_AUTH_PATH}",
+                f"{cfg.BASE_SITE_URL}{TOKEN_AUTH_PATH}",
                 json={"username": user, "password": pw},
                 timeout=10,
             )
@@ -1309,7 +1309,7 @@ async def main_page():
             ui.notify("Not logged in", color="negative")
             return
         try:
-            resp = rqst.get(f"{BASE_SITE_URL}/api/atlas/get_cases_available")
+            resp = rqst.get(f"{cfg.BASE_SITE_URL}/api/atlas/get_cases_available")
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
@@ -1507,6 +1507,51 @@ async def main_page():
             ui.label(f"Anon path: {ANON_PATH}")
             ui.button("Open", on_click=lambda: open_path(ANON_PATH))
         with ui.row():
+            ui.label("Base site URL:")
+            # Radio selection for prod/dev/custom
+            site_choice = ui.radio(
+                {
+                    "production": f"Production ({cfg.PROD_BASE_SITE_URL})",
+                    "development": f"Development ({cfg.DEV_BASE_SITE_URL})",
+                    "custom": "Custom",
+                },
+                value=("production") if cfg.BASE_SITE_URL == cfg.PROD_BASE_SITE_URL else ("development" if cfg.BASE_SITE_URL == cfg.DEV_BASE_SITE_URL else "custom"),
+            )
+
+        with ui.row():
+            custom_url_input = ui.input("Custom base URL", value=(cfg.BASE_SITE_URL if cfg.BASE_SITE_URL not in (cfg.PROD_BASE_SITE_URL, cfg.DEV_BASE_SITE_URL) else ""))
+            save_url_btn = ui.button("Save URL")
+
+        def on_site_choice_change(e=None):
+            v = site_choice.value
+            if v == "production":
+                cfg.set_base_site_url(cfg.PROD_BASE_SITE_URL)
+                custom_url_input.value = ""
+                custom_url_input.visible = False
+                ui.notify(f"Base site set to Production: {cfg.PROD_BASE_SITE_URL}", color="positive")
+            elif v == "development":
+                cfg.set_base_site_url(cfg.DEV_BASE_SITE_URL)
+                custom_url_input.value = ""
+                custom_url_input.visible = False
+                ui.notify(f"Base site set to Development: {cfg.DEV_BASE_SITE_URL}", color="positive")
+            else:
+                custom_url_input.visible = True
+
+        site_choice.on("click", on_site_choice_change)
+
+        def save_custom_url():
+            val = custom_url_input.value.strip()
+            if not val:
+                ui.notify("Custom URL cannot be empty", color="negative")
+                return
+            cfg.set_base_site_url(val)
+            ui.notify(f"Custom base site URL set to {val}", color="positive")
+
+        save_url_btn.on("click", lambda e=None: save_custom_url())
+
+        # hide custom input unless 'custom' is selected
+        custom_url_input.visible = site_choice.value == "custom"
+        with ui.row():
             open_prod_switch = ui.switch(
                 "Open external links on production site", value=False
             )
@@ -1607,8 +1652,9 @@ def launch_app(
     nng: bool = typer.Option(True, help="Use nng"),
     native_mode: bool = typer.Option(False, help="Use native mode"),
     debug: bool = typer.Option(False, help="Enable debug mode"),
+    base_site_url: str = typer.Option(None, help="Base site URL to use (overrides default)"),
     verbose: int = typer.Option(
-        0, "--verbose", "-v", help="Verbosity level (0=warning,1=info,2=debug)"
+        0, "--verbose", "-v", help="Verbosity level (0=warning,1=info,2=debug, 3+=trace)"
     ),
     autoselect_nng_port: bool = typer.Option(
         False,
@@ -1623,18 +1669,20 @@ def launch_app(
 ):
     global WORK_DIR, EXPORT_PATH, PROCESS_PATH, ANON_PATH
 
-    global BASE_SITE_URL
-    logger.debug(f"launch_app called with work_dir={work_dir}, nng={nng}, native_mode={native_mode}, debug={debug}, verbose={verbose}, autoselect_nng_port={autoselect_nng_port}, autoselect_nng_maxtries={autoselect_nng_maxtries}, allow_insecure_retry={allow_insecure_retry}")
+    logger.debug(f"launch_app called with work_dir={work_dir}, nng={nng}, native_mode={native_mode}, debug={debug}, base_site_url={base_site_url}, verbose={verbose}, autoselect_nng_port={autoselect_nng_port}, autoselect_nng_maxtries={autoselect_nng_maxtries}, allow_insecure_retry={allow_insecure_retry}")
 
     WORK_DIR = work_dir
     EXPORT_PATH = WORK_DIR / Path("export/")
     PROCESS_PATH = WORK_DIR / Path("to_process/")
     ANON_PATH = WORK_DIR / Path("anon/")
 
+    # initialize config from CLI args and debug flag
+    cfg.init_from_cli(base_site_url, debug)
+
     # allow overriding DEBUG and switch to test endpoints/paths when requested
     if debug:
         WORK_DIR = Path("./test/work")
-        BASE_SITE_URL = "http://localhost:8080"
+        cfg.BASE_SITE_URL = "http://localhost:8080"
         EXPORT_PATH = Path("./test/export")
         PROCESS_PATH = Path("./test/to_process")
         ANON_PATH = Path("./test/anon")
@@ -1642,7 +1690,9 @@ def launch_app(
 
     # configure logging verbosity
     logger.remove()
-    if verbose >= 2:
+    if verbose >= 3:
+        log_level = "TRACE"
+    elif verbose == 2:
         log_level = "DEBUG"
     elif verbose == 1:
         log_level = "INFO"
