@@ -6,9 +6,8 @@ import pynng
 from collections import defaultdict
 from pathlib import Path
 
-from nicegui import ui, app, html, run, Client, native
+from nicegui import ui, app, run, Client, native
 
-from datetime import datetime
 
 import logging
 
@@ -23,7 +22,6 @@ import platform
 import shutil
 
 import requests
-import time
 import blake3
 
 from multiprocessing import Manager, Queue, freeze_support
@@ -35,11 +33,8 @@ from local_folder_picker import local_folder_picker
 
 from typing import Optional
 
-from fastapi import Request
 from fastapi.responses import RedirectResponse
-from starlette.middleware.base import BaseHTTPMiddleware
 import typer
-import logging
 
 from socket_helpers import contact_socket_owner, ensure_run as _ensure_run
 import config as cfg

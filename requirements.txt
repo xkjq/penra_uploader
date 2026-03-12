@@ -3,7 +3,6 @@ typer
 pydicom
 dicognito
 python-datauri
-bs4
 requests
 pynng
 blake3
