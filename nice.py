@@ -372,7 +372,7 @@ async def read_nng_messages():
 
 # anonymizer will be initialized at startup inside `launch_app` so debug
 # mode can override the paths before the object is created.
-anonymizer = None
+anonymizer: Anonymizer | None = None
 
 
 async def upload_files_start(progress, upload_queue, case_id=None):
@@ -788,6 +788,9 @@ def load_files(q: Queue, src_path: Path | None = None, copy: bool = False, rqst=
 
     to_process_len = len(to_process)
     for n, file in enumerate(to_process):
+        # `anonymizer` is initialized in `launch_app` after paths are set.
+        # Add a runtime check so static type checkers know it's not None here.
+        assert anonymizer is not None, "Anonymizer not initialized"
         dataset, output_file = anonymizer.anonymize_file(file, remove_original=True)
         # with processed_files:
         #    ui.item(f"{datetime.now().strftime('%H:%M:%S')} - {file.name} -> {output_file.name}")
