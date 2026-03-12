@@ -254,7 +254,7 @@ loaded_duplicate_series = set()
 loaded_duplicate_series_links = defaultdict(set)
 uploaded_files: dict = {}
 duplicate_series = set()
-OPEN_LINKS_PROD = False
+# OPEN_LINKS_PROD removed; links follow cfg.BASE_SITE_URL
 AUTSELECT_NNG_PORT = False
 ALLOW_INSECURE_RETRY = False
 _requests_orig_request = None
@@ -665,7 +665,7 @@ def loaded_series_ui() -> None:
                     ui.label("Duplicate detected on server").classes("text-red-500")
                     series_links = loaded_duplicate_series_links.get(key, set())
                     if series_links:
-                        base = cfg.PROD_BASE_SITE_URL if OPEN_LINKS_PROD else cfg.BASE_SITE_URL
+                        base = cfg.BASE_SITE_URL
                         for link in sorted(series_links):
                             series_link = (
                                 link
@@ -743,7 +743,7 @@ def uploaded_files_ui() -> None:
         ui.label(f"Items: {len(uploaded_files)}")
         with ui.list():
             for series in duplicate_series:
-                base = cfg.PROD_BASE_SITE_URL if OPEN_LINKS_PROD else cfg.BASE_SITE_URL
+                base = cfg.BASE_SITE_URL
                 series_link = (
                     series if str(series).startswith("http") else f"{base}{series}"
                 )
@@ -1565,11 +1565,6 @@ async def main_page():
         # hide custom input unless 'custom' is selected
         custom_url_input.visible = site_choice.value == "custom"
         with ui.row():
-            open_prod_switch = ui.switch(
-                "Open external links on production site", value=False
-            )
-
-        with ui.row():
             # initialize skip-verify switch based on env var
             skip_verify_initial = os.environ.get("UPLOADER_SKIP_SSL_VERIFY", "").lower() in ("1", "true", "yes", "y")
 
@@ -1593,11 +1588,7 @@ async def main_page():
             # use 'click' event to catch toggle changes reliably
             skip_verify_switch.on("click", on_skip_verify_change)
 
-            def set_open_prod(v=open_prod_switch):
-                global OPEN_LINKS_PROD
-                OPEN_LINKS_PROD = v.value
-
-            open_prod_switch.on("click", set_open_prod)
+            # Note: external link behavior follows the configured base URL.
             # API token management
             with ui.row():
                 token_input = ui.input("API token (paste here)")
