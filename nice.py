@@ -37,6 +37,8 @@ from fastapi.responses import RedirectResponse
 import typer
 
 from socket_helpers import contact_socket_owner, ensure_run as _ensure_run
+from concurrent.futures import ProcessPoolExecutor as _ProcessPoolExecutor
+from pathlib import Path as _Path
 import config as cfg
 
 
@@ -368,6 +370,26 @@ async def read_nng_messages():
 # anonymizer will be initialized at startup inside `launch_app` so debug
 # mode can override the paths before the object is created.
 anonymizer: Anonymizer | None = None
+
+
+def _worker_init(anon_path_str: str, seed_str: str | None = "") -> None:
+    """Initialize worker process globals (runs in subprocesses).
+
+    This function is passed to the ProcessPoolExecutor initializer so each
+    worker process creates its own Anonymizer instance with the same
+    configuration as the main process.
+    """
+    global anonymizer
+    try:
+        seed: int | None = None
+        if seed_str:
+            try:
+                seed = int(seed_str)
+            except Exception:
+                seed = None
+        anonymizer = Anonymizer(_Path(anon_path_str), seed)
+    except Exception:
+        anonymizer = None
 
 
 async def upload_files_start(progress, upload_queue, case_id=None):
@@ -783,10 +805,12 @@ def load_files(q: Queue, src_path: Path | None = None, copy: bool = False, rqst=
 
     to_process_len = len(to_process)
     for n, file in enumerate(to_process):
-        # `anonymizer` is initialized in `launch_app` after paths are set.
-        # Add a runtime check so static type checkers know it's not None here.
-        assert anonymizer is not None, "Anonymizer not initialized"
-        dataset, output_file = anonymizer.anonymize_file(file, remove_original=True)
+        # Use a local anonymizer inside worker process if the module-level
+        # `anonymizer` wasn't initialized in this process (e.g. when running
+        # inside a ProcessPoolExecutor). This avoids AssertionError in
+        # subprocesses while reusing the same behavior.
+        local_anonymizer = anonymizer if anonymizer is not None else Anonymizer(ANON_PATH, cfg.get_anonymizer_seed())
+        dataset, output_file = local_anonymizer.anonymize_file(file, remove_original=True)
         # with processed_files:
         #    ui.item(f"{datetime.now().strftime('%H:%M:%S')} - {file.name} -> {output_file.name}")
 
@@ -1559,6 +1583,47 @@ async def main_page():
 
         # hide custom input unless 'custom' is selected
         custom_url_input.visible = site_choice.value == "custom"
+        # Anonymizer seed control
+        with ui.row():
+            seed_input = ui.input("Anonymizer seed (integer)", value=(str(cfg.get_anonymizer_seed()) if cfg.get_anonymizer_seed() is not None else ""))
+            seed_save_btn = ui.button("Save seed")
+
+        def save_seed():
+            v = seed_input.value.strip()
+            if v == "":
+                cfg.set_anonymizer_seed(None)
+                ui.notify("Anonymizer seed cleared (non-deterministic)", color="warning")
+            else:
+                try:
+                    s = int(v)
+                except Exception:
+                    ui.notify("Seed must be an integer", color="negative")
+                    return
+                cfg.set_anonymizer_seed(s)
+                ui.notify(f"Anonymizer seed set to {s}", color="positive")
+
+            # reinitialize main anonymizer and worker processes with new seed
+            global anonymizer
+            try:
+                anonymizer = Anonymizer(ANON_PATH, cfg.get_anonymizer_seed())
+                logger.debug(f"Reinitialized main Anonymizer with seed={cfg.get_anonymizer_seed()}")
+            except Exception as e:
+                logger.error("Failed to reinitialize Anonymizer: %s", e)
+
+            try:
+                if run.process_pool is not None:
+                    try:
+                        run.process_pool.shutdown(wait=False, cancel_futures=True)
+                    except Exception:
+                        pass
+                seed = cfg.get_anonymizer_seed()
+                seed_arg = "" if seed is None else str(seed)
+                run.process_pool = _ProcessPoolExecutor(initializer=_worker_init, initargs=(str(ANON_PATH), seed_arg))
+                logger.debug("Recreated process pool with new anonymizer seed=%s", seed)
+            except Exception as e:
+                logger.error("Failed to recreate process pool after seed change: %s", e)
+
+        seed_save_btn.on("click", lambda e=None: save_seed())
         with ui.row():
             # initialize skip-verify switch based on env var
             skip_verify_initial = os.environ.get("UPLOADER_SKIP_SSL_VERIFY", "").lower() in ("1", "true", "yes", "y")
@@ -1652,6 +1717,7 @@ def launch_app(
     native_mode: bool = typer.Option(False, help="Use native mode"),
     debug: bool = typer.Option(False, help="Enable debug mode"),
     base_site_url: str = typer.Option(None, help="Base site URL to use (overrides default)"),
+    anonymizer_seed: int = typer.Option(None, help="Seed for anonymizer (integer)"),
     verbose: int = typer.Option(
         0, "--verbose", "-v", help="Verbosity level (0=warning,1=info,2=debug, 3+=trace)"
     ),
@@ -1675,8 +1741,8 @@ def launch_app(
     PROCESS_PATH = WORK_DIR / Path("to_process/")
     ANON_PATH = WORK_DIR / Path("anon/")
 
-    # initialize config from CLI args and debug flag
-    cfg.init_from_cli(base_site_url, debug)
+    # initialize config from CLI args and debug flag (including optional seed)
+    cfg.init_from_cli(base_site_url, debug, anonymizer_seed)
 
     # allow overriding DEBUG and switch to test endpoints/paths when requested
     if debug:
@@ -1694,8 +1760,8 @@ def launch_app(
     # initialize anonymizer now that ANON_PATH is final
     global anonymizer
     try:
-        anonymizer = Anonymizer(ANON_PATH)
-        logger.debug("Anonymizer initialized successfully")
+        anonymizer = Anonymizer(ANON_PATH, cfg.get_anonymizer_seed())
+        logger.debug(f"Anonymizer initialized successfully (seed={cfg.get_anonymizer_seed()})")
     except Exception as e:
         logger.error(f"Failed to initialize Anonymizer: {e}")
 
@@ -1723,6 +1789,8 @@ def launch_app(
         candidates = []
         if is_frozen and system.startswith("win"):
             appdata = os.getenv("APPDATA")
+
+    
             localapp = os.getenv("LOCALAPPDATA")
             if appdata:
                 candidates.append(Path(appdata) / APP_NAME)
@@ -1765,6 +1833,22 @@ def launch_app(
         logger.debug(f"Logging initialized at {level} level")
 
     setup_logging(log_level)
+
+    # Recreate the process pool so worker processes are initialized with a
+    # configured Anonymizer instance (including seed). This ensures subprocess
+    # workers use a similarly-configured anonymizer rather than failing.
+    try:
+        if run.process_pool is not None:
+            try:
+                run.process_pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+        seed = cfg.get_anonymizer_seed()
+        seed_arg = "" if seed is None else str(seed)
+        run.process_pool = _ProcessPoolExecutor(initializer=_worker_init, initargs=(str(ANON_PATH), seed_arg))
+        logger.debug(f"Recreated process pool with Anonymizer initializer (seed={seed})")
+    except Exception as e:
+        logger.error(f"Failed to recreate process pool with initializer: {e}")
 
     # ensure paths exist
 
