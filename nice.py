@@ -114,6 +114,7 @@ def token_file_path() -> Path:
 
 
 def save_api_token(token: str) -> None:
+    logger.trace(f"Saving API token, length={len(token)}")
     global API_TOKEN, rqst
     API_TOKEN = token
     if KEYRING_AVAILABLE:
@@ -150,6 +151,7 @@ def save_api_token(token: str) -> None:
 
 
 def load_api_token() -> str | None:
+    logger.trace("Loading API token")
     global API_TOKEN, rqst
     if KEYRING_AVAILABLE:
         try:
@@ -182,11 +184,13 @@ def load_api_token() -> str | None:
             except Exception:
                 logger.error("Failed to clear invalid API token")
 
+    logger.trace(f"Loaded API token: {token}")
     return token
 
 
 def check_token() -> dict | None:
     """Call the token_check endpoint and return parsed JSON or None on error."""
+    logger.trace("Checking API token validity")
     global rqst
     try:
         # Prefer header auth if session exists
@@ -220,6 +224,7 @@ def check_token() -> dict | None:
 
 
 def clear_api_token() -> None:
+    logger.trace("Clearing API token")
     global API_TOKEN, rqst
     API_TOKEN = None
     if KEYRING_AVAILABLE:
@@ -259,6 +264,7 @@ def enable_skip_verify():
     Monkeypatches `requests.sessions.Session.request` to default `verify=False`
     and silences the InsecureRequestWarning.
     """
+    logger.trace("Enabling global skip-verify for requests")
     global _requests_orig_request
     try:
         import urllib3
@@ -285,6 +291,7 @@ def enable_skip_verify():
 
 def disable_skip_verify():
     """Restore original requests behavior (re-enable verification)."""
+    logger.trace("Disabling global skip-verify for requests")
     global _requests_orig_request
     try:
         if _requests_orig_request is not None:
@@ -314,6 +321,7 @@ def find_free_tcp_port(start_port: int, max_tries: int = 100) -> int | None:
     """Scan forward from start_port to find a free TCP port on localhost.
     Returns the first free port found or None if none available within max_tries.
     """
+    logger.debug(f"Scanning for free TCP port starting at {start_port} up to {start_port + max_tries - 1}")
     for p in range(start_port, start_port + max_tries):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
@@ -368,6 +376,8 @@ anonymizer = None
 
 
 async def upload_files_start(progress, upload_queue, case_id=None):
+    logger.debug("upload files start")
+    logger.trace(f"Preparing to upload files, number: {len(upload_queue)}, case_id: {case_id}")
     global \
         uploaded_files, \
         duplicate_series, \
