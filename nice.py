@@ -1698,6 +1698,21 @@ def launch_app(
         ANON_PATH = Path("./test/anon")
         verbose = 2  # force debug logging in debug mode
 
+    EXPORT_PATH.mkdir(exist_ok=True, parents=True)
+    PROCESS_PATH.mkdir(exist_ok=True, parents=True)
+    ANON_PATH.mkdir(exist_ok=True, parents=True)
+
+    # initialize anonymizer now that ANON_PATH is final
+    global anonymizer
+    try:
+        anonymizer = Anonymizer(ANON_PATH)
+        logger.debug("Anonymizer initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize Anonymizer: {e}")
+
+    logger.debug(f"Work dir: {WORK_DIR}")
+
+
     # configure logging verbosity
     logger.remove()
     if verbose >= 3:
@@ -1763,19 +1778,6 @@ def launch_app(
     setup_logging(log_level)
 
     # ensure paths exist
-    EXPORT_PATH.mkdir(exist_ok=True, parents=True)
-    PROCESS_PATH.mkdir(exist_ok=True, parents=True)
-    ANON_PATH.mkdir(exist_ok=True, parents=True)
-
-    # initialize anonymizer now that ANON_PATH is final
-    global anonymizer
-    try:
-        anonymizer = Anonymizer(ANON_PATH)
-        logger.debug("Anonymizer initialized successfully")
-    except Exception as e:
-        logger.error(f"Failed to initialize Anonymizer: {e}")
-
-    logger.debug(f"Work dir: {WORK_DIR}")
 
     # allow insecure retry behavior to be controlled via CLI or env var
     global ALLOW_INSECURE_RETRY
@@ -1852,17 +1854,8 @@ def launch_app(
         info = check_token()
         if info and info.get("valid"):
             logger.debug(f"Stored API token is valid for user: {info.get('username')}")
-            LOGIN_SUCCESS = True
-            LOGGED_IN_USER = info.get("username") or "API token"
-            #maybe = user_info_ui.refresh()
-            #try:
-            #    logger.debug("Refreshing user info UI with loaded token")
-            #    if asyncio.iscoroutine(maybe) or hasattr(maybe, "__await__"):
-            #        asyncio.run(maybe)
-            #except RuntimeError:
-            #    logger.debug("Event loop already running; scheduling refresh in existing loop")
-            #    loop = asyncio.get_event_loop()
-            #    loop.run_until_complete(maybe)
+            #LOGIN_SUCCESS = True
+            #LOGGED_IN_USER = info.get("username") or "API token"
         else:
             logger.debug("Stored API token invalid; clearing")
             try:
