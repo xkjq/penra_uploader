@@ -28,3 +28,5 @@ uploader_rs/export/
 uploader_rs/anon/
 
 test_dicoms/
+
+.last_scan.json

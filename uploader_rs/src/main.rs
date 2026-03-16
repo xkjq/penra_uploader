@@ -22,6 +22,11 @@ struct AppState {
     last_msg: String,
     export_dir: PathBuf,
     rx: Option<Receiver<String>>,
+    // processing progress/state shown in UI
+    processing_step: Option<String>,
+    processing_progress: f32,
+    // shared sender for background tasks -> GUI
+    tx: Option<mpsc::Sender<String>>,
     processed: Vec<String>,
     seed: Option<String>,
     username: String,
@@ -68,6 +73,9 @@ impl Default for AppState {
                 }
             },
             rx: None,
+            processing_step: None,
+            processing_progress: 0.0,
+            tx: None,
             processed: Vec::new(),
             seed: None,
             username: String::new(),
@@ -104,8 +112,14 @@ impl Default for AppState {
 
 impl AppState {
     fn spawn_login(&mut self, user: String, pass: String) {
-        let (tx, rx) = mpsc::channel::<String>();
-        self.rx = Some(rx);
+        let tx = match &self.tx {
+            Some(t) => t.clone(),
+            None => {
+                // fall back to a local channel if tx not available
+                let (t, _r) = mpsc::channel::<String>();
+                t
+            }
+        };
         thread::spawn(move || {
             let base = upload::base_site_url();
             let url = format!("{}{}", base, "/api/atlas/create_api_token");
@@ -204,6 +218,10 @@ impl eframe::App for AppState {
             });
 
             ui.collapsing("Processing", |ui| {
+                if let Some(step) = &self.processing_step {
+                    ui.label(format!("Step: {}", step));
+                    ui.add(egui::ProgressBar::new(self.processing_progress).show_percentage());
+                }
                 if ui.button("Process export (anonymize + notify)").clicked() {
                     // spawn a background thread to process .dcm files in export_dir via the Python directory wrapper
                     let export = self.export_dir.clone();
@@ -212,10 +230,10 @@ impl eframe::App for AppState {
                         .map(|p| p.to_path_buf())
                         .unwrap_or_else(|| PathBuf::from("."))
                         .join("anon");
-                    let (tx, rx) = mpsc::channel::<String>();
+                    // reuse shared tx for UI messages
+                    let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
                     // capture notify flag before moving into the thread
                     let notify_flag = self.notify_on_process;
-                    self.rx = Some(rx);
                     let seed_clone = self.seed.clone();
                     thread::spawn(move || {
                         if let Ok(entries) = fs::read_dir(&export) {
@@ -264,10 +282,10 @@ impl eframe::App for AppState {
                                     let files = s.files.into_iter().map(|f| (f.path.to_string_lossy().to_string(), f.hash, f.is_duplicate)).collect();
                                     (s.series_uid, files, s.duplicate_series_urls)
                                 }).collect();
-                                if let Ok(json) = serde_json::to_string(&list) {
-                                    let _ = std::fs::write(".last_scan.json", json);
-                                    let _ = tx.send("scan_written".to_string());
-                                }
+                                    if let Ok(json) = serde_json::to_string(&list) {
+                                        let _ = std::fs::write(".last_scan.json", json);
+                                        let _ = tx.send("scan_written".to_string());
+                                    }
                             }
                             Err(e) => { let _ = tx.send(format!("Post-process scan failed: {}", e)); }
                         }
@@ -284,8 +302,7 @@ impl eframe::App for AppState {
                         let depth = self.recurse_depth;
                         let ext = self.ext_filter.clone();
                         let export = self.export_dir.clone();
-                        let (tx, rx) = mpsc::channel::<String>();
-                        self.rx = Some(rx);
+                        let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
 
                         thread::spawn(move || {
                             // collect files (optionally recurse with depth)
@@ -312,7 +329,7 @@ impl eframe::App for AppState {
                             }
 
                             if found.is_empty() {
-                                let _ = tx.send("No .dcm files found in selected folder".to_string());
+                                            let _ = tx.send("No .dcm files found in selected folder".to_string());
                             } else {
                                 for p in found {
                                     let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string();
@@ -364,10 +381,10 @@ impl eframe::App for AppState {
                                                 let files = s.files.into_iter().map(|f| (f.path.to_string_lossy().to_string(), f.hash, f.is_duplicate)).collect();
                                                 (s.series_uid, files, s.duplicate_series_urls)
                                             }).collect();
-                                            if let Ok(json) = serde_json::to_string(&list) {
-                                                let _ = std::fs::write(".last_scan.json", json);
-                                                let _ = tx.send("scan_written".to_string());
-                                            }
+                                                if let Ok(json) = serde_json::to_string(&list) {
+                                                    let _ = std::fs::write(".last_scan.json", json);
+                                                    let _ = tx.send("scan_written".to_string());
+                                                }
                                         }
                                         Err(e) => { let _ = tx.send(format!("Post-import scan failed: {}", e)); }
                                     }
@@ -396,8 +413,7 @@ impl eframe::App for AppState {
 
                 if ui.button("Upload anonymized files").clicked() {
                     let anon_dir = self.anon_dir();
-                    let (tx, rx) = mpsc::channel::<String>();
-                    self.rx = Some(rx);
+                    let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
                     thread::spawn(move || {
                         match upload_anon_dir(&anon_dir, None) {
                             Ok(res) => {
@@ -417,8 +433,7 @@ impl eframe::App for AppState {
                 if ui.button("Refresh ready-to-upload").clicked() {
                     let anon_dir = self.export_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
                         let anon_dir = self.anon_dir();
-                    let (tx, rx) = mpsc::channel::<String>();
-                    self.rx = Some(rx);
+                    let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
                     thread::spawn(move || {
                         match scan_for_upload(&anon_dir) {
                             Ok(series) => {
@@ -447,6 +462,12 @@ impl eframe::App for AppState {
                     Ok(m) => {
                         if m == "done" {
                             self.last_msg = "Processing complete".to_string();
+                            self.processing_step = None;
+                            self.processing_progress = 0.0;
+                        } else if m == "PROC:DONE" {
+                            self.last_msg = "Processing complete".to_string();
+                            self.processing_step = None;
+                            self.processing_progress = 0.0;
                         } else if m == "scan_written" {
                             if let Ok(txt) = std::fs::read_to_string(".last_scan.json") {
                                 if let Ok(v) = serde_json::from_str::<Vec<(String, Vec<(String,String,bool)>, Vec<String>)>>(&txt) {
@@ -474,6 +495,17 @@ impl eframe::App for AppState {
                                 self.logged_in_user = Some(name.to_string());
                                 self.login_open = false;
                                 self.last_msg = format!("Logged in as {}", name);
+                            }
+                        } else if m.starts_with("PROC:STEP:") {
+                            if let Some(step) = m.strip_prefix("PROC:STEP:") {
+                                self.processing_step = Some(step.to_string());
+                                self.last_msg = step.to_string();
+                            }
+                        } else if m.starts_with("PROC:PROG:") {
+                            if let Some(p) = m.strip_prefix("PROC:PROG:") {
+                                if let Ok(v) = p.parse::<f32>() {
+                                    self.processing_progress = v.clamp(0.0, 1.0);
+                                }
                             }
                         } else {
                             self.processed.push(m.clone());
@@ -507,8 +539,7 @@ impl eframe::App for AppState {
                             ui.add_space(8.0);
                             if ui.small_button("Clear duplicates").clicked() {
                                 let anon_dir = self.anon_dir();
-                                let (tx, rx) = mpsc::channel::<String>();
-                                self.rx = Some(rx);
+                                let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
                                 thread::spawn(move || {
                                     match scan_for_upload(&anon_dir) {
                                         Ok(series) => {
@@ -877,6 +908,7 @@ fn main() {
         let _ = std::fs::OpenOptions::new().create(true).append(true).open(upload::log_file_path());
         let (tx, rx) = mpsc::channel::<String>();
         app.rx = Some(rx);
+        app.tx = Some(tx.clone());
 
         // Initial scan for existing anonymised files to show ready-to-upload series
         let anon_dir = app.anon_dir();
@@ -894,6 +926,9 @@ fn main() {
         // Spawn NNG listener thread to accept notifications from exporter app.
         // Binds to tcp://127.0.0.1:9976 and forwards received messages to the GUI via `tx`.
         let tx_clone = tx.clone();
+        let export_dir_clone = app.export_dir.clone();
+        let anon_dir_clone = app.anon_dir();
+        let seed_for_nng = app.seed.clone();
         thread::spawn(move || {
             match Socket::new(Protocol::Pair0) {
                 Ok(s) => {
@@ -911,6 +946,114 @@ fn main() {
                                     Err(_) => format!("<bin:{} bytes>", msg.len()),
                                 };
                                 let _ = tx_clone.send(format!("NNG msg: {}", text));
+                                // Kick off processing: copy-export-then-anonymize in background
+                                let tx2 = tx_clone.clone();
+                                let export_dir2 = export_dir_clone.clone();
+                                let anon_dir2 = anon_dir_clone.clone();
+                                let seed2 = seed_for_nng.clone();
+                                thread::spawn(move || {
+                                    // create a processing dir so we don't race with exporter clearing export
+                                    let proc_base = export_dir2.parent().map(|p| p.join("processing")).unwrap_or_else(|| PathBuf::from("processing"));
+                                    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S").to_string();
+                                    let proc_dir = proc_base.join(ts);
+                                    let _ = std::fs::create_dir_all(&proc_dir);
+                                    let _ = tx2.send("PROC:STEP:Copying export files".to_string());
+                                    // collect files
+                                    let mut files: Vec<PathBuf> = Vec::new();
+                                    if let Ok(entries) = std::fs::read_dir(&export_dir2) {
+                                        for e in entries.flatten() {
+                                            let p = e.path();
+                                            if p.is_file() {
+                                                if p.extension().map(|s| s.to_string_lossy().eq_ignore_ascii_case("dcm")).unwrap_or(false) {
+                                                    files.push(p);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    let total = files.len();
+                                    if total == 0 {
+                                        let _ = tx2.send("PROC:STEP:No files to process".to_string());
+                                        let _ = tx2.send("PROC:DONE".to_string());
+                                        return;
+                                    }
+                                    for (i, p) in files.iter().enumerate() {
+                                        let fname = p.file_name().unwrap_or_default().to_os_string();
+                                        let dest = proc_dir.join(&fname);
+                                        // prefer moving (rename) to avoid copying large files; fallback to copy+remove
+                                        match std::fs::rename(&p, &dest) {
+                                            Ok(_) => {
+                                                let _ = tx2.send(format!("Moved {} -> {}", p.display(), dest.display()));
+                                            }
+                                            Err(_) => match std::fs::copy(&p, &dest) {
+                                                Ok(_) => {
+                                                    let _ = std::fs::remove_file(&p);
+                                                    let _ = tx2.send(format!("Copied+removed {} -> {}", p.display(), dest.display()));
+                                                }
+                                                Err(e) => {
+                                                    let _ = tx2.send(format!("Failed to move {}: {}", p.display(), e));
+                                                }
+                                            },
+                                        }
+                                        let frac = (i as f32 + 1.0) / (total as f32);
+                                        let _ = tx2.send(format!("PROC:PROG:{}", frac));
+                                    }
+
+                                    let _ = tx2.send("PROC:STEP:Anonymizing copied files".to_string());
+                                    for (i, p) in std::fs::read_dir(&proc_dir).unwrap_or_else(|_| std::fs::read_dir(&export_dir2).unwrap()).flatten().enumerate() {
+                                        let src = p.path();
+                                        if src.extension().map(|s| s.to_string_lossy().eq_ignore_ascii_case("dcm")).unwrap_or(false) {
+                                            match anonymize_file(&src, &anon_dir2, true, seed2.as_deref()) {
+                                                Ok(out) => {
+                                                    let _ = tx2.send(format!("Anonymized: {}", out.display()));
+                                                    // remove the source file from processing dir when anonymization succeeded
+                                                    if std::fs::remove_file(&src).is_ok() {
+                                                        let _ = tx2.send(format!("Removed processed file: {}", src.display()));
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    let _ = tx2.send(format!("Anon failed {}: {}", src.display(), e));
+                                                }
+                                            }
+                                        }
+                                        let frac = (i as f32 + 1.0) / (total as f32);
+                                        let _ = tx2.send(format!("PROC:PROG:{}", frac));
+                                    }
+
+                                    // after processing, refresh ready-to-upload by scanning anon dir
+                                    let _ = tx2.send("PROC:STEP:Refreshing ready-to-upload".to_string());
+                                    match scan_for_upload(&anon_dir2) {
+                                        Ok(series) => {
+                                            let list: Vec<(String, Vec<(String,String,bool)>, Vec<String>)> = series.into_iter().map(|s| {
+                                                let files = s.files.into_iter().map(|f| (f.path.to_string_lossy().to_string(), f.hash, f.is_duplicate)).collect();
+                                                (s.series_uid, files, s.duplicate_series_urls)
+                                            }).collect();
+                                            if let Ok(json) = serde_json::to_string(&list) {
+                                                let _ = std::fs::write(".last_scan.json", json);
+                                                let _ = tx2.send("scan_written".to_string());
+                                            }
+                                        }
+                                        Err(e) => { let _ = tx2.send(format!("Post-process scan failed: {}", e)); }
+                                    }
+
+                                    // attempt to remove the processing directory if it's now empty
+                                    match std::fs::read_dir(&proc_dir) {
+                                        Ok(mut rd) => {
+                                            if rd.next().is_none() {
+                                                if std::fs::remove_dir(&proc_dir).is_ok() {
+                                                    let _ = tx2.send(format!("Removed empty processing dir: {}", proc_dir.display()));
+                                                }
+                                            } else {
+                                                let _ = tx2.send(format!("Processing dir not empty: {}", proc_dir.display()));
+                                            }
+                                        }
+                                        Err(_) => {
+                                            // if we can't read it, try remove_dir and ignore errors
+                                            let _ = std::fs::remove_dir(&proc_dir);
+                                        }
+                                    }
+
+                                    let _ = tx2.send("PROC:DONE".to_string());
+                                });
                                 // reply ack
                                 let _ = s.send(&b"ack"[..]);
                             }
