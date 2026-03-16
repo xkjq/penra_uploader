@@ -6,6 +6,7 @@ use blake3;
 use std::collections::{HashMap, HashSet};
 use dicom_object::open_file;
 use dicom_object::Tag;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -28,8 +29,46 @@ pub struct UploadResult {
     pub duplicate_series: HashSet<String>,
 }
 
-fn base_site_url() -> String {
-    std::env::var("UPLOADER_BASE_URL").unwrap_or_else(|_| "https://www.penracourses.org.uk".to_string())
+pub fn base_site_url() -> String {
+    // priority: env var -> saved config -> default
+    if let Ok(env) = std::env::var("UPLOADER_BASE_URL") {
+        if !env.is_empty() {
+            return env;
+        }
+    }
+    if let Some(cfg) = load_base_url() {
+        if !cfg.is_empty() {
+            return cfg;
+        }
+    }
+    "https://www.penracourses.org.uk".to_string()
+}
+
+fn config_file_path() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let cfg = home.join(".uploader");
+    let _ = std::fs::create_dir_all(&cfg);
+    cfg.join("config.json")
+}
+
+pub fn load_base_url() -> Option<String> {
+    let p = config_file_path();
+    if p.exists() {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                if let Some(u) = v.get("base_url").and_then(|x| x.as_str()) {
+                    return Some(u.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn save_base_url(url: &str) -> bool {
+    let p = config_file_path();
+    let obj = serde_json::json!({"base_url": url});
+    std::fs::write(p, obj.to_string()).is_ok()
 }
 
 fn token_file_path() -> PathBuf {
@@ -58,18 +97,71 @@ pub fn clear_api_token() -> bool {
     if p.exists() { std::fs::remove_file(p).is_ok() } else { true }
 }
 
+pub fn log_file_path() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let cfg = home.join(".uploader");
+    let _ = std::fs::create_dir_all(&cfg);
+    cfg.join("request_log.txt")
+}
+
+pub fn log_rpc(msg: &str) {
+    let p = log_file_path();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let entry = format!("[{}] {}\n", now, msg);
+    let _ = std::fs::OpenOptions::new().create(true).append(true).open(&p).and_then(|mut f| std::io::Write::write_all(&mut f, entry.as_bytes()));
+}
+
+fn bodies_dir() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let dir = home.join(".uploader").join("bodies");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+fn save_body_to_file(body: &str) -> Option<PathBuf> {
+    let dir = bodies_dir();
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let p = dir.join(format!("resp_{}.txt", ts));
+    match std::fs::write(&p, body) {
+        Ok(_) => Some(p),
+        Err(_) => None,
+    }
+}
+
+fn json_value_truthy(v: &serde_json::Value) -> bool {
+    if v.is_boolean() {
+        v.as_bool().unwrap_or(false)
+    } else if v.is_number() {
+        v.as_i64().map(|n| n != 0).unwrap_or(false)
+    } else if v.is_string() {
+        !v.as_str().unwrap_or("").is_empty()
+    } else {
+        false
+    }
+}
+
 pub fn token_username() -> Option<String> {
     if let Some(t) = load_api_token() {
         let base = base_site_url();
         let token_check = format!("{}{}", base, "/api/atlas/token_check");
         let client = reqwest::blocking::Client::new();
         if let Ok(r) = client.post(&token_check).header("Authorization", format!("Bearer {}", t)).send() {
-            if r.status().is_success() {
-                if let Ok(j) = r.json::<serde_json::Value>() {
-                    if j.get("valid").and_then(|b| b.as_bool()).unwrap_or(false) {
-                        return j.get("username").and_then(|s| s.as_str()).map(|s| s.to_string()).or(Some("API token".to_string()));
+            let status = r.status();
+            if let Ok(body) = r.text() {
+                if let Some(pf) = save_body_to_file(&body) {
+                    log_rpc(&format!("Response {}: {} BODY_FILE:{}", token_check, status, pf.display()));
+                } else {
+                    log_rpc(&format!("Response {}: {} body: (failed to save body)", token_check, status));
+                }
+                if status.is_success() {
+                    if let Ok(j) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if j.get("valid").and_then(|b| b.as_bool()).unwrap_or(false) {
+                            return j.get("username").and_then(|s| s.as_str()).map(|s| s.to_string()).or(Some("API token".to_string()));
+                        }
                     }
                 }
+            } else {
+                log_rpc(&format!("Response {}: {} (failed to read body)", token_check, status));
             }
         }
     }
@@ -94,7 +186,27 @@ fn make_client(token: Option<&str>) -> Result<Client, String> {
 }
 
 fn calculate_hash(path: &Path) -> Option<String> {
-    // Try to read PixelData (7FE0,0010) would require parsing; fallback to file bytes
+    // Prefer hashing the PixelData element (7FE0,0010) if present
+    if let Ok(obj) = open_file(path) {
+        if let Ok(elem) = obj.element(Tag(0x7FE0, 0x0010)) {
+            // Try a few ways to obtain raw bytes from the element/value.
+            // Different versions of the dicom crates expose different helpers,
+            // so attempt a couple of reasonably-supported approaches and
+            // fall back to hashing the whole file.
+            // 1) If the element exposes a raw value-to-bytes conversion
+            if let Ok(bytes) = elem.to_bytes() {
+                return Some(blake3::hash(&bytes).to_hex().to_string());
+            }
+
+            // 2) Try taking the element value as a string/byte slice representation
+            if let Ok(s) = elem.to_str() {
+                let b = s.as_bytes();
+                return Some(blake3::hash(b).to_hex().to_string());
+            }
+        }
+    }
+
+    // Fallback: hash the entire file bytes
     match std::fs::read(path) {
         Ok(bytes) => Some(blake3::hash(&bytes).to_hex().to_string()),
         Err(_) => None,
@@ -129,29 +241,49 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>) -> Result<UploadR
     let mut pre_duplicate_series: HashSet<String> = HashSet::new();
 
     if !hash_list.is_empty() {
+        let _ = std::fs::read_dir(&anon_dir); // keep usage
+        log_rpc(&format!("POST {} with {} hashes", hash_check_url, hash_list.len()));
         let resp = client.post(&hash_check_url).json(&hash_list).send();
         if let Ok(r) = resp {
-            if r.status().is_success() {
-                if let Ok(map) = r.json::<serde_json::Value>() {
-                    if map.is_object() {
-                        if let Some(obj) = map.as_object() {
-                            for (hash_val, info) in obj.iter() {
-                                if info.is_object() {
-                                    if let Some(id) = info.get("id") {
-                                        if !id.is_null() {
-                                            duplicate_hashes.insert(hash_val.clone());
-                                            if let Some(urlv) = info.get("url") {
-                                                if let Some(urls) = urlv.as_str() {
-                                                    pre_duplicate_series.insert(urls.to_string());
+            let status = r.status();
+            if let Ok(body) = r.text() {
+                if let Some(pf) = save_body_to_file(&body) {
+                    log_rpc(&format!("Response {}: {} BODY_FILE:{}", hash_check_url, status, pf.display()));
+                } else {
+                    log_rpc(&format!("Response {}: {} body: (failed to save body)", hash_check_url, status));
+                }
+                if status.is_success() {
+                    if let Ok(map) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if map.is_object() {
+                            if let Some(obj) = map.as_object() {
+                                for (hash_val, info) in obj.iter() {
+                                            if info.is_object() {
+                                                if let Some(id) = info.get("id") {
+                                                    if json_value_truthy(id) {
+                                                        duplicate_hashes.insert(hash_val.clone());
+                                                        if let Some(urlv) = info.get("url") {
+                                                            if let Some(urls) = urlv.as_str() {
+                                                                // ensure full URL includes base if server returned a relative path
+                                                                let full = if urls.starts_with("http") {
+                                                                    urls.to_string()
+                                                                } else if urls.starts_with('/') {
+                                                                    format!("{}{}", base.trim_end_matches('/'), urls)
+                                                                } else {
+                                                                    format!("{}/{}", base.trim_end_matches('/'), urls)
+                                                                };
+                                                                pre_duplicate_series.insert(full);
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             }
-                                        }
-                                    }
                                 }
                             }
                         }
                     }
                 }
+            } else {
+                log_rpc(&format!("Response {}: {} (failed to read body)", hash_check_url, status));
             }
         }
     }
@@ -190,44 +322,78 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>) -> Result<UploadR
                 }
             }
 
+            log_rpc(&format!("POST {} upload {} files", endpoint, chunk_pairs.len()));
             match client.post(&endpoint).multipart(form).send() {
                 Ok(resp) => {
-                    if resp.status().is_success() {
-                        if let Ok(jsonv) = resp.json::<serde_json::Value>() {
-                            if let Some(upl) = jsonv.get("uploaded").and_then(|v| v.as_array()) {
-                                for it in upl {
-                                    if let Some(arr) = it.as_array() {
-                                        if arr.len() >= 2 {
-                                            if let (Some(fname), Some(hash)) = (arr[0].as_str(), arr[1].as_str()) {
-                                                uploaded.push((fname.to_string(), hash.to_string()));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            if let Some(dups) = jsonv.get("duplicates").and_then(|v| v.as_array()) {
-                                for it in dups {
-                                    if let Some(arr) = it.as_array() {
-                                        if arr.len() >= 2 {
-                                            if let (Some(fname), Some(hash)) = (arr[0].as_str(), arr[1].as_str()) {
-                                                duplicates.push((fname.to_string(), hash.to_string()));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            if let Some(failedv) = jsonv.get("failed").and_then(|v| v.as_array()) {
-                                for it in failedv { if let Some(s) = it.as_str() { failed.push(s.to_string()); } }
-                            }
-                            if let Some(ds) = jsonv.get("duplicate_series").and_then(|v| v.as_array()) {
-                                for it in ds { if let Some(s) = it.as_str() { duplicate_series.insert(s.to_string()); } }
-                            }
+                    let status = resp.status();
+                    if let Ok(body) = resp.text() {
+                        if let Some(pf) = save_body_to_file(&body) {
+                            log_rpc(&format!("Response {}: {} BODY_FILE:{}", endpoint, status, pf.display()));
+                        } else {
+                            log_rpc(&format!("Response {}: {} body: (failed to save body)", endpoint, status));
                         }
-                        success = true;
-                        break;
+                        if status.is_success() {
+                            if let Ok(jsonv) = serde_json::from_str::<serde_json::Value>(&body) {
+                                if let Some(upl) = jsonv.get("uploaded").and_then(|v| v.as_array()) {
+                                    for it in upl {
+                                        if let Some(arr) = it.as_array() {
+                                            if arr.len() >= 2 {
+                                                if let (Some(fname), Some(hash)) = (arr[0].as_str(), arr[1].as_str()) {
+                                                    // record uploaded and remove local file to avoid re-upload
+                                                    uploaded.push((fname.to_string(), hash.to_string()));
+                                                    // find matching path in this chunk and delete
+                                                    for (p, f) in &chunk_pairs {
+                                                        if f == fname {
+                                                            if std::fs::remove_file(p).is_ok() {
+                                                                log_rpc(&format!("Deleted uploaded file: {}", p.display()));
+                                                            } else {
+                                                                log_rpc(&format!("Failed to delete uploaded file: {}", p.display()));
+                                                            }
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(dups) = jsonv.get("duplicates").and_then(|v| v.as_array()) {
+                                    for it in dups {
+                                        if let Some(arr) = it.as_array() {
+                                            if arr.len() >= 2 {
+                                                if let (Some(fname), Some(hash)) = (arr[0].as_str(), arr[1].as_str()) {
+                                                    // record duplicate and delete local copy to keep anon dir clean
+                                                    duplicates.push((fname.to_string(), hash.to_string()));
+                                                    for (p, f) in &chunk_pairs {
+                                                        if f == fname {
+                                                            if std::fs::remove_file(p).is_ok() {
+                                                                log_rpc(&format!("Deleted duplicate local file: {}", p.display()));
+                                                            } else {
+                                                                log_rpc(&format!("Failed to delete duplicate local file: {}", p.display()));
+                                                            }
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(failedv) = jsonv.get("failed").and_then(|v| v.as_array()) {
+                                    for it in failedv { if let Some(s) = it.as_str() { failed.push(s.to_string()); } }
+                                }
+                                if let Some(ds) = jsonv.get("duplicate_series").and_then(|v| v.as_array()) {
+                                    for it in ds { if let Some(s) = it.as_str() { duplicate_series.insert(s.to_string()); } }
+                                }
+                            }
+                            success = true;
+                            break;
+                        }
+                    } else {
+                        log_rpc(&format!("Response {}: {} (failed to read body)", endpoint, status));
                     }
                 }
-                Err(_) => {}
+                Err(e) => { log_rpc(&format!("Request error {}: {}", endpoint, e)); }
             }
         }
 
@@ -282,19 +448,35 @@ pub fn scan_for_upload(anon_dir: &Path) -> Result<Vec<SeriesInfo>, String> {
         let client = make_client(load_api_token().as_deref()).map_err(|e| e)?;
         let base = base_site_url();
         let hash_check_url = format!("{}{}", base, "/api/atlas/check_image_hashes/");
+        log_rpc(&format!("POST {} with {} hashes", hash_check_url, hash_list.len()));
         if let Ok(r) = client.post(&hash_check_url).json(&hash_list).send() {
-            if r.status().is_success() {
-                if let Ok(map) = r.json::<serde_json::Value>() {
-                    if let Some(obj) = map.as_object() {
-                        for (hash_val, info) in obj.iter() {
-                            if info.is_object() {
-                                if let Some(id) = info.get("id") {
-                                    if !id.is_null() {
-                                        duplicate_hashes.insert(hash_val.clone());
-                                        if let Some(urlv) = info.get("url") {
-                                            if let Some(urls) = urlv.as_str() {
-                                                // note: may want to map by series later
-                                                duplicate_series_urls.entry(hash_val.clone()).or_default().push(urls.to_string());
+            let status = r.status();
+            if let Ok(body) = r.text() {
+                if let Some(pf) = save_body_to_file(&body) {
+                    log_rpc(&format!("Response {}: {} BODY_FILE:{}", hash_check_url, status, pf.display()));
+                } else {
+                    log_rpc(&format!("Response {}: {} body: (failed to save body)", hash_check_url, status));
+                }
+                if status.is_success() {
+                    if let Ok(map) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if let Some(obj) = map.as_object() {
+                            for (hash_val, info) in obj.iter() {
+                                if info.is_object() {
+                                    if let Some(id) = info.get("id") {
+                                        if json_value_truthy(id) {
+                                            duplicate_hashes.insert(hash_val.clone());
+                                            if let Some(urlv) = info.get("url") {
+                                                if let Some(urls) = urlv.as_str() {
+                                                    // ensure full URL includes base if server returned a relative path
+                                                    let full = if urls.starts_with("http") {
+                                                        urls.to_string()
+                                                    } else if urls.starts_with('/') {
+                                                        format!("{}{}", base.trim_end_matches('/'), urls)
+                                                    } else {
+                                                        format!("{}/{}", base.trim_end_matches('/'), urls)
+                                                    };
+                                                    duplicate_series_urls.entry(hash_val.clone()).or_default().push(full);
+                                                }
                                             }
                                         }
                                     }
@@ -303,6 +485,8 @@ pub fn scan_for_upload(anon_dir: &Path) -> Result<Vec<SeriesInfo>, String> {
                         }
                     }
                 }
+            } else {
+                log_rpc(&format!("Response {}: {} (failed to read body)", hash_check_url, status));
             }
         }
     }

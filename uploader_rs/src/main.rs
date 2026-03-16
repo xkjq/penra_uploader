@@ -33,6 +33,8 @@ struct AppState {
     notify_on_process: bool,
     ready_series: Vec<SeriesInfo>,
     selected_series: Vec<bool>,
+    base_url_mode: i32,
+    custom_base_url: String,
     // metadata viewer state
     metadata_window_open: bool,
     metadata_compare_open: bool,
@@ -40,6 +42,7 @@ struct AppState {
     metadata_compare: Vec<(String, HashMap<String,String>)>,
     selected_files_for_meta: HashSet<String>,
     metadata_select_mode: bool,
+    log_window_open: bool,
 }
 
 impl Default for AppState {
@@ -59,12 +62,23 @@ impl Default for AppState {
             notify_on_process: false,
             ready_series: Vec::new(),
             selected_series: Vec::new(),
+            base_url_mode: {
+                // decide initial mode from saved config
+                let cfg = upload::load_base_url();
+                if let Some(s) = cfg {
+                    if s == "https://www.penracourses.org.uk" { 0 } else if s == "http://localhost:8080" { 1 } else { 2 }
+                } else {
+                    0
+                }
+            },
+            custom_base_url: upload::load_base_url().unwrap_or_default(),
             metadata_window_open: false,
             metadata_compare_open: false,
             metadata_single: None,
             metadata_compare: Vec::new(),
             selected_files_for_meta: HashSet::new(),
             metadata_select_mode: false,
+            log_window_open: false,
         }
     }
 }
@@ -73,6 +87,39 @@ impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         CentralPanel::default().show(ctx, |ui| {
             ui.heading("Uploader (Rust) - skeleton");
+
+            ui.collapsing("Server", |ui| {
+                ui.label("Choose server:");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.base_url_mode, 0, "Production (https://www.penracourses.org.uk)");
+                    ui.radio_value(&mut self.base_url_mode, 1, "Development (http://localhost:8080)");
+                });
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.base_url_mode, 2, "Custom");
+                    ui.text_edit_singleline(&mut self.custom_base_url);
+                });
+                if ui.button("Save Server").clicked() {
+                    let url = match self.base_url_mode {
+                        0 => "https://www.penracourses.org.uk".to_string(),
+                        1 => "http://localhost:8080".to_string(),
+                        _ => self.custom_base_url.clone(),
+                    };
+                    if upload::save_base_url(&url) {
+                        self.last_msg = format!("Saved base URL {}", url);
+                    } else {
+                        self.last_msg = "Failed to save base URL".to_string();
+                    }
+                }
+                ui.label(format!("Current base: {}", upload::base_site_url()));
+            });
+            ui.horizontal(|ui| {
+                if ui.small_button("Show Logs").clicked() { self.log_window_open = !self.log_window_open; }
+                if ui.small_button("Refresh Logs").clicked() { self.last_msg = "Logs refreshed".to_string(); }
+                if ui.small_button("Clear Logs").clicked() {
+                    let _ = std::fs::write(upload::log_file_path(), "");
+                    self.last_msg = "Cleared logs".to_string();
+                }
+            });
 
             if ui.button("Launch backend (Python)").clicked() {
                 match Command::new("python3").arg("../nice.py").arg("--work-dir").arg(".").spawn() {
@@ -105,7 +152,7 @@ impl eframe::App for AppState {
                     let (tx, rx) = mpsc::channel::<String>();
                     self.rx = Some(rx);
                     thread::spawn(move || {
-                        let base = std::env::var("UPLOADER_BASE_URL").unwrap_or_else(|_| "https://www.penracourses.org.uk".to_string());
+                            let base = upload::base_site_url();
                         let url = format!("{}{}", base, "/api/atlas/create_api_token");
                         let token_check = format!("{}{}", base, "/api/atlas/token_check");
                         let client = reqwest::blocking::Client::new();
@@ -166,9 +213,10 @@ impl eframe::App for AppState {
                 ui.label(format!("Logged in: {}", self.logged_in_user.clone().unwrap_or_else(|| "no".to_string())));
             });
 
-            if ui.button("Process export (anonymize + notify)").clicked() {
-                // spawn a background thread to process .dcm files in export_dir via the Python directory wrapper
-                let export = self.export_dir.clone();
+            ui.collapsing("Processing", |ui| {
+                if ui.button("Process export (anonymize + notify)").clicked() {
+                    // spawn a background thread to process .dcm files in export_dir via the Python directory wrapper
+                    let export = self.export_dir.clone();
                     let anon_dir = export
                         .parent()
                         .map(|p| p.to_path_buf())
@@ -178,13 +226,13 @@ impl eframe::App for AppState {
                     // capture notify flag before moving into the thread
                     let notify_flag = self.notify_on_process;
                     self.rx = Some(rx);
-                let seed_clone = self.seed.clone();
-                thread::spawn(move || {
+                    let seed_clone = self.seed.clone();
+                    thread::spawn(move || {
                         if let Ok(entries) = fs::read_dir(&export) {
                             for ent in entries.flatten() {
                                 let p = ent.path();
                                 if p.extension().map(|e| e == "dcm").unwrap_or(false) {
-                                match anonymize_file(&p, &anon_dir, true, seed_clone.as_deref()) {
+                                    match anonymize_file(&p, &anon_dir, true, seed_clone.as_deref()) {
                                         Ok(out) => {
                                             let _ = tx.send(format!("Anonymized: {}", out.display()));
                                             if let Ok(bytes) = fs::read(&out) {
@@ -221,131 +269,133 @@ impl eframe::App for AppState {
 
                         let _ = tx.send("done".to_string());
                     });
-            }
+                }
 
-            if ui.button("Import from folder").clicked() {
-                // Pick a source folder and copy .dcm files into the export dir in background
-                if let Some(src) = FileDialog::new().pick_folder() {
-                    // capture options
-                    let do_move = self.move_files;
-                    let depth = self.recurse_depth;
-                    let ext = self.ext_filter.clone();
-                    let export = self.export_dir.clone();
+                if ui.button("Import from folder").clicked() {
+                    // Pick a source folder and copy .dcm files into the export dir in background
+                    if let Some(src) = FileDialog::new().pick_folder() {
+                        // capture options
+                        let do_move = self.move_files;
+                        let depth = self.recurse_depth;
+                        let ext = self.ext_filter.clone();
+                        let export = self.export_dir.clone();
+                        let (tx, rx) = mpsc::channel::<String>();
+                        self.rx = Some(rx);
+                        thread::spawn(move || {
+                            // collect files (optionally recurse with depth)
+                            let mut stack: Vec<(PathBuf, i32)> = vec![(src.clone(), depth)];
+                            let mut found = Vec::new();
+                            while let Some((dir, dleft)) = stack.pop() {
+                                if let Ok(entries) = fs::read_dir(&dir) {
+                                    for e in entries.flatten() {
+                                        let p = e.path();
+                                        if p.is_dir() && (dleft != 0) {
+                                            // if dleft < 0 it's infinite
+                                            let next = if dleft > 0 { dleft - 1 } else { dleft };
+                                            stack.push((p, next));
+                                        } else if p.is_file() {
+                                            if let Some(exts) = p.extension().and_then(|s| s.to_str()) {
+                                                if exts.eq_ignore_ascii_case(&ext) {
+                                                    found.push(p);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if found.is_empty() {
+                                let _ = tx.send("No .dcm files found in selected folder".to_string());
+                            } else {
+                                for p in found {
+                                    let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string();
+                                    let dest = export.join(&fname);
+                                    if do_move {
+                                        // try rename, fallback to copy+remove
+                                        match fs::rename(&p, &dest) {
+                                            Ok(_) => { let _ = tx.send(format!("Moved {} -> {}", p.display(), dest.display())); }
+                                            Err(_) => match fs::copy(&p, &dest) {
+                                                Ok(_) => {
+                                                    let _ = fs::remove_file(&p);
+                                                    let _ = tx.send(format!("Copied+removed {} -> {}", p.display(), dest.display()));
+                                                }
+                                                Err(e) => { let _ = tx.send(format!("Failed to move {}: {}", p.display(), e)); }
+                                            }
+                                        }
+                                    } else {
+                                        match fs::copy(&p, &dest) {
+                                            Ok(_) => { let _ = tx.send(format!("Copied {} -> {}", p.display(), dest.display())); }
+                                            Err(e) => { let _ = tx.send(format!("Failed to copy {}: {}", p.display(), e)); }
+                                        }
+                                    }
+                                }
+                            }
+                            let _ = tx.send("done".to_string());
+                        });
+                    } else {
+                        self.last_msg = "No folder selected".to_string();
+                    }
+                }
+
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.move_files, "Move files (don\'t keep originals)");
+                    ui.add(egui::widgets::DragValue::new(&mut self.recurse_depth).clamp_range(-1..=100).speed(1.0));
+                    ui.label("Recursion depth (-1 = infinite)");
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.notify_on_process, "Notify exporters after processing");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Extension filter:");
+                    ui.text_edit_singleline(&mut self.ext_filter);
+                });
+
+                if ui.button("Upload anonymized files").clicked() {
+                    let anon_dir = self.export_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
                     let (tx, rx) = mpsc::channel::<String>();
                     self.rx = Some(rx);
                     thread::spawn(move || {
-                        // collect files (optionally recurse with depth)
-                        let mut stack: Vec<(PathBuf, i32)> = vec![(src.clone(), depth)];
-                        let mut found = Vec::new();
-                        while let Some((dir, dleft)) = stack.pop() {
-                            if let Ok(entries) = fs::read_dir(&dir) {
-                                for e in entries.flatten() {
-                                    let p = e.path();
-                                    if p.is_dir() && (dleft != 0) {
-                                        // if dleft < 0 it's infinite
-                                        let next = if dleft > 0 { dleft - 1 } else { dleft };
-                                        stack.push((p, next));
-                                    } else if p.is_file() {
-                                        if let Some(exts) = p.extension().and_then(|s| s.to_str()) {
-                                            if exts.eq_ignore_ascii_case(&ext) {
-                                                found.push(p);
-                                            }
-                                        }
-                                    }
-                                }
+                        match upload_anon_dir(&anon_dir, None) {
+                            Ok(res) => {
+                                let _ = tx.send(format!("Uploaded: {}", res.uploaded.len()));
+                                let _ = tx.send(format!("Duplicates: {}", res.duplicates.len()));
+                                let _ = tx.send(format!("Failed: {}", res.failed.len()));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(format!("Upload failed: {}", e));
                             }
                         }
 
-                        if found.is_empty() {
-                            let _ = tx.send("No .dcm files found in selected folder".to_string());
-                        } else {
-                            for p in found {
-                                let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string();
-                                let dest = export.join(&fname);
-                                if do_move {
-                                    // try rename, fallback to copy+remove
-                                    match fs::rename(&p, &dest) {
-                                        Ok(_) => { let _ = tx.send(format!("Moved {} -> {}", p.display(), dest.display())); }
-                                        Err(_) => match fs::copy(&p, &dest) {
-                                            Ok(_) => {
-                                                let _ = fs::remove_file(&p);
-                                                let _ = tx.send(format!("Copied+removed {} -> {}", p.display(), dest.display()));
-                                            }
-                                            Err(e) => { let _ = tx.send(format!("Failed to move {}: {}", p.display(), e)); }
-                                        }
-                                    }
+                        let _ = tx.send("done".to_string());
+                    });
+                }
+
+                if ui.button("Refresh ready-to-upload").clicked() {
+                    let anon_dir = self.export_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
+                    let (tx, rx) = mpsc::channel::<String>();
+                    self.rx = Some(rx);
+                    thread::spawn(move || {
+                        match scan_for_upload(&anon_dir) {
+                            Ok(series) => {
+                                // write series summary to temp JSON for GUI to load
+                                let list: Vec<(String, Vec<(String,String,bool)>, Vec<String>)> = series.into_iter().map(|s| {
+                                    let files = s.files.into_iter().map(|f| (f.path.to_string_lossy().to_string(), f.hash, f.is_duplicate)).collect();
+                                    (s.series_uid, files, s.duplicate_series_urls)
+                                }).collect();
+                                if let Ok(json) = serde_json::to_string(&list) {
+                                    let _ = std::fs::write(".last_scan.json", json);
+                                    let _ = tx.send("scan_written".to_string());
                                 } else {
-                                    match fs::copy(&p, &dest) {
-                                        Ok(_) => { let _ = tx.send(format!("Copied {} -> {}", p.display(), dest.display())); }
-                                        Err(e) => { let _ = tx.send(format!("Failed to copy {}: {}", p.display(), e)); }
-                                    }
+                                    let _ = tx.send("scan_serialize_failed".to_string());
                                 }
                             }
+                            Err(e) => { let _ = tx.send(format!("Scan failed: {}", e)); }
                         }
                         let _ = tx.send("done".to_string());
                     });
-                } else {
-                    self.last_msg = "No folder selected".to_string();
                 }
-            }
-
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.move_files, "Move files (don\'t keep originals)");
-                ui.add(egui::widgets::DragValue::new(&mut self.recurse_depth).clamp_range(-1..=100).speed(1.0));
-                ui.label("Recursion depth (-1 = infinite)");
             });
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.notify_on_process, "Notify exporters after processing");
-            });
-            ui.horizontal(|ui| {
-                ui.label("Extension filter:");
-                ui.text_edit_singleline(&mut self.ext_filter);
-            });
-
-            if ui.button("Upload anonymized files").clicked() {
-                let anon_dir = self.export_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
-                let (tx, rx) = mpsc::channel::<String>();
-                self.rx = Some(rx);
-                thread::spawn(move || {
-                    match upload_anon_dir(&anon_dir, None) {
-                        Ok(res) => {
-                            let _ = tx.send(format!("Uploaded: {}", res.uploaded.len()));
-                            let _ = tx.send(format!("Duplicates: {}", res.duplicates.len()));
-                            let _ = tx.send(format!("Failed: {}", res.failed.len()));
-                        }
-                        Err(e) => {
-                            let _ = tx.send(format!("Upload failed: {}", e));
-                        }
-                    }
-
-                    let _ = tx.send("done".to_string());
-                });
-            }
-
-            if ui.button("Refresh ready-to-upload").clicked() {
-                let anon_dir = self.export_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
-                let (tx, rx) = mpsc::channel::<String>();
-                self.rx = Some(rx);
-                thread::spawn(move || {
-                    match scan_for_upload(&anon_dir) {
-                        Ok(series) => {
-                            // write series summary to temp JSON for GUI to load
-                            let list: Vec<(String, Vec<(String,String,bool)>, Vec<String>)> = series.into_iter().map(|s| {
-                                let files = s.files.into_iter().map(|f| (f.path.to_string_lossy().to_string(), f.hash, f.is_duplicate)).collect();
-                                (s.series_uid, files, s.duplicate_series_urls)
-                            }).collect();
-                            if let Ok(json) = serde_json::to_string(&list) {
-                                let _ = std::fs::write(".last_scan.json", json);
-                                let _ = tx.send("scan_written".to_string());
-                            } else {
-                                let _ = tx.send("scan_serialize_failed".to_string());
-                            }
-                        }
-                        Err(e) => { let _ = tx.send(format!("Scan failed: {}", e)); }
-                    }
-                    let _ = tx.send("done".to_string());
-                });
-            }
+            
 
             if ui.button("Send 'loaded' message").clicked() {
                 // placeholder for NNG send
@@ -394,6 +444,12 @@ impl eframe::App for AppState {
                                     self.last_msg = "Ready-to-upload refreshed".to_string();
                                 }
                             }
+                        } else if m.starts_with("duplicates_cleared:") {
+                            if let Some(n) = m.strip_prefix("duplicates_cleared:") {
+                                if let Ok(num) = n.parse::<usize>() {
+                                    self.last_msg = format!("Cleared {} duplicate files", num);
+                                }
+                            }
                         } else if m.starts_with("LOGIN_USER:") {
                             if let Some(name) = m.strip_prefix("LOGIN_USER:") {
                                 self.logged_in_user = Some(name.to_string());
@@ -427,6 +483,43 @@ impl eframe::App for AppState {
                                 self.metadata_select_mode = true;
                                 self.selected_files_for_meta.clear();
                                 self.last_msg = "Select files for metadata compare".to_string();
+                            }
+                            ui.add_space(8.0);
+                            if ui.small_button("Clear duplicates").clicked() {
+                                let anon_dir = self.export_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
+                                let (tx, rx) = mpsc::channel::<String>();
+                                self.rx = Some(rx);
+                                thread::spawn(move || {
+                                    match scan_for_upload(&anon_dir) {
+                                        Ok(series) => {
+                                            let mut deleted = 0usize;
+                                            for s in &series {
+                                                for f in &s.files {
+                                                    if f.is_duplicate {
+                                                        if std::fs::remove_file(&f.path).is_ok() {
+                                                            upload::log_rpc(&format!("Deleted duplicate file: {}", f.path.display()));
+                                                            deleted += 1;
+                                                        } else {
+                                                            upload::log_rpc(&format!("Failed to delete duplicate file: {}", f.path.display()));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // after deletions, write an updated scan so GUI refreshes
+                                            let list: Vec<(String, Vec<(String,String,bool)>, Vec<String>)> = series.into_iter().map(|s| {
+                                                let files = s.files.into_iter().map(|f| (f.path.to_string_lossy().to_string(), f.hash, f.is_duplicate)).collect();
+                                                (s.series_uid, files, s.duplicate_series_urls)
+                                            }).collect();
+                                            if let Ok(json) = serde_json::to_string(&list) {
+                                                let _ = std::fs::write(".last_scan.json", json);
+                                                let _ = tx.send("scan_written".to_string());
+                                            }
+                                            let _ = tx.send(format!("duplicates_cleared:{}", deleted));
+                                        }
+                                        Err(e) => { let _ = tx.send(format!("Clear duplicates failed: {}", e)); }
+                                    }
+                                    let _ = tx.send("done".to_string());
+                                });
                             }
                         } else {
                             if ui.button("Launch metadata viewer").clicked() {
@@ -469,11 +562,43 @@ impl eframe::App for AppState {
                             if ui.checkbox(&mut checked, format!("Series: {} ({} files)", series.series_uid, series.files.len())).changed() {
                                 if si < self.selected_series.len() { self.selected_series[si] = checked; }
                             }
+                            ui.add_space(8.0);
+                            // single button per series: either open the duplicate series URL
+                            // reported by the server (first entry), or redirect to the
+                            // server's uploads page when the series is awaiting import.
+                            if !series.duplicate_series_urls.is_empty() {
+                                let url = series.duplicate_series_urls.get(0).cloned().unwrap_or_default();
+                                if ui.small_button("View on server").clicked() {
+                                    if !url.is_empty() {
+                                        #[cfg(target_os = "windows")]
+                                        let _ = std::process::Command::new("explorer").arg(url.clone()).spawn();
+                                        #[cfg(target_os = "macos")]
+                                        let _ = std::process::Command::new("open").arg(url.clone()).spawn();
+                                        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                                        let _ = std::process::Command::new("xdg-open").arg(url.clone()).spawn();
+                                    } else {
+                                        self.last_msg = "No duplicate URL available".to_string();
+                                    }
+                                }
+                            } else {
+                                // fallback: series likely awaiting import — open the uploads page
+                                let base = upload::base_site_url();
+                                let uploads = format!("{}/atlas/uploads", base.trim_end_matches('/'));
+                                if ui.small_button("Open uploads").clicked() {
+                                    #[cfg(target_os = "windows")]
+                                    let _ = std::process::Command::new("explorer").arg(uploads.clone()).spawn();
+                                    #[cfg(target_os = "macos")]
+                                    let _ = std::process::Command::new("open").arg(uploads.clone()).spawn();
+                                    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                                    let _ = std::process::Command::new("xdg-open").arg(uploads.clone()).spawn();
+                                }
+                            }
                         });
                         if !series.duplicate_series_urls.is_empty() {
                             ui.colored_label(egui::Color32::YELLOW, format!("{} duplicate(s) found on server", series.duplicate_series_urls.len()));
-                            for url in &series.duplicate_series_urls {
-                                ui.hyperlink(url);
+                            // show the first URL (full) as plain text for clarity
+                            if let Some(u) = series.duplicate_series_urls.get(0) {
+                                ui.label(u);
                             }
                         }
                         ui.indent(format!("files-{}", si), |ui| {
@@ -525,6 +650,47 @@ impl eframe::App for AppState {
                         });
                     });
                 }
+            }
+
+            // Logs window
+            if self.log_window_open {
+                egui::Window::new("Request/Response Logs").open(&mut self.log_window_open).show(ctx, |ui| {
+                    let p = upload::log_file_path();
+                    let contents = std::fs::read_to_string(&p).unwrap_or_else(|_| "(no logs)".to_string());
+                    // expand BODY_FILE entries to inline the saved body contents for easier copy
+                    let mut display = String::new();
+                    for line in contents.lines() {
+                        display.push_str(line);
+                        display.push('\n');
+                        if let Some(idx) = line.find("BODY_FILE:") {
+                            let path = line[idx+"BODY_FILE:".len()..].trim();
+                            if !path.is_empty() {
+                                if let Ok(body) = std::fs::read_to_string(path) {
+                                    display.push_str("---- BODY START ----\n");
+                                    display.push_str(&body);
+                                    if !body.ends_with('\n') { display.push('\n'); }
+                                    display.push_str("---- BODY END ----\n");
+                                } else {
+                                    display.push_str("(failed to read body file)\n");
+                                }
+                            }
+                        }
+                    }
+                    let mut txt = display;
+                    egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                        ui.add(egui::TextEdit::multiline(&mut txt).desired_rows(20).desired_width(ui.available_width()));
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Refresh").clicked() {
+                            // force UI to re-open (content read each frame, so nothing else required)
+                            self.last_msg = "Logs refreshed".to_string();
+                        }
+                        if ui.button("Clear").clicked() {
+                            let _ = std::fs::write(p.clone(), "");
+                            self.last_msg = "Logs cleared".to_string();
+                        }
+                    });
+                });
             }
 
             // Metadata compare window (side-by-side)
@@ -618,6 +784,8 @@ fn main() {
     let _ = eframe::run_native("Uploader (Rust)", native_options, Box::new(|_cc| {
         // create app and a channel for background notifications (NNG and tasks)
         let mut app = AppState::default();
+        // ensure log file exists for debug output
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(upload::log_file_path());
         let (tx, rx) = mpsc::channel::<String>();
         app.rx = Some(rx);
 
