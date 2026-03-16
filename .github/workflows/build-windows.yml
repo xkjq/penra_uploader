@@ -1,0 +1,53 @@
+name: Build Windows artifacts
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-msvc:
+    name: Build (Windows MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      - name: Build release (MSVC)
+        run: cargo build --release
+      - name: Upload MSVC artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: uploader-windows-msvc
+          path: target\\release\\uploader_rs.exe
+
+  build-gnu:
+    name: Build (Windows GNU via Ubuntu + mingw)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mingw and deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 pkg-config libssl-dev build-essential
+      - name: Setup Rust + add target
+        run: |
+          curl https://sh.rustup.rs -sSf | sh -s -- -y
+          source $HOME/.cargo/env
+          rustup target add x86_64-pc-windows-gnu
+      - name: Build release (x86_64-pc-windows-gnu)
+        env:
+          RUSTFLAGS: "-C linker=x86_64-w64-mingw32-gcc"
+        run: |
+          source $HOME/.cargo/env
+          cargo build --release --target x86_64-pc-windows-gnu
+      - name: Upload GNU artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: uploader-windows-gnu
+          path: target/x86_64-pc-windows-gnu/release/uploader_rs.exe
