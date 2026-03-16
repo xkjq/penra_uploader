@@ -20,3 +20,11 @@ launcher/target/
 launcher/Cargo.lock
 
 uploader.log
+
+uploader_rs/debug/
+uploader_rs/target/
+uploader_rs/Cargo.lock
+uploader_rs/export/
+uploader_rs/anon/
+
+test_dicoms/

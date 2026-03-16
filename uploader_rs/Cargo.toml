@@ -1,0 +1,24 @@
+[package]
+name = "uploader_rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.22"
+egui = "0.22"
+nng = "1.0.1"
+serde = { version = "1.0", features = ["derive"] }
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "json", "rustls-tls", "multipart"] }
+blake3 = "1.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+rfd = "0.14.1"
+dicom-object = "0.6"
+dicom-core = "0.6"
+chrono = { version = "0.4", features = ["serde"] }
+num-bigint = "0.4"
+hex = "0.4"
+serde_json = "1.0"
+dirs = "4.0"
+
+[dev-dependencies]
+tempfile = "3.6"
