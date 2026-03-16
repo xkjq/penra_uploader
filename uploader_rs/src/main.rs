@@ -51,7 +51,22 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             last_msg: String::new(),
-            export_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join("export"),
+            export_dir: {
+                if cfg!(target_os = "windows") {
+                    let base = PathBuf::from(r"C:\uploader");
+                    let export = base.join("export");
+                    let anon = base.join("anon");
+                    let _ = std::fs::create_dir_all(&export);
+                    let _ = std::fs::create_dir_all(&anon);
+                    export
+                } else {
+                    let export = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join("export");
+                    let anon = export.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
+                    let _ = std::fs::create_dir_all(&export);
+                    let _ = std::fs::create_dir_all(&anon);
+                    export
+                }
+            },
             rx: None,
             processed: Vec::new(),
             seed: None,
@@ -139,6 +154,9 @@ impl AppState {
             }
             let _ = tx.send("done".to_string());
         });
+    }
+    fn anon_dir(&self) -> PathBuf {
+        self.export_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon")
     }
 }
 
@@ -377,7 +395,7 @@ impl eframe::App for AppState {
                 });
 
                 if ui.button("Upload anonymized files").clicked() {
-                    let anon_dir = self.export_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
+                    let anon_dir = self.anon_dir();
                     let (tx, rx) = mpsc::channel::<String>();
                     self.rx = Some(rx);
                     thread::spawn(move || {
@@ -398,6 +416,7 @@ impl eframe::App for AppState {
 
                 if ui.button("Refresh ready-to-upload").clicked() {
                     let anon_dir = self.export_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
+                        let anon_dir = self.anon_dir();
                     let (tx, rx) = mpsc::channel::<String>();
                     self.rx = Some(rx);
                     thread::spawn(move || {
@@ -487,7 +506,7 @@ impl eframe::App for AppState {
                             }
                             ui.add_space(8.0);
                             if ui.small_button("Clear duplicates").clicked() {
-                                let anon_dir = self.export_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
+                                let anon_dir = self.anon_dir();
                                 let (tx, rx) = mpsc::channel::<String>();
                                 self.rx = Some(rx);
                                 thread::spawn(move || {
@@ -860,7 +879,7 @@ fn main() {
         app.rx = Some(rx);
 
         // Initial scan for existing anonymised files to show ready-to-upload series
-        let anon_dir = app.export_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
+        let anon_dir = app.anon_dir();
         match scan_for_upload(&anon_dir) {
             Ok(series) => {
                 app.ready_series = series;
