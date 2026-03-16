@@ -19,6 +19,16 @@ use rfd::FileDialog;
 use nng::{Protocol, Socket};
 use chrono::Utc;
 
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+    } else if bytes >= 1_000 {
+        format!("{:.1} KB", bytes as f64 / 1_000.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 struct AppState {
     last_msg: String,
     export_dir: PathBuf,
@@ -593,13 +603,14 @@ impl eframe::App for AppState {
                         let mut checked = *self.selected_series.get(si).unwrap_or(&true);
                         ui.horizontal(|ui| {
                             let header = format!(
-                                "Patient: {} ({}) — Study: {} — Modality: {} — Series {} — {} files",
-                                series.patient_name.as_deref().unwrap_or("-"),
+                                "Exam: {} — ID: {} — Study: {} — Modality: {} — Series {} — {} files — {}",
+                                series.examination.as_deref().or(series.series_description.as_deref()).unwrap_or("-"),
                                 series.patient_id.as_deref().unwrap_or("-"),
                                 series.study_date.as_deref().unwrap_or("-"),
                                 series.modality.as_deref().unwrap_or("-"),
                                 series.series_number.as_deref().unwrap_or(&series.series_uid),
-                                series.files.len()
+                                series.file_count,
+                                human_size(series.total_bytes)
                             );
                             if ui.checkbox(&mut checked, header).changed() {
                                 if si < self.selected_series.len() { self.selected_series[si] = checked; }

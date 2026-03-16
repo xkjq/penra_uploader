@@ -23,6 +23,7 @@ pub struct SeriesInfo {
     pub duplicate_series_urls: Vec<String>,
     // common metadata to present in the GUI
     pub patient_name: Option<String>,
+    pub examination: Option<String>,
     pub patient_id: Option<String>,
     pub study_date: Option<String>,
     pub modality: Option<String>,
@@ -570,6 +571,7 @@ pub fn scan_for_upload(anon_dir: &Path) -> Result<Vec<SeriesInfo>, String> {
 
         // pick first file to extract study/series metadata
         let mut patient_name = None;
+        let mut examination = None;
         let mut patient_id = None;
         let mut study_date = None;
         let mut modality = None;
@@ -578,6 +580,7 @@ pub fn scan_for_upload(anon_dir: &Path) -> Result<Vec<SeriesInfo>, String> {
         if let Some((first_path, _)) = items.get(0) {
             if let Ok(obj) = open_file(first_path) {
                 patient_name = obj.element(Tag(0x0010,0x0010)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
+                examination = obj.element(Tag(0x0008,0x1030)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
                 patient_id = obj.element(Tag(0x0010,0x0020)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
                 study_date = obj.element(Tag(0x0008,0x0020)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
                 modality = obj.element(Tag(0x0008,0x0060)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
@@ -591,6 +594,7 @@ pub fn scan_for_upload(anon_dir: &Path) -> Result<Vec<SeriesInfo>, String> {
             files: entries,
             duplicate_series_urls: urls,
             patient_name,
+            examination,
             patient_id,
             study_date,
             modality,
