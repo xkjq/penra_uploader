@@ -595,6 +595,25 @@ fn main() {
         run_meta_viewer(paths);
         return;
     }
+    // if started with --anon, anonymize a single file and write to the given output path
+    if args.len() >= 4 && args[1] == "--anon" {
+        let in_path = std::path::Path::new(&args[2]);
+        let out_path = std::path::Path::new(&args[3]);
+        match anonymizer::anonymize_file(in_path, out_path.parent().unwrap_or_else(||std::path::Path::new(".")), false, None) {
+            Ok(p) => {
+                // if anonymizer wrote a file with same name under output dir, move/rename to requested path
+                if p != out_path {
+                    let _ = std::fs::rename(&p, out_path);
+                }
+                println!("OK:{}", out_path.display());
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("ERROR:{}", e);
+                std::process::exit(2);
+            }
+        }
+    }
     let native_options = NativeOptions::default();
     let _ = eframe::run_native("Uploader (Rust)", native_options, Box::new(|_cc| {
         // create app and a channel for background notifications (NNG and tasks)

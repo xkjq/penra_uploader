@@ -58,6 +58,35 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
     let _ = obj.put_str(Tag(0x0010, 0x0010), VR::PN, &pn);
     let _ = obj.put_str(Tag(0x0010, 0x0020), VR::LO, &pid);
 
+    // Keep patient name and id pseudonymized, but clear other PHI-heavy fields
+    let _ = obj.put_str(Tag(0x0010, 0x0010), VR::PN, &pn);
+    let _ = obj.put_str(Tag(0x0010, 0x0020), VR::LO, &pid);
+
+    // Clear common free-text and ID tags that dicognito typically removes
+    let mut clear_tags = vec![
+        Tag(0x0008,0x0080), // InstitutionName
+        Tag(0x0008,0x0081), // InstitutionAddress
+        Tag(0x0008,0x1030), // StudyDescription
+        Tag(0x0008,0x103E), // SeriesDescription
+        Tag(0x0010,0x1040), // PatientAddress
+        Tag(0x0010,0x4000), // PatientComments
+        Tag(0x0008,0x0092), // Referring Physician Address Sequence (may be sequence)
+    ];
+    // Physician and operator names
+    clear_tags.push(Tag(0x0008,0x0090)); // ReferringPhysicianName
+    clear_tags.push(Tag(0x0008,0x1050)); // PerformingPhysicianName
+    clear_tags.push(Tag(0x0008,0x1070)); // OperatorsName
+    // IDs and other patient identifiers
+    clear_tags.push(Tag(0x0008,0x0050)); // AccessionNumber
+    clear_tags.push(Tag(0x0020,0x0010)); // StudyID
+    clear_tags.push(Tag(0x0018,0x1000)); // DeviceSerialNumber
+    clear_tags.push(Tag(0x0010,0x1000)); // OtherPatientIDs
+    clear_tags.push(Tag(0x0010,0x1002)); // OtherPatientIDsSequence
+    for tag in clear_tags {
+        // write empty string with a reasonable VR; fall back to LO
+        let _ = obj.put_str(tag, VR::LO, "");
+    }
+
     // Remap UIDs: StudyInstanceUID (0020,000D), SeriesInstanceUID (0020,000E), SOPInstanceUID (0008,0018)
     if let Ok(e) = obj.element(Tag(0x0020,0x000D)) {
         if let Ok(s) = e.to_str() {
