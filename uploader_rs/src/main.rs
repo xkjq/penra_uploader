@@ -61,6 +61,7 @@ struct AppState {
     selected_files_for_meta: HashSet<String>,
     metadata_select_mode: bool,
     log_window_open: bool,
+    confirm_remove_all: bool,
 }
 
 impl Default for AppState {
@@ -117,6 +118,7 @@ impl Default for AppState {
             metadata_select_mode: false,
             log_window_open: false,
             login_open: upload::token_username().is_none(),
+            confirm_remove_all: false,
         }
     }
 }
@@ -414,24 +416,7 @@ impl eframe::App for AppState {
                     ui.text_edit_singleline(&mut self.ext_filter);
                 });
 
-                if ui.button("Upload anonymized files").clicked() {
-                    let anon_dir = self.anon_dir();
-                    let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
-                    thread::spawn(move || {
-                        match upload_anon_dir(&anon_dir, None) {
-                            Ok(res) => {
-                                let _ = tx.send(format!("Uploaded: {}", res.uploaded.len()));
-                                let _ = tx.send(format!("Duplicates: {}", res.duplicates.len()));
-                                let _ = tx.send(format!("Failed: {}", res.failed.len()));
-                            }
-                            Err(e) => {
-                                let _ = tx.send(format!("Upload failed: {}", e));
-                            }
-                        }
-
-                        let _ = tx.send("done".to_string());
-                    });
-                }
+                
 
                 if ui.button("Refresh ready-to-upload").clicked() {
                     let anon_dir = self.export_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
@@ -521,7 +506,26 @@ impl eframe::App for AppState {
             ui.collapsing("Ready to Upload", |ui| {
                 egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                     ui.horizontal(|ui| {
+                        // Styled Upload button moved here to Ready-to-Upload (prominent)
                         if !self.metadata_select_mode {
+                            if ui.add(egui::Button::new("Upload anonymized files").fill(egui::Color32::from_rgb(0,150,60))).clicked() {
+                                let anon_dir = self.anon_dir();
+                                let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
+                                thread::spawn(move || {
+                                    match upload_anon_dir(&anon_dir, None) {
+                                        Ok(res) => {
+                                            let _ = tx.send(format!("Uploaded: {}", res.uploaded.len()));
+                                            let _ = tx.send(format!("Duplicates: {}", res.duplicates.len()));
+                                            let _ = tx.send(format!("Failed: {}", res.failed.len()));
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(format!("Upload failed: {}", e));
+                                        }
+                                    }
+                                    let _ = tx.send("done".to_string());
+                                });
+                            }
+                            ui.add_space(8.0);
                             if ui.button("Compare selected metadata").clicked() {
                                 self.metadata_select_mode = true;
                                 self.selected_files_for_meta.clear();
@@ -563,6 +567,12 @@ impl eframe::App for AppState {
                                     }
                                     let _ = tx.send("done".to_string());
                                 });
+                            }
+                            ui.add_space(6.0);
+                            if ui.small_button("Remove all").clicked() {
+                                // ask for confirmation before deleting everything
+                                self.confirm_remove_all = true;
+                                self.last_msg = "Confirm remove all files...".to_string();
                             }
                         } else {
                             if ui.button("Launch metadata viewer").clicked() {
@@ -759,6 +769,54 @@ impl eframe::App for AppState {
             });
 
             ui.label(format!("Last: {}", self.last_msg));
+
+            // Confirmation modal for Remove all
+            if self.confirm_remove_all {
+                egui::Window::new("Confirm remove all").collapsible(false).resizable(false).show(ctx, |ui| {
+                    ui.label("This will permanently delete all anonymised files in the anon directory. This cannot be undone.");
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new("Yes, remove all").fill(egui::Color32::from_rgb(180,20,20))).clicked() {
+                            let anon_dir = self.anon_dir();
+                            let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
+                            thread::spawn(move || {
+                                match scan_for_upload(&anon_dir) {
+                                    Ok(series) => {
+                                        let mut removed = 0usize;
+                                        for s in &series {
+                                            for f in &s.files {
+                                                if std::fs::remove_file(&f.path).is_ok() {
+                                                    upload::log_rpc(&format!("Removed file: {}", f.path.display()));
+                                                    removed += 1;
+                                                } else {
+                                                    upload::log_rpc(&format!("Failed to remove file: {}", f.path.display()));
+                                                }
+                                            }
+                                        }
+                                        // after removals, refresh scan so GUI shows empty/updated state
+                                        match scan_for_upload(&anon_dir) {
+                                            Ok(new_series) => {
+                                                if let Ok(json2) = serde_json::to_string(&new_series) {
+                                                    let _ = std::fs::write(".last_scan.json", json2);
+                                                    let _ = tx.send("scan_written".to_string());
+                                                }
+                                            }
+                                            Err(e) => { let _ = tx.send(format!("Post-remove scan failed: {}", e)); }
+                                        }
+                                        let _ = tx.send(format!("removed_all:{}", removed));
+                                    }
+                                    Err(e) => { let _ = tx.send(format!("Remove all failed: {}", e)); }
+                                }
+                                let _ = tx.send("done".to_string());
+                            });
+                            self.confirm_remove_all = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_remove_all = false;
+                            self.last_msg = "Remove all cancelled".to_string();
+                        }
+                    });
+                });
+            }
 
             // Metadata single-view window
             if self.metadata_window_open {
