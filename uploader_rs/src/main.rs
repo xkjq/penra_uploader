@@ -35,6 +35,7 @@ struct AppState {
     selected_series: Vec<bool>,
     base_url_mode: i32,
     custom_base_url: String,
+    skip_ssl: bool,
     // metadata viewer state
     metadata_window_open: bool,
     metadata_compare_open: bool,
@@ -72,6 +73,7 @@ impl Default for AppState {
                 }
             },
             custom_base_url: upload::load_base_url().unwrap_or_default(),
+            skip_ssl: upload::load_skip_ssl(),
             metadata_window_open: false,
             metadata_compare_open: false,
             metadata_single: None,
@@ -88,8 +90,8 @@ impl eframe::App for AppState {
         CentralPanel::default().show(ctx, |ui| {
             ui.heading("Uploader (Rust) - skeleton");
 
-            ui.collapsing("Server", |ui| {
-                ui.label("Choose server:");
+            ui.collapsing("Settings", |ui| {
+                ui.label("Server settings:");
                 ui.horizontal(|ui| {
                     ui.radio_value(&mut self.base_url_mode, 0, "Production (https://www.penracourses.org.uk)");
                     ui.radio_value(&mut self.base_url_mode, 1, "Development (http://localhost:8080)");
@@ -98,16 +100,19 @@ impl eframe::App for AppState {
                     ui.radio_value(&mut self.base_url_mode, 2, "Custom");
                     ui.text_edit_singleline(&mut self.custom_base_url);
                 });
-                if ui.button("Save Server").clicked() {
+                ui.checkbox(&mut self.skip_ssl, "Disable SSL verification (unsafe)");
+                if ui.button("Save Settings").clicked() {
                     let url = match self.base_url_mode {
                         0 => "https://www.penracourses.org.uk".to_string(),
                         1 => "http://localhost:8080".to_string(),
                         _ => self.custom_base_url.clone(),
                     };
-                    if upload::save_base_url(&url) {
-                        self.last_msg = format!("Saved base URL {}", url);
+                    let ok1 = upload::save_base_url(&url);
+                    let ok2 = upload::save_skip_ssl(self.skip_ssl);
+                    if ok1 && ok2 {
+                        self.last_msg = format!("Saved settings: {} (skip_ssl={})", url, self.skip_ssl);
                     } else {
-                        self.last_msg = "Failed to save base URL".to_string();
+                        self.last_msg = "Failed to save settings".to_string();
                     }
                 }
                 ui.label(format!("Current base: {}", upload::base_site_url()));
@@ -267,6 +272,21 @@ impl eframe::App for AppState {
                             }
                         }
 
+                        // after processing, refresh ready-to-upload by scanning anon dir
+                        match scan_for_upload(&anon_dir) {
+                            Ok(series) => {
+                                let list: Vec<(String, Vec<(String,String,bool)>, Vec<String>)> = series.into_iter().map(|s| {
+                                    let files = s.files.into_iter().map(|f| (f.path.to_string_lossy().to_string(), f.hash, f.is_duplicate)).collect();
+                                    (s.series_uid, files, s.duplicate_series_urls)
+                                }).collect();
+                                if let Ok(json) = serde_json::to_string(&list) {
+                                    let _ = std::fs::write(".last_scan.json", json);
+                                    let _ = tx.send("scan_written".to_string());
+                                }
+                            }
+                            Err(e) => { let _ = tx.send(format!("Post-process scan failed: {}", e)); }
+                        }
+
                         let _ = tx.send("done".to_string());
                     });
                 }
@@ -274,23 +294,25 @@ impl eframe::App for AppState {
                 if ui.button("Import from folder").clicked() {
                     // Pick a source folder and copy .dcm files into the export dir in background
                     if let Some(src) = FileDialog::new().pick_folder() {
-                        // capture options
                         let do_move = self.move_files;
+                        let seed_clone = self.seed.clone();
                         let depth = self.recurse_depth;
                         let ext = self.ext_filter.clone();
                         let export = self.export_dir.clone();
                         let (tx, rx) = mpsc::channel::<String>();
                         self.rx = Some(rx);
+
                         thread::spawn(move || {
                             // collect files (optionally recurse with depth)
                             let mut stack: Vec<(PathBuf, i32)> = vec![(src.clone(), depth)];
-                            let mut found = Vec::new();
+                            let mut found: Vec<PathBuf> = Vec::new();
+                            let mut copied_files: Vec<PathBuf> = Vec::new();
+
                             while let Some((dir, dleft)) = stack.pop() {
                                 if let Ok(entries) = fs::read_dir(&dir) {
                                     for e in entries.flatten() {
                                         let p = e.path();
                                         if p.is_dir() && (dleft != 0) {
-                                            // if dleft < 0 it's infinite
                                             let next = if dleft > 0 { dleft - 1 } else { dleft };
                                             stack.push((p, next));
                                         } else if p.is_file() {
@@ -311,25 +333,62 @@ impl eframe::App for AppState {
                                     let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string();
                                     let dest = export.join(&fname);
                                     if do_move {
-                                        // try rename, fallback to copy+remove
                                         match fs::rename(&p, &dest) {
-                                            Ok(_) => { let _ = tx.send(format!("Moved {} -> {}", p.display(), dest.display())); }
+                                            Ok(_) => { let _ = tx.send(format!("Moved {} -> {}", p.display(), dest.display())); copied_files.push(dest.clone()); }
                                             Err(_) => match fs::copy(&p, &dest) {
                                                 Ok(_) => {
                                                     let _ = fs::remove_file(&p);
                                                     let _ = tx.send(format!("Copied+removed {} -> {}", p.display(), dest.display()));
+                                                    copied_files.push(dest.clone());
                                                 }
                                                 Err(e) => { let _ = tx.send(format!("Failed to move {}: {}", p.display(), e)); }
                                             }
                                         }
                                     } else {
                                         match fs::copy(&p, &dest) {
-                                            Ok(_) => { let _ = tx.send(format!("Copied {} -> {}", p.display(), dest.display())); }
+                                            Ok(_) => { let _ = tx.send(format!("Copied {} -> {}", p.display(), dest.display())); copied_files.push(dest.clone()); }
                                             Err(e) => { let _ = tx.send(format!("Failed to copy {}: {}", p.display(), e)); }
                                         }
                                     }
                                 }
+
+                                // After files have been copied/moved, automatically process them
+                                if !copied_files.is_empty() {
+                                    let anon_dir = export.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
+                                    for p in &copied_files {
+                                        if p.extension().map(|e| e == "dcm").unwrap_or(false) {
+                                            match anonymize_file(p, &anon_dir, true, seed_clone.as_deref()) {
+                                                Ok(out) => {
+                                                    let _ = tx.send(format!("Anonymized: {}", out.display()));
+                                                    if let Ok(bytes) = fs::read(&out) {
+                                                        let hash = blake3::hash(&bytes);
+                                                        let _ = tx.send(format!("Hash {}: {}", out.display(), hash.to_hex()));
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    let _ = tx.send(format!("Anon failed {}: {}", p.display(), e));
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // after processing, refresh ready-to-upload by scanning anon dir
+                                    match scan_for_upload(&anon_dir) {
+                                        Ok(series) => {
+                                            let list: Vec<(String, Vec<(String,String,bool)>, Vec<String>)> = series.into_iter().map(|s| {
+                                                let files = s.files.into_iter().map(|f| (f.path.to_string_lossy().to_string(), f.hash, f.is_duplicate)).collect();
+                                                (s.series_uid, files, s.duplicate_series_urls)
+                                            }).collect();
+                                            if let Ok(json) = serde_json::to_string(&list) {
+                                                let _ = std::fs::write(".last_scan.json", json);
+                                                let _ = tx.send("scan_written".to_string());
+                                            }
+                                        }
+                                        Err(e) => { let _ = tx.send(format!("Post-import scan failed: {}", e)); }
+                                    }
+                                }
                             }
+
                             let _ = tx.send("done".to_string());
                         });
                     } else {
@@ -505,14 +564,19 @@ impl eframe::App for AppState {
                                                     }
                                                 }
                                             }
-                                            // after deletions, write an updated scan so GUI refreshes
-                                            let list: Vec<(String, Vec<(String,String,bool)>, Vec<String>)> = series.into_iter().map(|s| {
-                                                let files = s.files.into_iter().map(|f| (f.path.to_string_lossy().to_string(), f.hash, f.is_duplicate)).collect();
-                                                (s.series_uid, files, s.duplicate_series_urls)
-                                            }).collect();
-                                            if let Ok(json) = serde_json::to_string(&list) {
-                                                let _ = std::fs::write(".last_scan.json", json);
-                                                let _ = tx.send("scan_written".to_string());
+                                            // after deletions, do a fresh scan so GUI reflects current anon dir
+                                            match scan_for_upload(&anon_dir) {
+                                                Ok(new_series) => {
+                                                    let list2: Vec<(String, Vec<(String,String,bool)>, Vec<String>)> = new_series.into_iter().map(|s| {
+                                                        let files = s.files.into_iter().map(|f| (f.path.to_string_lossy().to_string(), f.hash, f.is_duplicate)).collect();
+                                                        (s.series_uid, files, s.duplicate_series_urls)
+                                                    }).collect();
+                                                    if let Ok(json2) = serde_json::to_string(&list2) {
+                                                        let _ = std::fs::write(".last_scan.json", json2);
+                                                        let _ = tx.send("scan_written".to_string());
+                                                    }
+                                                }
+                                                Err(e) => { let _ = tx.send(format!("Post-clear scan failed: {}", e)); }
                                             }
                                             let _ = tx.send(format!("duplicates_cleared:{}", deleted));
                                         }

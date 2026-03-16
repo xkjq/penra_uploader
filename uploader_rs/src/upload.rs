@@ -67,8 +67,51 @@ pub fn load_base_url() -> Option<String> {
 
 pub fn save_base_url(url: &str) -> bool {
     let p = config_file_path();
-    let obj = serde_json::json!({"base_url": url});
-    std::fs::write(p, obj.to_string()).is_ok()
+    // merge with existing config if present
+    let mut map = serde_json::Map::new();
+    if p.exists() {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                if let Some(o) = v.as_object() {
+                    for (k, val) in o {
+                        map.insert(k.clone(), val.clone());
+                    }
+                }
+            }
+        }
+    }
+    map.insert("base_url".to_string(), serde_json::Value::String(url.to_string()));
+    std::fs::write(p, serde_json::Value::Object(map).to_string()).is_ok()
+}
+
+pub fn load_skip_ssl() -> bool {
+    let p = config_file_path();
+    if p.exists() {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                return v.get("skip_ssl").and_then(|b| b.as_bool()).unwrap_or(false);
+            }
+        }
+    }
+    false
+}
+
+pub fn save_skip_ssl(skip: bool) -> bool {
+    let p = config_file_path();
+    let mut map = serde_json::Map::new();
+    if p.exists() {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                if let Some(o) = v.as_object() {
+                    for (k, val) in o {
+                        map.insert(k.clone(), val.clone());
+                    }
+                }
+            }
+        }
+    }
+    map.insert("skip_ssl".to_string(), serde_json::Value::Bool(skip));
+    std::fs::write(p, serde_json::Value::Object(map).to_string()).is_ok()
 }
 
 fn token_file_path() -> PathBuf {
@@ -170,7 +213,13 @@ pub fn token_username() -> Option<String> {
 
 fn make_client(token: Option<&str>) -> Result<Client, String> {
     let mut b = reqwest::blocking::Client::builder();
-    if std::env::var("UPLOADER_SKIP_SSL_VERIFY").unwrap_or_default().to_lowercase() == "1" {
+    // priority: env var -> saved config -> default
+    let skip = if let Ok(env) = std::env::var("UPLOADER_SKIP_SSL_VERIFY") {
+        if !env.is_empty() { env.to_lowercase() == "1" } else { load_skip_ssl() }
+    } else {
+        load_skip_ssl()
+    };
+    if skip {
         b = b.danger_accept_invalid_certs(true);
     }
     // set default Authorization header when token provided
