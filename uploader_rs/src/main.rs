@@ -116,30 +116,24 @@ impl eframe::App for AppState {
                     }
                 }
                 ui.label(format!("Current base: {}", upload::base_site_url()));
+                ui.horizontal(|ui| {
+                    ui.label("Seed:");
+                    let mut s = self.seed.clone().unwrap_or_default();
+                    if ui.text_edit_singleline(&mut s).changed() {
+                        self.seed = if s.is_empty() { None } else { Some(s.clone()) };
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.small_button("Show Logs").clicked() { self.log_window_open = !self.log_window_open; }
+                    if ui.small_button("Refresh Logs").clicked() { self.last_msg = "Logs refreshed".to_string(); }
+                    if ui.small_button("Clear Logs").clicked() {
+                        let _ = std::fs::write(upload::log_file_path(), "");
+                        self.last_msg = "Cleared logs".to_string();
+                    }
+                });
             });
-            ui.horizontal(|ui| {
-                if ui.small_button("Show Logs").clicked() { self.log_window_open = !self.log_window_open; }
-                if ui.small_button("Refresh Logs").clicked() { self.last_msg = "Logs refreshed".to_string(); }
-                if ui.small_button("Clear Logs").clicked() {
-                    let _ = std::fs::write(upload::log_file_path(), "");
-                    self.last_msg = "Cleared logs".to_string();
-                }
-            });
+            
 
-            if ui.button("Launch backend (Python)").clicked() {
-                match Command::new("python3").arg("../nice.py").arg("--work-dir").arg(".").spawn() {
-                    Ok(_) => self.last_msg = "Launched python backend".to_string(),
-                    Err(e) => self.last_msg = format!("Failed to launch backend: {}", e),
-                }
-            }
-
-            ui.horizontal(|ui| {
-                ui.label("Seed:");
-                let mut s = self.seed.clone().unwrap_or_default();
-                if ui.text_edit_singleline(&mut s).changed() {
-                    self.seed = if s.is_empty() { None } else { Some(s.clone()) };
-                }
-            });
 
             ui.collapsing("Login", |ui| {
                 ui.horizontal(|ui| {
