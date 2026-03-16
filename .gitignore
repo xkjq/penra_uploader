@@ -29,4 +29,4 @@ uploader_rs/anon/
 
 test_dicoms/
 
-.last_scan.json
+uploader_rs/.last_scan.json

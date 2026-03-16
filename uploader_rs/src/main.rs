@@ -17,6 +17,7 @@ use blake3;
 use std::fs;
 use rfd::FileDialog;
 use nng::{Protocol, Socket};
+use chrono::Utc;
 
 struct AppState {
     last_msg: String,
@@ -177,7 +178,7 @@ impl AppState {
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Uploader (Rust) - skeleton");
+            ui.heading("Uploader (Rust)");
 
             
 
@@ -278,14 +279,10 @@ impl eframe::App for AppState {
                         // after processing, refresh ready-to-upload by scanning anon dir
                         match scan_for_upload(&anon_dir) {
                             Ok(series) => {
-                                let list: Vec<(String, Vec<(String,String,bool)>, Vec<String>)> = series.into_iter().map(|s| {
-                                    let files = s.files.into_iter().map(|f| (f.path.to_string_lossy().to_string(), f.hash, f.is_duplicate)).collect();
-                                    (s.series_uid, files, s.duplicate_series_urls)
-                                }).collect();
-                                    if let Ok(json) = serde_json::to_string(&list) {
-                                        let _ = std::fs::write(".last_scan.json", json);
-                                        let _ = tx.send("scan_written".to_string());
-                                    }
+                                if let Ok(json) = serde_json::to_string(&series) {
+                                    let _ = std::fs::write(".last_scan.json", json);
+                                    let _ = tx.send("scan_written".to_string());
+                                }
                             }
                             Err(e) => { let _ = tx.send(format!("Post-process scan failed: {}", e)); }
                         }
@@ -377,14 +374,10 @@ impl eframe::App for AppState {
                                     // after processing, refresh ready-to-upload by scanning anon dir
                                     match scan_for_upload(&anon_dir) {
                                         Ok(series) => {
-                                            let list: Vec<(String, Vec<(String,String,bool)>, Vec<String>)> = series.into_iter().map(|s| {
-                                                let files = s.files.into_iter().map(|f| (f.path.to_string_lossy().to_string(), f.hash, f.is_duplicate)).collect();
-                                                (s.series_uid, files, s.duplicate_series_urls)
-                                            }).collect();
-                                                if let Ok(json) = serde_json::to_string(&list) {
-                                                    let _ = std::fs::write(".last_scan.json", json);
-                                                    let _ = tx.send("scan_written".to_string());
-                                                }
+                                            if let Ok(json) = serde_json::to_string(&series) {
+                                                let _ = std::fs::write(".last_scan.json", json);
+                                                let _ = tx.send("scan_written".to_string());
+                                            }
                                         }
                                         Err(e) => { let _ = tx.send(format!("Post-import scan failed: {}", e)); }
                                     }
@@ -438,11 +431,7 @@ impl eframe::App for AppState {
                         match scan_for_upload(&anon_dir) {
                             Ok(series) => {
                                 // write series summary to temp JSON for GUI to load
-                                let list: Vec<(String, Vec<(String,String,bool)>, Vec<String>)> = series.into_iter().map(|s| {
-                                    let files = s.files.into_iter().map(|f| (f.path.to_string_lossy().to_string(), f.hash, f.is_duplicate)).collect();
-                                    (s.series_uid, files, s.duplicate_series_urls)
-                                }).collect();
-                                if let Ok(json) = serde_json::to_string(&list) {
+                                if let Ok(json) = serde_json::to_string(&series) {
                                     let _ = std::fs::write(".last_scan.json", json);
                                     let _ = tx.send("scan_written".to_string());
                                 } else {
@@ -470,16 +459,8 @@ impl eframe::App for AppState {
                             self.processing_progress = 0.0;
                         } else if m == "scan_written" {
                             if let Ok(txt) = std::fs::read_to_string(".last_scan.json") {
-                                if let Ok(v) = serde_json::from_str::<Vec<(String, Vec<(String,String,bool)>, Vec<String>)>>(&txt) {
-                                    let mut cols = Vec::new();
-                                    for (suid, files, urls) in v {
-                                        let mut entries = Vec::new();
-                                        for (p, h, dup) in files {
-                                            entries.push(FileEntry { path: PathBuf::from(p), hash: h, is_duplicate: dup });
-                                        }
-                                        cols.push(SeriesInfo { series_uid: suid, files: entries, duplicate_series_urls: urls });
-                                    }
-                                    self.ready_series = cols;
+                                if let Ok(v) = serde_json::from_str::<Vec<SeriesInfo>>(&txt) {
+                                    self.ready_series = v;
                                     self.selected_series = vec![true; self.ready_series.len()];
                                     self.last_msg = "Ready-to-upload refreshed".to_string();
                                 }
@@ -559,11 +540,7 @@ impl eframe::App for AppState {
                                             // after deletions, do a fresh scan so GUI reflects current anon dir
                                             match scan_for_upload(&anon_dir) {
                                                 Ok(new_series) => {
-                                                    let list2: Vec<(String, Vec<(String,String,bool)>, Vec<String>)> = new_series.into_iter().map(|s| {
-                                                        let files = s.files.into_iter().map(|f| (f.path.to_string_lossy().to_string(), f.hash, f.is_duplicate)).collect();
-                                                        (s.series_uid, files, s.duplicate_series_urls)
-                                                    }).collect();
-                                                    if let Ok(json2) = serde_json::to_string(&list2) {
+                                                    if let Ok(json2) = serde_json::to_string(&new_series) {
                                                         let _ = std::fs::write(".last_scan.json", json2);
                                                         let _ = tx.send("scan_written".to_string());
                                                     }
@@ -615,7 +592,16 @@ impl eframe::App for AppState {
                     for (si, series) in self.ready_series.iter().enumerate() {
                         let mut checked = *self.selected_series.get(si).unwrap_or(&true);
                         ui.horizontal(|ui| {
-                            if ui.checkbox(&mut checked, format!("Series: {} ({} files)", series.series_uid, series.files.len())).changed() {
+                            let header = format!(
+                                "Patient: {} ({}) — Study: {} — Modality: {} — Series {} — {} files",
+                                series.patient_name.as_deref().unwrap_or("-"),
+                                series.patient_id.as_deref().unwrap_or("-"),
+                                series.study_date.as_deref().unwrap_or("-"),
+                                series.modality.as_deref().unwrap_or("-"),
+                                series.series_number.as_deref().unwrap_or(&series.series_uid),
+                                series.files.len()
+                            );
+                            if ui.checkbox(&mut checked, header).changed() {
                                 if si < self.selected_series.len() { self.selected_series[si] = checked; }
                             }
                             ui.add_space(8.0);
@@ -657,39 +643,43 @@ impl eframe::App for AppState {
                                 ui.label(u);
                             }
                         }
-                        ui.indent(format!("files-{}", si), |ui| {
-                            for f in &series.files {
-                                ui.horizontal(|ui| {
-                                    // selection checkbox for metadata compare (visible only in selection mode)
-                                    let pstr = f.path.to_string_lossy().to_string();
-                                    if self.metadata_select_mode {
-                                        let mut sel = self.selected_files_for_meta.contains(&pstr);
-                                        if ui.checkbox(&mut sel, "").changed() {
-                                            if sel { self.selected_files_for_meta.insert(pstr.clone()); } else { self.selected_files_for_meta.remove(&pstr); }
-                                        }
-                                    } else {
-                                        ui.add_space(16.0);
-                                    }
-                                    if f.is_duplicate {
-                                        ui.colored_label(egui::Color32::LIGHT_RED, "DUP");
-                                    }
-                                    ui.label(f.path.file_name().and_then(|s| s.to_str()).unwrap_or("file"));
-                                    if ui.small_button("View meta").clicked() {
-                                        // launch standalone viewer for a single file
-                                        match std::env::current_exe() {
-                                            Ok(exe) => {
-                                                match Command::new(exe).arg("--meta-view").arg(pstr.clone()).spawn() {
-                                                    Ok(_) => { self.last_msg = format!("Opened metadata viewer for {}", f.path.display()); }
-                                                    Err(e) => { self.last_msg = format!("Failed to spawn viewer: {}", e); }
-                                                }
+                        // files are hidden by default inside a collapsing header to reduce UI noise
+                        egui::CollapsingHeader::new(format!("Files ({})", series.files.len()))
+                            .default_open(false)
+                            .id_source(format!("files-{}", si))
+                            .show(ui, |ui| {
+                                for f in &series.files {
+                                    ui.horizontal(|ui| {
+                                        // selection checkbox for metadata compare (visible only in selection mode)
+                                        let pstr = f.path.to_string_lossy().to_string();
+                                        if self.metadata_select_mode {
+                                            let mut sel = self.selected_files_for_meta.contains(&pstr);
+                                            if ui.checkbox(&mut sel, "").changed() {
+                                                if sel { self.selected_files_for_meta.insert(pstr.clone()); } else { self.selected_files_for_meta.remove(&pstr); }
                                             }
-                                            Err(e) => { self.last_msg = format!("Failed to locate executable: {}", e); }
+                                        } else {
+                                            ui.add_space(16.0);
                                         }
-                                    }
-                                    ui.label(format!("hash: {}", f.hash));
-                                });
-                            }
-                        });
+                                        if f.is_duplicate {
+                                            ui.colored_label(egui::Color32::LIGHT_RED, "DUP");
+                                        }
+                                        ui.label(f.path.file_name().and_then(|s| s.to_str()).unwrap_or("file"));
+                                        if ui.small_button("View meta").clicked() {
+                                            // launch standalone viewer for a single file
+                                            match std::env::current_exe() {
+                                                Ok(exe) => {
+                                                    match Command::new(exe).arg("--meta-view").arg(pstr.clone()).spawn() {
+                                                        Ok(_) => { self.last_msg = format!("Opened metadata viewer for {}", f.path.display()); }
+                                                        Err(e) => { self.last_msg = format!("Failed to spawn viewer: {}", e); }
+                                                    }
+                                                }
+                                                Err(e) => { self.last_msg = format!("Failed to locate executable: {}", e); }
+                                            }
+                                        }
+                                        ui.label(format!("hash: {}", f.hash));
+                                    });
+                                }
+                            });
                         ui.separator();
                     }
                 });
@@ -1023,11 +1013,7 @@ fn main() {
                                     let _ = tx2.send("PROC:STEP:Refreshing ready-to-upload".to_string());
                                     match scan_for_upload(&anon_dir2) {
                                         Ok(series) => {
-                                            let list: Vec<(String, Vec<(String,String,bool)>, Vec<String>)> = series.into_iter().map(|s| {
-                                                let files = s.files.into_iter().map(|f| (f.path.to_string_lossy().to_string(), f.hash, f.is_duplicate)).collect();
-                                                (s.series_uid, files, s.duplicate_series_urls)
-                                            }).collect();
-                                            if let Ok(json) = serde_json::to_string(&list) {
+                                            if let Ok(json) = serde_json::to_string(&series) {
                                                 let _ = std::fs::write(".last_scan.json", json);
                                                 let _ = tx2.send("scan_written".to_string());
                                             }

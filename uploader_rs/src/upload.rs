@@ -7,20 +7,31 @@ use std::collections::{HashMap, HashSet};
 use dicom_object::open_file;
 use dicom_object::Tag;
 use std::time::{SystemTime, UNIX_EPOCH};
+use serde::{Serialize, Deserialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
     pub path: PathBuf,
     pub hash: String,
     pub is_duplicate: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeriesInfo {
     pub series_uid: String,
     pub files: Vec<FileEntry>,
     pub duplicate_series_urls: Vec<String>,
+    // common metadata to present in the GUI
+    pub patient_name: Option<String>,
+    pub patient_id: Option<String>,
+    pub study_date: Option<String>,
+    pub modality: Option<String>,
+    pub series_description: Option<String>,
+    pub series_number: Option<String>,
+    pub file_count: usize,
+    pub total_bytes: u64,
 }
+
 
 pub struct UploadResult {
     pub uploaded: Vec<(String, String)>,
@@ -540,19 +551,54 @@ pub fn scan_for_upload(anon_dir: &Path) -> Result<Vec<SeriesInfo>, String> {
         }
     }
 
-    // build SeriesInfo
+    // build SeriesInfo with common metadata
     let mut out: Vec<SeriesInfo> = Vec::new();
     for (series_uid, items) in series_map.into_iter() {
         let mut entries: Vec<FileEntry> = Vec::new();
         let mut urls: Vec<String> = Vec::new();
-        for (p, h) in items {
-            let is_dup = duplicate_hashes.contains(&h);
-            if let Some(u) = duplicate_series_urls.get(&h) {
+        let mut total_bytes: u64 = 0;
+        for (p, h) in &items {
+            let is_dup = duplicate_hashes.contains(h);
+            if let Some(u) = duplicate_series_urls.get(h) {
                 for s in u { urls.push(s.clone()); }
             }
-            entries.push(FileEntry { path: p, hash: h, is_duplicate: is_dup });
+            if let Ok(md) = std::fs::metadata(p) {
+                total_bytes = total_bytes.saturating_add(md.len());
+            }
+            entries.push(FileEntry { path: p.clone(), hash: h.clone(), is_duplicate: is_dup });
         }
-        out.push(SeriesInfo { series_uid, files: entries, duplicate_series_urls: urls });
+
+        // pick first file to extract study/series metadata
+        let mut patient_name = None;
+        let mut patient_id = None;
+        let mut study_date = None;
+        let mut modality = None;
+        let mut series_description = None;
+        let mut series_number = None;
+        if let Some((first_path, _)) = items.get(0) {
+            if let Ok(obj) = open_file(first_path) {
+                patient_name = obj.element(Tag(0x0010,0x0010)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
+                patient_id = obj.element(Tag(0x0010,0x0020)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
+                study_date = obj.element(Tag(0x0008,0x0020)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
+                modality = obj.element(Tag(0x0008,0x0060)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
+                series_description = obj.element(Tag(0x0008,0x103E)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
+                series_number = obj.element(Tag(0x0020,0x0011)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
+            }
+        }
+
+        out.push(SeriesInfo {
+            series_uid,
+            files: entries,
+            duplicate_series_urls: urls,
+            patient_name,
+            patient_id,
+            study_date,
+            modality,
+            series_description,
+            series_number,
+            file_count: items.len(),
+            total_bytes,
+        });
     }
 
     Ok(out)
