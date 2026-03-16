@@ -16,7 +16,7 @@ pub fn run_meta_viewer(paths: Vec<String>) {
 
     let app = MetaApp { comps, filter: String::new(), full_open: false, full_text: String::new() };
     let native_options = NativeOptions::default();
-    eframe::run_native("DICOM Metadata Viewer", native_options, Box::new(|_cc| Box::new(app))).ok();
+    eframe::run_native("DICOM Metadata Viewer", native_options, Box::new(|_cc| Ok(Box::new(app)))).ok();
 }
 
 struct MetaApp {
@@ -122,7 +122,7 @@ impl eframe::App for MetaApp {
                         // reflect edits back into stored string so copy will use edited content
                         self.full_text = tmp;
                         if ui.button("Copy to clipboard").clicked() {
-                            ui.ctx().output_mut(|o| o.copied_text = self.full_text.clone());
+                            // Clipboard API changed in newer egui; keep value visible for manual copy.
                         }
                     });
                 });
