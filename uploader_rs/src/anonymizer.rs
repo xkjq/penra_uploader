@@ -1,7 +1,7 @@
 use dicom_object::{open_file, FileDicomObject, Tag};
 use blake3;
 use chrono::{NaiveDate, Duration};
-use dicom_core::header::VR;
+use dicom_core::header::{VR, Header};
 use num_bigint::BigUint;
 use std::path::{Path, PathBuf};
 use std::fs;
@@ -109,6 +109,55 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
             let _ = obj.put_str(Tag(0x0008,0x0018), VR::UI, &uid);
         }
     }
+
+    // Strip private tags (any element whose group number is odd)
+    // and recurse into Sequence (SQ) elements to anonymize nested items.
+    fn process_dataset<D: dicom_object::DataSetMut>(ds: &mut D, study_uid: &str, seed: Option<&str>) {
+        use dicom_core::value::Value;
+        use dicom_object::mem::InMemDicomObject;
+
+        // collect odd-group private tags to remove after iteration
+        let mut to_remove: Vec<Tag> = Vec::new();
+        // collect sequence tags to walk
+        let mut seq_tags: Vec<Tag> = Vec::new();
+
+        for el in ds.iter() {
+            let t = el.tag();
+            let group = t.0;
+            if (group & 1) == 1 {
+                to_remove.push(t);
+                continue;
+            }
+            if el.vr() == VR::SQ {
+                seq_tags.push(t);
+            }
+        }
+
+        // remove private tags
+        for t in to_remove {
+            let _ = ds.remove_element(t);
+        }
+
+        // walk sequences and recurse into each item
+        for t in seq_tags {
+            if let Ok(el) = ds.element(t) {
+                if let Value::Sequence { items, .. } = el.value() {
+                    // items is a slice of InMemDicomObject values; clone and recreate
+                    let mut new_items: Vec<InMemDicomObject> = Vec::new();
+                    for item in items.iter() {
+                        // create a mutable copy to modify
+                        let mut item_obj = item.to_owned();
+                        process_dataset(&mut item_obj, study_uid, seed);
+                        new_items.push(item_obj);
+                    }
+                    // write back the sequence with anonymized items
+                    let _ = ds.put_value(t, VR::SQ, Value::Sequence { items: new_items, size: dicom_core::value::Len::Undefined });
+                }
+            }
+        }
+    }
+
+    process_dataset(&mut obj, &study_uid, seed);
 
     // Shift date fields (basic set)
     let date_tags = vec![Tag(0x0008,0x0020), Tag(0x0008,0x0021), Tag(0x0008,0x0022), Tag(0x0008,0x0023), Tag(0x0010,0x0030)];
