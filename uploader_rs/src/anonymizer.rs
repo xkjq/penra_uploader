@@ -106,7 +106,6 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
         Tag(0x0018,0x1030), // ProtocolName
         Tag(0x0020,0x4000), // ImageComments
         Tag(0x0040,0x0275), // RequestAttributesSequence
-        Tag(0x0040,0xA730), // Content Sequence (SR)
     ];
 
     // sensible defaults for certain tags (replace rather than blank)
@@ -408,6 +407,17 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
                 }
             }
         }
+    }
+
+    // Special-case: scrub Structured Report Content Sequence `(0040,A730)` rather than removing it outright.
+    if let Ok(_) = obj.element(Tag(0x0040,0xA730)) {
+        let _ = obj.update_value(Tag(0x0040,0xA730), |v| {
+            if let Some(items) = v.items_mut() {
+                for item in items.iter_mut() {
+                    process_inmem(item, &study_uid, seed, &clear_tags, &date_tags, &mut map, &text_vrs, &vr_whitelist);
+                }
+            }
+        });
     }
 
     process_file(&mut obj, &study_uid, seed, &clear_tags, &date_tags, &mut map, &text_vrs, &vr_whitelist);
