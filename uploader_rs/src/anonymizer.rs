@@ -5,6 +5,8 @@ use dicom_core::header::{VR, Header};
 use num_bigint::BigUint;
 use std::path::{Path, PathBuf};
 use std::fs;
+use std::fs::File;
+use std::collections::HashMap;
 
 fn hash_bytes(input: &str) -> [u8; 16] {
     let mut out = [0u8; 16];
@@ -51,6 +53,11 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
     let pid_hash = hash_bytes(&format!("{}:{}:{}:id", seed.unwrap_or(""), study_uid, pat_name));
     let pid = format!("ID-{}", &hex::encode(&pid_hash)[..12]);
 
+    // prepare mapping audit
+    let mut map: HashMap<String, String> = HashMap::new();
+    map.insert(format!("PatientName:{}", pat_name), pn.clone());
+    map.insert(format!("PatientID:{}", pid), pid.clone());
+
     // time shift
     let shift_days = shift_date_by_study(&study_uid, seed);
 
@@ -84,23 +91,29 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
     // Remap UIDs: StudyInstanceUID (0020,000D), SeriesInstanceUID (0020,000E), SOPInstanceUID (0008,0018)
     if let Ok(e) = obj.element(Tag(0x0020,0x000D)) {
         if let Ok(s) = e.to_str() {
-            let h = blake3::hash(s.as_bytes());
+            let orig = s.to_string();
+            let h = blake3::hash(orig.as_bytes());
             let uid = uid_from_hash_bytes(&h.as_bytes()[..16]);
             let _ = obj.put_str(Tag(0x0020,0x000D), VR::UI, &uid);
+            map.insert(format!("UID:{}", orig), uid.clone());
         }
     }
     if let Ok(e) = obj.element(Tag(0x0020,0x000E)) {
         if let Ok(s) = e.to_str() {
-            let h = blake3::hash(s.as_bytes());
+            let orig = s.to_string();
+            let h = blake3::hash(orig.as_bytes());
             let uid = uid_from_hash_bytes(&h.as_bytes()[..16]);
             let _ = obj.put_str(Tag(0x0020,0x000E), VR::UI, &uid);
+            map.insert(format!("UID:{}", orig), uid.clone());
         }
     }
     if let Ok(e) = obj.element(Tag(0x0008,0x0018)) {
         if let Ok(s) = e.to_str() {
-            let h = blake3::hash(s.as_bytes());
+            let orig = s.to_string();
+            let h = blake3::hash(orig.as_bytes());
             let uid = uid_from_hash_bytes(&h.as_bytes()[..16]);
             let _ = obj.put_str(Tag(0x0008,0x0018), VR::UI, &uid);
+            map.insert(format!("UID:{}", orig), uid.clone());
         }
     }
 
@@ -109,7 +122,7 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
 
     use dicom_object::InMemDicomObject;
 
-    fn process_inmem<D: dicom_core::DataDictionary + Clone>(ds: &mut InMemDicomObject<D>, study_uid: &str, seed: Option<&str>, clear_tags: &Vec<Tag>, date_tags: &Vec<Tag>) {
+    fn process_inmem<D: dicom_core::DataDictionary + Clone>(ds: &mut InMemDicomObject<D>, study_uid: &str, seed: Option<&str>, clear_tags: &Vec<Tag>, date_tags: &Vec<Tag>, map: &mut HashMap<String,String>) {
         use dicom_core::value::Value;
 
         let mut to_remove: Vec<Tag> = Vec::new();
@@ -131,6 +144,7 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
                 if let Ok(s) = el.to_str() {
                     let hb = hash_bytes(s.as_ref());
                     let new_uid = uid_from_hash_bytes(&hb);
+                    map.insert(format!("UID:{}", s), new_uid.clone());
                     puts.push((t, VR::UI, new_uid));
                     continue;
                 }
@@ -166,16 +180,15 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
             let _ = ds.update_value(t, |v| {
                 if let Some(items) = v.items_mut() {
                     for item in items.iter_mut() {
-                        process_inmem(item, study_uid, seed, clear_tags, date_tags);
+                        process_inmem(item, study_uid, seed, clear_tags, date_tags, map);
                     }
                 }
             });
         }
     }
 
-    fn process_file<D: dicom_core::DataDictionary + Clone>(ds: &mut dicom_object::FileDicomObject<dicom_object::InMemDicomObject<D>>, study_uid: &str, seed: Option<&str>, clear_tags: &Vec<Tag>, date_tags: &Vec<Tag>) {
+    fn process_file<D: dicom_core::DataDictionary + Clone>(ds: &mut dicom_object::FileDicomObject<dicom_object::InMemDicomObject<D>>, study_uid: &str, seed: Option<&str>, clear_tags: &Vec<Tag>, date_tags: &Vec<Tag>, map: &mut HashMap<String,String>) {
         use dicom_core::value::Value;
-
         let mut to_remove: Vec<Tag> = Vec::new();
         let mut seq_tags: Vec<Tag> = Vec::new();
         let mut puts: Vec<(Tag, VR, String)> = Vec::new();
@@ -195,6 +208,7 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
                 if let Ok(s) = el.to_str() {
                     let hb = hash_bytes(s.as_ref());
                     let new_uid = uid_from_hash_bytes(&hb);
+                    map.insert(format!("UID:{}", s), new_uid.clone());
                     puts.push((t, VR::UI, new_uid));
                     continue;
                 }
@@ -229,7 +243,7 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
             let _ = ds.update_value(t, |v| {
                 if let Some(items) = v.items_mut() {
                     for item in items.iter_mut() {
-                        process_inmem(item, study_uid, seed, clear_tags, date_tags);
+                        process_inmem(item, study_uid, seed, clear_tags, date_tags, map);
                     }
                 }
             });
@@ -255,7 +269,7 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
         }
     }
 
-    process_file(&mut obj, &study_uid, seed, &clear_tags, &date_tags);
+    process_file(&mut obj, &study_uid, seed, &clear_tags, &date_tags, &mut map);
 
     // Shift date fields (basic set)
     let date_tags = vec![Tag(0x0008,0x0020), Tag(0x0008,0x0021), Tag(0x0008,0x0022), Tag(0x0008,0x0023), Tag(0x0010,0x0030)];
@@ -281,6 +295,19 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
     let out_path = output_dir.join(fname);
 
     obj.write_to_file(&out_path).map_err(|e| format!("write failed: {}", e))?;
+
+    // write mapping audit next to output file
+    let fname = fname.to_string_lossy();
+    let map_fname = format!("{}.anon_map.json", fname);
+    let map_path = output_dir.join(map_fname);
+    match File::create(&map_path) {
+        Ok(f) => {
+            if let Err(e) = serde_json::to_writer_pretty(f, &map) {
+                eprintln!("Failed to write anon map: {}", e);
+            }
+        }
+        Err(e) => eprintln!("Failed to create anon map file: {}", e),
+    }
 
     if remove_original {
         let _ = fs::remove_file(input);
