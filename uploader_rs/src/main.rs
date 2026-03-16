@@ -31,6 +31,7 @@ struct AppState {
     recurse_depth: i32,
     ext_filter: String,
     notify_on_process: bool,
+    login_open: bool,
     ready_series: Vec<SeriesInfo>,
     selected_series: Vec<bool>,
     base_url_mode: i32,
@@ -81,7 +82,63 @@ impl Default for AppState {
             selected_files_for_meta: HashSet::new(),
             metadata_select_mode: false,
             log_window_open: false,
+            login_open: upload::token_username().is_none(),
         }
+    }
+}
+
+impl AppState {
+    fn spawn_login(&mut self, user: String, pass: String) {
+        let (tx, rx) = mpsc::channel::<String>();
+        self.rx = Some(rx);
+        thread::spawn(move || {
+            let base = upload::base_site_url();
+            let url = format!("{}{}", base, "/api/atlas/create_api_token");
+            let token_check = format!("{}{}", base, "/api/atlas/token_check");
+            let client = reqwest::blocking::Client::new();
+            let body = serde_json::json!({"username": user, "password": pass});
+            match client.post(&url).json(&body).send() {
+                Ok(r) => {
+                    if r.status().is_success() {
+                        if let Ok(v) = r.json::<serde_json::Value>() {
+                            if let Some(t) = v.get("token").and_then(|x| x.as_str()) {
+                                if upload::save_api_token(t) {
+                                    let _ = tx.send("Login successful".to_string());
+                                    // validate token and fetch username
+                                    match client.post(&token_check).header("Authorization", format!("Bearer {}", t)).send() {
+                                        Ok(vc) => {
+                                            if vc.status().is_success() {
+                                                if let Ok(info) = vc.json::<serde_json::Value>() {
+                                                    if info.get("valid").and_then(|b| b.as_bool()).unwrap_or(false) {
+                                                        let uname = info.get("username").and_then(|s| s.as_str()).unwrap_or("API token");
+                                                        let _ = tx.send(format!("LOGIN_USER:{}", uname));
+                                                    } else {
+                                                        let _ = tx.send("Token invalid after login".to_string());
+                                                    }
+                                                }
+                                            } else {
+                                                let _ = tx.send(format!("Token check failed: HTTP {}", vc.status()));
+                                            }
+                                        }
+                                        Err(e) => { let _ = tx.send(format!("Token check request error: {}", e)); }
+                                    }
+                                } else {
+                                    let _ = tx.send("Login received token but failed to save".to_string());
+                                }
+                            } else {
+                                let _ = tx.send("Login response missing token".to_string());
+                            }
+                        } else {
+                            let _ = tx.send("Failed to parse login response".to_string());
+                        }
+                    } else {
+                        let _ = tx.send(format!("Login failed: HTTP {}", r.status()));
+                    }
+                }
+                Err(e) => { let _ = tx.send(format!("Login request error: {}", e)); }
+            }
+            let _ = tx.send("done".to_string());
+        });
     }
 }
 
@@ -93,74 +150,32 @@ impl eframe::App for AppState {
             
 
 
-            ui.collapsing("Login", |ui| {
+            egui::CollapsingHeader::new("Login").default_open(self.login_open).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Username:");
                     ui.text_edit_singleline(&mut self.username);
                 });
+                // password field: pressing Enter should submit
                 ui.horizontal(|ui| {
                     ui.label("Password:");
-                    ui.add(egui::widgets::TextEdit::singleline(&mut self.password).password(true));
+                    let pw_resp = ui.add(egui::widgets::TextEdit::singleline(&mut self.password).password(true));
+                    if pw_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        let user = self.username.clone();
+                        let pass = self.password.clone();
+                        self.spawn_login(user, pass);
+                    }
                 });
 
                 if ui.button("Login").clicked() {
                     let user = self.username.clone();
                     let pass = self.password.clone();
-                    let (tx, rx) = mpsc::channel::<String>();
-                    self.rx = Some(rx);
-                    thread::spawn(move || {
-                            let base = upload::base_site_url();
-                        let url = format!("{}{}", base, "/api/atlas/create_api_token");
-                        let token_check = format!("{}{}", base, "/api/atlas/token_check");
-                        let client = reqwest::blocking::Client::new();
-                        let body = serde_json::json!({"username": user, "password": pass});
-                        match client.post(&url).json(&body).send() {
-                            Ok(r) => {
-                                if r.status().is_success() {
-                                    if let Ok(v) = r.json::<serde_json::Value>() {
-                                        if let Some(t) = v.get("token").and_then(|x| x.as_str()) {
-                                            if upload::save_api_token(t) {
-                                                let _ = tx.send("Login successful".to_string());
-                                                // validate token and fetch username
-                                                match client.post(&token_check).header("Authorization", format!("Bearer {}", t)).send() {
-                                                    Ok(vc) => {
-                                                        if vc.status().is_success() {
-                                                            if let Ok(info) = vc.json::<serde_json::Value>() {
-                                                                if info.get("valid").and_then(|b| b.as_bool()).unwrap_or(false) {
-                                                                    let uname = info.get("username").and_then(|s| s.as_str()).unwrap_or("API token");
-                                                                    let _ = tx.send(format!("LOGIN_USER:{}", uname));
-                                                                } else {
-                                                                    let _ = tx.send("Token invalid after login".to_string());
-                                                                }
-                                                            }
-                                                        } else {
-                                                            let _ = tx.send(format!("Token check failed: HTTP {}", vc.status()));
-                                                        }
-                                                    }
-                                                    Err(e) => { let _ = tx.send(format!("Token check request error: {}", e)); }
-                                                }
-                                            } else {
-                                                let _ = tx.send("Login received token but failed to save".to_string());
-                                            }
-                                        } else {
-                                            let _ = tx.send("Login response missing token".to_string());
-                                        }
-                                    } else {
-                                        let _ = tx.send("Failed to parse login response".to_string());
-                                    }
-                                } else {
-                                    let _ = tx.send(format!("Login failed: HTTP {}", r.status()));
-                                }
-                            }
-                            Err(e) => { let _ = tx.send(format!("Login request error: {}", e)); }
-                        }
-                        let _ = tx.send("done".to_string());
-                    });
+                    self.spawn_login(user, pass);
                 }
 
                 if ui.button("Logout").clicked() {
                     if upload::clear_api_token() {
                         self.logged_in_user = None;
+                        self.login_open = true;
                         self.last_msg = "Logged out".to_string();
                     } else {
                         self.last_msg = "Failed to clear token".to_string();
@@ -438,6 +453,7 @@ impl eframe::App for AppState {
                         } else if m.starts_with("LOGIN_USER:") {
                             if let Some(name) = m.strip_prefix("LOGIN_USER:") {
                                 self.logged_in_user = Some(name.to_string());
+                                self.login_open = false;
                                 self.last_msg = format!("Logged in as {}", name);
                             }
                         } else {
