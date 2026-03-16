@@ -90,48 +90,6 @@ impl eframe::App for AppState {
         CentralPanel::default().show(ctx, |ui| {
             ui.heading("Uploader (Rust) - skeleton");
 
-            ui.collapsing("Settings", |ui| {
-                ui.label("Server settings:");
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.base_url_mode, 0, "Production (https://www.penracourses.org.uk)");
-                    ui.radio_value(&mut self.base_url_mode, 1, "Development (http://localhost:8080)");
-                });
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.base_url_mode, 2, "Custom");
-                    ui.text_edit_singleline(&mut self.custom_base_url);
-                });
-                ui.checkbox(&mut self.skip_ssl, "Disable SSL verification (unsafe)");
-                if ui.button("Save Settings").clicked() {
-                    let url = match self.base_url_mode {
-                        0 => "https://www.penracourses.org.uk".to_string(),
-                        1 => "http://localhost:8080".to_string(),
-                        _ => self.custom_base_url.clone(),
-                    };
-                    let ok1 = upload::save_base_url(&url);
-                    let ok2 = upload::save_skip_ssl(self.skip_ssl);
-                    if ok1 && ok2 {
-                        self.last_msg = format!("Saved settings: {} (skip_ssl={})", url, self.skip_ssl);
-                    } else {
-                        self.last_msg = "Failed to save settings".to_string();
-                    }
-                }
-                ui.label(format!("Current base: {}", upload::base_site_url()));
-                ui.horizontal(|ui| {
-                    ui.label("Seed:");
-                    let mut s = self.seed.clone().unwrap_or_default();
-                    if ui.text_edit_singleline(&mut s).changed() {
-                        self.seed = if s.is_empty() { None } else { Some(s.clone()) };
-                    }
-                });
-                ui.horizontal(|ui| {
-                    if ui.small_button("Show Logs").clicked() { self.log_window_open = !self.log_window_open; }
-                    if ui.small_button("Refresh Logs").clicked() { self.last_msg = "Logs refreshed".to_string(); }
-                    if ui.small_button("Clear Logs").clicked() {
-                        let _ = std::fs::write(upload::log_file_path(), "");
-                        self.last_msg = "Cleared logs".to_string();
-                    }
-                });
-            });
             
 
 
@@ -449,32 +407,6 @@ impl eframe::App for AppState {
                 }
             });
             
-
-            if ui.button("Send 'loaded' message").clicked() {
-                // placeholder for NNG send
-                self.last_msg = "(placeholder) send 'loaded'".to_string();
-            }
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(format!("Export dir: {}", self.export_dir.display()));
-                if ui.small_button("Open").clicked() {
-                    // Open folder using the platform default command (explorer / open / xdg-open)
-                    let res = if cfg!(target_os = "windows") {
-                        let p = self.export_dir.to_string_lossy().to_string().replace('/', "\\");
-                        std::process::Command::new("explorer").arg(p).spawn()
-                    } else if cfg!(target_os = "macos") {
-                        std::process::Command::new("open").arg(self.export_dir.to_string_lossy().to_string()).spawn()
-                    } else {
-                        std::process::Command::new("xdg-open").arg(self.export_dir.to_string_lossy().to_string()).spawn()
-                    };
-                    match res {
-                        Ok(_) => self.last_msg = format!("Opened {}", self.export_dir.display()),
-                        Err(e) => self.last_msg = format!("Failed to open export dir: {}", e),
-                    }
-                }
-            });
-            ui.label(format!("Last: {}", self.last_msg));
             ui.separator();
             if let Some(rx) = &self.rx {
                 match rx.try_recv() {
@@ -696,6 +628,70 @@ impl eframe::App for AppState {
                     }
                 });
             });
+
+            ui.collapsing("Settings", |ui| {
+                ui.label("Server settings:");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.base_url_mode, 0, "Production (https://www.penracourses.org.uk)");
+                    ui.radio_value(&mut self.base_url_mode, 1, "Development (http://localhost:8080)");
+                });
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.base_url_mode, 2, "Custom");
+                    ui.text_edit_singleline(&mut self.custom_base_url);
+                });
+                ui.checkbox(&mut self.skip_ssl, "Disable SSL verification (unsafe)");
+                if ui.button("Save Settings").clicked() {
+                    let url = match self.base_url_mode {
+                        0 => "https://www.penracourses.org.uk".to_string(),
+                        1 => "http://localhost:8080".to_string(),
+                        _ => self.custom_base_url.clone(),
+                    };
+                    let ok1 = upload::save_base_url(&url);
+                    let ok2 = upload::save_skip_ssl(self.skip_ssl);
+                    if ok1 && ok2 {
+                        self.last_msg = format!("Saved settings: {} (skip_ssl={})", url, self.skip_ssl);
+                    } else {
+                        self.last_msg = "Failed to save settings".to_string();
+                    }
+                }
+                ui.label(format!("Current base: {}", upload::base_site_url()));
+                ui.horizontal(|ui| {
+                    ui.label("Seed:");
+                    let mut s = self.seed.clone().unwrap_or_default();
+                    if ui.text_edit_singleline(&mut s).changed() {
+                        self.seed = if s.is_empty() { None } else { Some(s.clone()) };
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.small_button("Show Logs").clicked() { self.log_window_open = !self.log_window_open; }
+                    if ui.small_button("Refresh Logs").clicked() { self.last_msg = "Logs refreshed".to_string(); }
+                    if ui.small_button("Clear Logs").clicked() {
+                        let _ = std::fs::write(upload::log_file_path(), "");
+                        self.last_msg = "Cleared logs".to_string();
+                    }
+                });
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(format!("Export dir: {}", self.export_dir.display()));
+                if ui.small_button("Open").clicked() {
+                    // Open folder using the platform default command (explorer / open / xdg-open)
+                    let res = if cfg!(target_os = "windows") {
+                        let p = self.export_dir.to_string_lossy().to_string().replace('/', "\\");
+                        std::process::Command::new("explorer").arg(p).spawn()
+                    } else if cfg!(target_os = "macos") {
+                        std::process::Command::new("open").arg(self.export_dir.to_string_lossy().to_string()).spawn()
+                    } else {
+                        std::process::Command::new("xdg-open").arg(self.export_dir.to_string_lossy().to_string()).spawn()
+                    };
+                    match res {
+                        Ok(_) => self.last_msg = format!("Opened {}", self.export_dir.display()),
+                        Err(e) => self.last_msg = format!("Failed to open export dir: {}", e),
+                    }
+                }
+            });
+            });
+
+            ui.label(format!("Last: {}", self.last_msg));
 
             // Metadata single-view window
             if self.metadata_window_open {
