@@ -19,12 +19,13 @@ jobs:
           toolchain: stable
           override: true
       - name: Build release (MSVC)
+        working-directory: uploader_rs
         run: cargo build --release
       - name: Upload MSVC artifact
         uses: actions/upload-artifact@v4
         with:
           name: uploader-windows-msvc
-          path: target\\release\\uploader_rs.exe
+          path: uploader_rs\\target\\release\\uploader_rs.exe
 
   build-gnu:
     name: Build (Windows GNU via Ubuntu + mingw)
@@ -46,8 +47,9 @@ jobs:
         run: |
           source $HOME/.cargo/env
           cargo build --release --target x86_64-pc-windows-gnu
+        working-directory: uploader_rs
       - name: Upload GNU artifact
         uses: actions/upload-artifact@v4
         with:
           name: uploader-windows-gnu
-          path: target/x86_64-pc-windows-gnu/release/uploader_rs.exe
+          path: uploader_rs/target/x86_64-pc-windows-gnu/release/uploader_rs.exe
