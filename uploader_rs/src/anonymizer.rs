@@ -63,7 +63,7 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
     let _ = obj.put_str(Tag(0x0010, 0x0020), VR::LO, &pid);
 
     // Clear common free-text and ID tags that dicognito typically removes
-    let mut clear_tags = vec![
+    let clear_tags = vec![
         Tag(0x0008,0x0080), // InstitutionName
         Tag(0x0008,0x0081), // InstitutionAddress
         Tag(0x0008,0x1030), // StudyDescription
@@ -71,21 +71,15 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
         Tag(0x0010,0x1040), // PatientAddress
         Tag(0x0010,0x4000), // PatientComments
         Tag(0x0008,0x0092), // Referring Physician Address Sequence (may be sequence)
+        Tag(0x0008,0x0090), // ReferringPhysicianName
+        Tag(0x0008,0x1050), // PerformingPhysicianName
+        Tag(0x0008,0x1070), // OperatorsName
+        Tag(0x0008,0x0050), // AccessionNumber
+        Tag(0x0020,0x0010), // StudyID
+        Tag(0x0018,0x1000), // DeviceSerialNumber
+        Tag(0x0010,0x1000), // OtherPatientIDs
+        Tag(0x0010,0x1002), // OtherPatientIDsSequence
     ];
-    // Physician and operator names
-    clear_tags.push(Tag(0x0008,0x0090)); // ReferringPhysicianName
-    clear_tags.push(Tag(0x0008,0x1050)); // PerformingPhysicianName
-    clear_tags.push(Tag(0x0008,0x1070)); // OperatorsName
-    // IDs and other patient identifiers
-    clear_tags.push(Tag(0x0008,0x0050)); // AccessionNumber
-    clear_tags.push(Tag(0x0020,0x0010)); // StudyID
-    clear_tags.push(Tag(0x0018,0x1000)); // DeviceSerialNumber
-    clear_tags.push(Tag(0x0010,0x1000)); // OtherPatientIDs
-    clear_tags.push(Tag(0x0010,0x1002)); // OtherPatientIDsSequence
-    for tag in clear_tags {
-        // write empty string with a reasonable VR; fall back to LO
-        let _ = obj.put_str(tag, VR::LO, "");
-    }
 
     // Remap UIDs: StudyInstanceUID (0020,000D), SeriesInstanceUID (0020,000E), SOPInstanceUID (0008,0018)
     if let Ok(e) = obj.element(Tag(0x0020,0x000D)) {
@@ -110,16 +104,17 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
         }
     }
 
-    // Strip private tags (any element whose group number is odd)
-    // and recurse into Sequence (SQ) elements to anonymize nested items.
-    fn process_dataset<D: dicom_object::DataSetMut>(ds: &mut D, study_uid: &str, seed: Option<&str>) {
-        use dicom_core::value::Value;
-        use dicom_object::mem::InMemDicomObject;
+    // Date tags to shift
+    let date_tags = vec![Tag(0x0008,0x0020), Tag(0x0008,0x0021), Tag(0x0008,0x0022), Tag(0x0008,0x0023), Tag(0x0010,0x0030)];
 
-        // collect odd-group private tags to remove after iteration
+    use dicom_object::InMemDicomObject;
+
+    fn process_inmem<D: dicom_core::DataDictionary + Clone>(ds: &mut InMemDicomObject<D>, study_uid: &str, seed: Option<&str>, clear_tags: &Vec<Tag>, date_tags: &Vec<Tag>) {
+        use dicom_core::value::Value;
+
         let mut to_remove: Vec<Tag> = Vec::new();
-        // collect sequence tags to walk
         let mut seq_tags: Vec<Tag> = Vec::new();
+        let mut puts: Vec<(Tag, VR, String)> = Vec::new();
 
         for el in ds.iter() {
             let t = el.tag();
@@ -128,36 +123,139 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
                 to_remove.push(t);
                 continue;
             }
+            if clear_tags.contains(&t) {
+                puts.push((t, VR::LO, "".to_string()));
+                continue;
+            }
+            if el.vr() == VR::UI {
+                if let Ok(s) = el.to_str() {
+                    let hb = hash_bytes(s.as_ref());
+                    let new_uid = uid_from_hash_bytes(&hb);
+                    puts.push((t, VR::UI, new_uid));
+                    continue;
+                }
+            }
+            if el.vr() == VR::DA || date_tags.contains(&t) {
+                if let Ok(s) = el.to_str() {
+                    if s.len() >= 8 {
+                        let date_part = &s[0..8];
+                        if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
+                            let shifted = dt + Duration::days(shift_date_by_study(study_uid, seed));
+                            let new = shifted.format("%Y%m%d").to_string();
+                            puts.push((t, VR::DA, new));
+                            continue;
+                        }
+                    }
+                }
+            }
             if el.vr() == VR::SQ {
                 seq_tags.push(t);
             }
         }
 
-        // remove private tags
         for t in to_remove {
             let _ = ds.remove_element(t);
         }
 
-        // walk sequences and recurse into each item
+        for (t, vr, val) in puts {
+            let _ = ds.put_str(t, vr, &val);
+        }
+
+        // For each sequence, update its items in-place and recurse
         for t in seq_tags {
-            if let Ok(el) = ds.element(t) {
-                if let Value::Sequence { items, .. } = el.value() {
-                    // items is a slice of InMemDicomObject values; clone and recreate
-                    let mut new_items: Vec<InMemDicomObject> = Vec::new();
-                    for item in items.iter() {
-                        // create a mutable copy to modify
-                        let mut item_obj = item.to_owned();
-                        process_dataset(&mut item_obj, study_uid, seed);
-                        new_items.push(item_obj);
+            let _ = ds.update_value(t, |v| {
+                if let Some(items) = v.items_mut() {
+                    for item in items.iter_mut() {
+                        process_inmem(item, study_uid, seed, clear_tags, date_tags);
                     }
-                    // write back the sequence with anonymized items
-                    let _ = ds.put_value(t, VR::SQ, Value::Sequence { items: new_items, size: dicom_core::value::Len::Undefined });
+                }
+            });
+        }
+    }
+
+    fn process_file<D: dicom_core::DataDictionary + Clone>(ds: &mut dicom_object::FileDicomObject<dicom_object::InMemDicomObject<D>>, study_uid: &str, seed: Option<&str>, clear_tags: &Vec<Tag>, date_tags: &Vec<Tag>) {
+        use dicom_core::value::Value;
+
+        let mut to_remove: Vec<Tag> = Vec::new();
+        let mut seq_tags: Vec<Tag> = Vec::new();
+        let mut puts: Vec<(Tag, VR, String)> = Vec::new();
+
+        for el in ds.iter() {
+            let t = el.tag();
+            let group = t.0;
+            if (group & 1) == 1 {
+                to_remove.push(t);
+                continue;
+            }
+            if clear_tags.contains(&t) {
+                puts.push((t, VR::LO, "".to_string()));
+                continue;
+            }
+            if el.vr() == VR::UI {
+                if let Ok(s) = el.to_str() {
+                    let hb = hash_bytes(s.as_ref());
+                    let new_uid = uid_from_hash_bytes(&hb);
+                    puts.push((t, VR::UI, new_uid));
+                    continue;
+                }
+            }
+            if el.vr() == VR::DA || date_tags.contains(&t) {
+                if let Ok(s) = el.to_str() {
+                    if s.len() >= 8 {
+                        let date_part = &s[0..8];
+                        if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
+                            let shifted = dt + Duration::days(shift_date_by_study(study_uid, seed));
+                            let new = shifted.format("%Y%m%d").to_string();
+                            puts.push((t, VR::DA, new));
+                            continue;
+                        }
+                    }
+                }
+            }
+            if el.vr() == VR::SQ {
+                seq_tags.push(t);
+            }
+        }
+
+        for t in to_remove {
+            let _ = ds.remove_element(t);
+        }
+
+        for (t, vr, val) in puts {
+            let _ = ds.put_str(t, vr, &val);
+        }
+
+        for t in seq_tags {
+            let _ = ds.update_value(t, |v| {
+                if let Some(items) = v.items_mut() {
+                    for item in items.iter_mut() {
+                        process_inmem(item, study_uid, seed, clear_tags, date_tags);
+                    }
+                }
+            });
+        }
+    }
+
+    // Apply top-level clearing and remapping first
+    for tag in &clear_tags {
+        let _ = obj.put_str(*tag, VR::LO, "");
+    }
+    for tag in &date_tags {
+        if let Ok(elem) = obj.element(*tag) {
+            if let Ok(s) = elem.to_str() {
+                if s.len() >= 8 {
+                    let date_part = &s[0..8];
+                    if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
+                        let shifted = dt + Duration::days(shift_days);
+                        let new = shifted.format("%Y%m%d").to_string();
+                        let _ = obj.put_str(*tag, VR::DA, &new);
+                    }
                 }
             }
         }
     }
 
-    process_dataset(&mut obj, &study_uid, seed);
+    process_file(&mut obj, &study_uid, seed, &clear_tags, &date_tags);
 
     // Shift date fields (basic set)
     let date_tags = vec![Tag(0x0008,0x0020), Tag(0x0008,0x0021), Tag(0x0008,0x0022), Tag(0x0008,0x0023), Tag(0x0010,0x0030)];
