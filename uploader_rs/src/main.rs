@@ -702,7 +702,7 @@ impl eframe::App for AppState {
                                     });
                                 }
                             });
-                        // Add a "View series" button to launch dicom-view with the series files
+                        // Add a "View series" button to launch diviz-rs with the series files
                         if ui.small_button("View series").clicked() {
                             // collect file paths for this series
                             let mut paths: Vec<String> = Vec::new();
@@ -718,15 +718,15 @@ impl eframe::App for AppState {
                                 };
 
                                 // first try by name (in PATH)
-                                match try_spawn("dicom-view", &paths) {
-                                    Ok(_) => { self.last_msg = "Launched dicom-view".to_string(); }
+                                match try_spawn("diviz-rs", &paths) {
+                                    Ok(_) => { self.last_msg = "Launched diviz-rs".to_string(); }
                                     Err(_) => {
                                         // Attempt to locate a workspace-built binary by walking up ancestor directories
                                         let mut candidates: Vec<std::path::PathBuf> = Vec::new();
                                         // helper to push debug/release targets for a root path
                                         let mut push_targets = |root: &std::path::Path| {
-                                            candidates.push(root.join("dicom-view/target/debug/dicom-view"));
-                                            candidates.push(root.join("dicom-view/target/release/dicom-view"));
+                                            candidates.push(root.join("dicom-view/target/debug/diviz-rs"));
+                                            candidates.push(root.join("dicom-view/target/release/diviz-rs"));
                                         };
 
                                         if let Ok(cwd) = std::env::current_dir() {
@@ -777,9 +777,9 @@ impl eframe::App for AppState {
                                         }
 
                                         if launched {
-                                            self.last_msg = "Launched dicom-view (fallback)".to_string();
+                                            self.last_msg = "Launched diviz-rs (fallback)".to_string();
                                         } else {
-                                            self.last_msg = "Failed to launch dicom-view; ensure it is built or in PATH".to_string();
+                                            self.last_msg = "Failed to launch diviz-rs; ensure it is built or in PATH".to_string();
                                         }
                                     }
                                 }

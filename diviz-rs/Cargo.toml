@@ -16,5 +16,5 @@ name = "diviz-rs"
 path = "src/main.rs"
 
 [lib]
-name = "dicom_view_app"
+name = "diviz_rs_app"
 path = "src/lib.rs"

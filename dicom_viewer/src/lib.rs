@@ -82,6 +82,59 @@ pub fn read_metadata_in_depth(path: &Path) -> Result<HashMap<String, String>, St
     read_metadata_with_mode(path, MetadataReadMode::InDepth)
 }
 
+/// Recursively extract metadata including nested elements within sequences.
+/// Keys are formatted as "GGGG,EEEE" at top level, and "parent_key[index]/GGGG,EEEE" for nested items.
+fn extract_deep_metadata(
+    obj: &dicom_object::InMemDicomObject,
+    prefix: &str,
+    out: &mut HashMap<String, String>,
+) -> Result<(), String> {
+    for elem in obj.iter() {
+        let tag = elem.tag();
+        let key = if prefix.is_empty() {
+            format!("{:04X},{:04X}", tag.group(), tag.element())
+        } else {
+            format!("{}/{:04X},{:04X}", prefix, tag.group(), tag.element())
+        };
+
+        // Handle sequences specially by attempting to extract nested items
+        if elem.vr() == VR::SQ {
+            out.insert(key.clone(), "<SQ sequence>".to_string());
+            
+            // Try to access sequence items
+            if let Some(items) = elem.items() {
+                for (item_idx, item) in items.iter().enumerate() {
+                    let item_prefix = format!("{}[{}]", key, item_idx);
+                    extract_deep_metadata(item, &item_prefix, out)?;
+                }
+            }
+        } else {
+            // Non-sequence: extract value
+            let value = if let Ok(s) = elem.to_str() {
+                s.to_string()
+            } else if let Ok(bytes) = elem.to_bytes() {
+                let preview_len = bytes.len().min(16);
+                let mut preview = String::new();
+                for (i, b) in bytes.iter().take(preview_len).enumerate() {
+                    if i > 0 {
+                        preview.push(' ');
+                    }
+                    preview.push_str(&format!("{:02X}", b));
+                }
+                if bytes.len() > preview_len {
+                    preview.push_str(" ...");
+                }
+                format!("<{:?} binary: {} bytes [{}]>", elem.vr(), bytes.len(), preview)
+            } else {
+                format!("<{:?} non-text>", elem.vr())
+            };
+
+            out.insert(key, value);
+        }
+    }
+    Ok(())
+}
+
 /// Read metadata from the file using a selectable extraction mode.
 pub fn read_metadata_with_mode(path: &Path, mode: MetadataReadMode) -> Result<HashMap<String, String>, String> {
     let obj = open_file(path).map_err(|e| format!("open_file error: {}", e))?;
@@ -105,34 +158,9 @@ pub fn read_metadata_with_mode(path: &Path, mode: MetadataReadMode) -> Result<Ha
             }
         }
         MetadataReadMode::InDepth => {
-            // Iterate all available elements for maximum comparison coverage.
-            for elem in obj.iter() {
-                let tag = elem.tag();
-                let key = format!("{:04X},{:04X}", tag.group(), tag.element());
-
-                let value = if let Ok(s) = elem.to_str() {
-                    s.to_string()
-                } else if elem.vr() == VR::SQ {
-                    format!("<{:?} sequence>", elem.vr())
-                } else if let Ok(bytes) = elem.to_bytes() {
-                    let preview_len = bytes.len().min(16);
-                    let mut preview = String::new();
-                    for (i, b) in bytes.iter().take(preview_len).enumerate() {
-                        if i > 0 {
-                            preview.push(' ');
-                        }
-                        preview.push_str(&format!("{:02X}", b));
-                    }
-                    if bytes.len() > preview_len {
-                        preview.push_str(" ...");
-                    }
-                    format!("<{:?} binary: {} bytes [{}]>", elem.vr(), bytes.len(), preview)
-                } else {
-                    format!("<{:?} non-text>", elem.vr())
-                };
-
-                out.insert(key, value);
-            }
+            // Iterate all available elements for maximum comparison coverage,
+            // including nested elements within sequences.
+            extract_deep_metadata(&obj, "", &mut out)?;
         }
     }
 

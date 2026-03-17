@@ -7,7 +7,7 @@ use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry};
 use dicom_dictionary_std::StandardDataDictionary;
 
 pub fn run_meta_viewer(paths: Vec<String>) {
-    run_meta_viewer_with_mode(paths, MetadataReadMode::Simple);
+    run_meta_viewer_with_mode(paths, MetadataReadMode::InDepth);
 }
 
 pub fn run_meta_viewer_with_mode(paths: Vec<String>, mode: MetadataReadMode) {
@@ -110,25 +110,46 @@ pub fn truncate_string(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Format a tag key with human-readable name if possible.
-/// For hex format "GGGG,EEEE", looks up the tag in the DICOM dictionary.
-/// For friendly labels like "PatientName", leaves them as-is.
-fn get_formatted_tag_name(key: &str) -> String {
-    // Try to parse as hex format "GGGG,EEEE"
-    if let Some((group_str, elem_str)) = key.split_once(',') {
-        if let (Ok(g), Ok(e)) = (u16::from_str_radix(group_str, 16), u16::from_str_radix(elem_str, 16)) {
+/// Format a single tag segment with a human-readable name if possible.
+fn format_tag_segment(segment: &str) -> String {
+    let dict = StandardDataDictionary;
+    let (tag_text, suffix) = match segment.split_once('[') {
+        Some((tag_text, rest)) => (tag_text, format!("[{}", rest)),
+        None => (segment, String::new()),
+    };
+
+    if let Some((group_str, elem_str)) = tag_text.split_once(',') {
+        if let (Ok(g), Ok(e)) = (
+            u16::from_str_radix(group_str, 16),
+            u16::from_str_radix(elem_str, 16),
+        ) {
             let tag = Tag(g, e);
-            let dict = StandardDataDictionary;
             if let Some(entry) = dict.by_tag(tag) {
                 let alias = entry.alias();
                 if !alias.is_empty() {
-                    return format!("{} ({})", alias, key);
+                    return format!("{} ({}){}", alias, tag_text, suffix);
                 }
             }
         }
     }
-    // Return original key for friendly labels or if tag lookup failed
-    key.to_string()
+
+    segment.to_string()
+}
+
+/// Prepare a key label for the table.
+/// Nested tags are shown as an indented leaf node, with the full path retained for hover text.
+fn get_key_display(key: &str) -> (String, String) {
+    let segments: Vec<&str> = key.split('/').collect();
+    let depth = segments.len().saturating_sub(1);
+    let leaf = segments.last().copied().unwrap_or(key);
+    let leaf_display = format_tag_segment(leaf);
+    let full_display = segments
+        .iter()
+        .map(|segment| format_tag_segment(segment))
+        .collect::<Vec<_>>()
+        .join(" / ");
+
+    (format!("{}{}", "  ".repeat(depth), leaf_display), full_display)
 }
 
 /// App state that manages both file selection and comparison views
@@ -149,7 +170,7 @@ impl DivueApp {
     fn new() -> Self {
         Self {
             selected_files: Vec::new(),
-            read_mode: MetadataReadMode::Simple,
+            read_mode: MetadataReadMode::InDepth,
             show_comparison: false,
             comps: Vec::new(),
             filter: String::new(),
@@ -208,8 +229,8 @@ impl DivueApp {
             ui.label("Select DICOM files to compare:");
             ui.horizontal(|ui| {
                 ui.label("Compare mode:");
-                ui.selectable_value(&mut self.read_mode, MetadataReadMode::Simple, "Simple (default)");
-                ui.selectable_value(&mut self.read_mode, MetadataReadMode::InDepth, "In-depth (all tags)");
+                ui.selectable_value(&mut self.read_mode, MetadataReadMode::Simple, "Simple");
+                ui.selectable_value(&mut self.read_mode, MetadataReadMode::InDepth, "In-depth (default)");
             });
             match self.read_mode {
                 MetadataReadMode::Simple => {
@@ -393,7 +414,8 @@ impl DivueApp {
                     .spacing([8.0, 4.0])
                     .show(ui, |ui| {
                         for k in &keys {
-                            ui.label(get_formatted_tag_name(k));
+                            let (key_display, key_hover) = get_key_display(k);
+                            ui.label(key_display).on_hover_text(key_hover);
                             // collect values for this key
                             let mut vals: Vec<Option<String>> = Vec::new();
                             for (_name, map) in &self.comps {
@@ -478,7 +500,8 @@ impl eframe::App for MetaApp {
             egui::ScrollArea::vertical().max_height(900.0).show(ui, |ui| {
                 egui::Grid::new("meta_rows").num_columns(1 + self.comps.len()).spacing([8.0, 4.0]).show(ui, |ui| {
                     for k in &keys {
-                        ui.label(get_formatted_tag_name(k));
+                        let (key_display, key_hover) = get_key_display(k);
+                        ui.label(key_display).on_hover_text(key_hover);
                         // collect values for this key
                         let mut vals: Vec<Option<String>> = Vec::new();
                         for (_name, map) in &self.comps {

@@ -9,9 +9,9 @@ fn main() {
     let project_root = manifest_dir.parent().unwrap_or(&manifest_dir);
     let dicom_view_manifest = project_root.join("dicom-view/Cargo.toml");
 
-    let target_bin = project_root.join(format!("dicom-view/target/{}/dicom-view", profile));
+    let target_bin = project_root.join(format!("dicom-view/target/{}/diviz-rs", profile));
     if target_bin.exists() {
-        println!("cargo:warning=dicom-view binary already exists at {}", target_bin.display());
+        println!("cargo:warning=diviz-rs binary already exists at {}", target_bin.display());
         return;
     }
 
@@ -20,7 +20,7 @@ fn main() {
         return;
     }
 
-    println!("cargo:warning=Building dicom-view ({})...", profile);
+    println!("cargo:warning=Building diviz-rs ({})...", profile);
     let mut cmd = Command::new("cargo");
     cmd.arg("build");
     cmd.arg("--manifest-path");

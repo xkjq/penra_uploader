@@ -997,18 +997,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dicom-view"
-version = "0.1.0"
-dependencies = [
- "dicom-core",
- "dicom-object",
- "dicom-pixeldata",
- "eframe",
- "egui",
- "rfd",
-]
-
-[[package]]
 name = "dispatch"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1035,6 +1023,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "diviz-rs"
+version = "0.1.0"
+dependencies = [
+ "dicom-core",
+ "dicom-object",
+ "dicom-pixeldata",
+ "eframe",
+ "egui",
+ "rfd",
 ]
 
 [[package]]
