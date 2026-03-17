@@ -1,13 +1,21 @@
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use dicom_viewer::read_metadata_all;
+use dicom_viewer::{read_metadata_all, read_metadata_in_depth, MetadataReadMode};
 
 pub fn run_meta_viewer(paths: Vec<String>) {
+    run_meta_viewer_with_mode(paths, MetadataReadMode::Simple);
+}
+
+pub fn run_meta_viewer_with_mode(paths: Vec<String>, mode: MetadataReadMode) {
     // load metadata maps
     let mut comps: Vec<(String, HashMap<String, String>)> = Vec::new();
     for p in &paths {
-        match read_metadata_all(std::path::Path::new(p)) {
+        let result = match mode {
+            MetadataReadMode::Simple => read_metadata_all(std::path::Path::new(p)),
+            MetadataReadMode::InDepth => read_metadata_in_depth(std::path::Path::new(p)),
+        };
+        match result {
             Ok(map) => comps.push((p.clone(), map)),
             Err(e) => comps.push((p.clone(), {
                 let mut m = HashMap::new(); m.insert("error".to_string(), e); m
@@ -105,6 +113,7 @@ struct DivueApp {
     selected_files: Vec<PathBuf>,
     
     // Comparison state
+    read_mode: MetadataReadMode,
     show_comparison: bool,
     comps: Vec<(String, HashMap<String, String>)>,
     filter: String,
@@ -116,6 +125,7 @@ impl DivueApp {
     fn new() -> Self {
         Self {
             selected_files: Vec::new(),
+            read_mode: MetadataReadMode::Simple,
             show_comparison: false,
             comps: Vec::new(),
             filter: String::new(),
@@ -128,7 +138,11 @@ impl DivueApp {
         self.comps.clear();
         for selected_file in &self.selected_files {
             if let Some(path_str) = selected_file.to_str() {
-                match read_metadata_all(selected_file) {
+                let result = match self.read_mode {
+                    MetadataReadMode::Simple => read_metadata_all(selected_file),
+                    MetadataReadMode::InDepth => read_metadata_in_depth(selected_file),
+                };
+                match result {
                     Ok(map) => self.comps.push((path_str.to_string(), map)),
                     Err(e) => {
                         let mut m = HashMap::new();
@@ -168,6 +182,19 @@ impl DivueApp {
 
         ui.group(|ui| {
             ui.label("Select DICOM files to compare:");
+            ui.horizontal(|ui| {
+                ui.label("Compare mode:");
+                ui.selectable_value(&mut self.read_mode, MetadataReadMode::Simple, "Simple (default)");
+                ui.selectable_value(&mut self.read_mode, MetadataReadMode::InDepth, "In-depth (all tags)");
+            });
+            match self.read_mode {
+                MetadataReadMode::Simple => {
+                    ui.label("Simple mode: fast text-focused view of common metadata.");
+                }
+                MetadataReadMode::InDepth => {
+                    ui.label("In-depth mode: iterates all available tags; non-text values shown as VR-aware placeholders.");
+                }
+            }
             ui.separator();
 
             // Add files button
@@ -298,6 +325,11 @@ impl DivueApp {
 
         ui.separator();
         ui.heading("DICOM Metadata Compare");
+        let mode_label = match self.read_mode {
+            MetadataReadMode::Simple => "Simple",
+            MetadataReadMode::InDepth => "In-depth",
+        };
+        ui.label(format!("Mode: {}", mode_label));
 
         if self.comps.is_empty() {
             ui.label("No files loaded");

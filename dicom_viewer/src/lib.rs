@@ -1,7 +1,18 @@
 use dicom_object::open_file;
 use dicom_object::Tag;
+use dicom_core::header::Header;
+use dicom_core::VR;
 use std::path::Path;
 use std::collections::HashMap;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetadataReadMode {
+    /// Fast, text-focused extraction used by default in the UI.
+    Simple,
+    /// In-depth extraction that iterates all available tags and provides
+    /// fallback representations for non-text values.
+    InDepth,
+}
 
 /// Read a small selection of DICOM metadata fields from `path`.
 /// Returns a map of `label -> string` for display.
@@ -61,22 +72,68 @@ pub fn read_metadata(path: &Path) -> Result<HashMap<String, String>, String> {
 
 /// Read a richer set of metadata from the file. Returns a map of tag/key -> value.
 pub fn read_metadata_all(path: &Path) -> Result<HashMap<String, String>, String> {
+    read_metadata_with_mode(path, MetadataReadMode::Simple)
+}
+
+/// Read an in-depth set of metadata from the file.
+/// This mode iterates available tags and includes non-text fields using
+/// concise, diff-friendly placeholder representations.
+pub fn read_metadata_in_depth(path: &Path) -> Result<HashMap<String, String>, String> {
+    read_metadata_with_mode(path, MetadataReadMode::InDepth)
+}
+
+/// Read metadata from the file using a selectable extraction mode.
+pub fn read_metadata_with_mode(path: &Path, mode: MetadataReadMode) -> Result<HashMap<String, String>, String> {
     let obj = open_file(path).map_err(|e| format!("open_file error: {}", e))?;
     let mut out: HashMap<String, String> = HashMap::new();
 
-    // Best-effort extraction: probe common groups and element ranges.
-    let groups: &[u16] = &[0x0008, 0x0010, 0x0020, 0x0028, 0x0040, 0x7FE0];
-    for &g in groups {
-        for el in 0x0000u16..=0xFFFFu16 {
-            let tag = Tag(g, el);
-            if let Ok(elem) = obj.element(tag) {
-                if let Ok(s) = elem.to_str() {
-                    out.insert(format!("{:04X},{:04X}", g, el), s.to_string());
+    match mode {
+        MetadataReadMode::Simple => {
+            // Best-effort extraction: probe common groups and element ranges.
+            let groups: &[u16] = &[0x0008, 0x0010, 0x0020, 0x0028, 0x0040, 0x7FE0];
+            for &g in groups {
+                for el in 0x0000u16..=0xFFFFu16 {
+                    let tag = Tag(g, el);
+                    if let Ok(elem) = obj.element(tag) {
+                        if let Ok(s) = elem.to_str() {
+                            out.insert(format!("{:04X},{:04X}", g, el), s.to_string());
+                        }
+                    }
+                    if out.len() > 2000 { break; }
                 }
+                if out.len() > 2000 { break; }
             }
-            if out.len() > 2000 { break; }
         }
-        if out.len() > 2000 { break; }
+        MetadataReadMode::InDepth => {
+            // Iterate all available elements for maximum comparison coverage.
+            for elem in obj.iter() {
+                let tag = elem.tag();
+                let key = format!("{:04X},{:04X}", tag.group(), tag.element());
+
+                let value = if let Ok(s) = elem.to_str() {
+                    s.to_string()
+                } else if elem.vr() == VR::SQ {
+                    format!("<{:?} sequence>", elem.vr())
+                } else if let Ok(bytes) = elem.to_bytes() {
+                    let preview_len = bytes.len().min(16);
+                    let mut preview = String::new();
+                    for (i, b) in bytes.iter().take(preview_len).enumerate() {
+                        if i > 0 {
+                            preview.push(' ');
+                        }
+                        preview.push_str(&format!("{:02X}", b));
+                    }
+                    if bytes.len() > preview_len {
+                        preview.push_str(" ...");
+                    }
+                    format!("<{:?} binary: {} bytes [{}]>", elem.vr(), bytes.len(), preview)
+                } else {
+                    format!("<{:?} non-text>", elem.vr())
+                };
+
+                out.insert(key, value);
+            }
+        }
     }
 
     Ok(out)
