@@ -18,6 +18,16 @@ jobs:
         with:
           toolchain: stable
           override: true
+      - name: Build diviz-rs (MSVC)
+        working-directory: diviz-rs
+        env:
+          RUSTFLAGS: "-C link-args=/DEFAULTLIB:Advapi32.lib"
+        run: cargo build --release
+      - name: Upload diviz-rs MSVC artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: diviz-rs-windows-msvc
+          path: diviz-rs\\target\\release\\diviz-rs.exe
       - name: Build release (MSVC)
         working-directory: uploader_rs
         env:
@@ -43,6 +53,18 @@ jobs:
           curl https://sh.rustup.rs -sSf | sh -s -- -y
           source $HOME/.cargo/env
           rustup target add x86_64-pc-windows-gnu
+      - name: Build diviz-rs (GNU target)
+        env:
+          RUSTFLAGS: "-C linker=x86_64-w64-mingw32-gcc -C link-args=-ladvapi32"
+        run: |
+          source $HOME/.cargo/env
+          cargo build --release --target x86_64-pc-windows-gnu
+        working-directory: diviz-rs
+      - name: Upload diviz-rs GNU artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: diviz-rs-windows-gnu
+          path: diviz-rs/target/x86_64-pc-windows-gnu/release/diviz-rs.exe
       - name: Build release (x86_64-pc-windows-gnu)
         env:
           RUSTFLAGS: "-C linker=x86_64-w64-mingw32-gcc -C link-args=-ladvapi32"

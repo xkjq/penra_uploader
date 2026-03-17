@@ -116,56 +116,123 @@ pub fn truncate_string(s: &str, max_len: usize) -> String {
     }
 }
 
-fn strip_item_suffix(segment: &str) -> &str {
-    segment.split_once('[').map(|(tag_text, _)| tag_text).unwrap_or(segment)
+#[derive(Clone)]
+struct TreeRow {
+    row_id: String,
+    value_key: Option<String>,
 }
 
-fn strip_item_suffix_from_path(path: &str) -> String {
-    if let Some((prefix, segment)) = path.rsplit_once('/') {
-        format!("{}/{}", prefix, strip_item_suffix(segment))
+fn append_path(base: &str, segment: &str) -> String {
+    if base.is_empty() {
+        segment.to_string()
     } else {
-        strip_item_suffix(path).to_string()
+        format!("{}/{}", base, segment)
     }
 }
 
-fn ancestor_rows(key: &str) -> Vec<String> {
-    let segments: Vec<&str> = key.split('/').collect();
+fn row_ancestors(row_id: &str) -> Vec<String> {
+    let segments: Vec<&str> = row_id.split('/').collect();
     let mut ancestors = Vec::new();
-    let mut raw_path = String::new();
+    let mut path = String::new();
 
     for segment in segments.iter().take(segments.len().saturating_sub(1)) {
-        if !raw_path.is_empty() {
-            raw_path.push('/');
-        }
-        raw_path.push_str(segment);
-        ancestors.push(strip_item_suffix_from_path(&raw_path));
+        path = append_path(&path, segment);
+        ancestors.push(path.clone());
     }
 
     ancestors
 }
 
-fn key_has_children(key: &str, keys: &[String]) -> bool {
-    keys.iter()
-        .any(|candidate| candidate != key && ancestor_rows(candidate).iter().any(|ancestor| ancestor == key))
-}
+fn build_tree_rows(all_keys: &[String], keys_to_show: &[String]) -> Vec<TreeRow> {
+    let all_key_set: HashSet<&str> = all_keys.iter().map(String::as_str).collect();
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
 
-fn visible_keys(keys: &[String], expanded_keys: &HashSet<String>, filtered: bool) -> Vec<String> {
-    if filtered {
-        return keys.to_vec();
+    for key in keys_to_show {
+        let mut row_prefix = String::new();
+        let mut raw_prefix = String::new();
+
+        for raw_segment in key.split('/') {
+            if let Some((tag_text, rest)) = raw_segment.split_once('[') {
+                let tag_row_id = append_path(&row_prefix, tag_text);
+                let tag_raw_key = append_path(&raw_prefix, tag_text);
+                if seen.insert(tag_row_id.clone()) {
+                    rows.push(TreeRow {
+                        row_id: tag_row_id.clone(),
+                        value_key: all_key_set.contains(tag_raw_key.as_str()).then_some(tag_raw_key.clone()),
+                    });
+                }
+                row_prefix = tag_row_id;
+
+                let item_segment = format!("[{}", rest);
+                let item_row_id = append_path(&row_prefix, &item_segment);
+                if seen.insert(item_row_id.clone()) {
+                    rows.push(TreeRow {
+                        row_id: item_row_id.clone(),
+                        value_key: None,
+                    });
+                }
+                row_prefix = item_row_id;
+                raw_prefix = append_path(&raw_prefix, raw_segment);
+            } else {
+                let row_id = append_path(&row_prefix, raw_segment);
+                let raw_key = append_path(&raw_prefix, raw_segment);
+                if seen.insert(row_id.clone()) {
+                    rows.push(TreeRow {
+                        row_id: row_id.clone(),
+                        value_key: all_key_set.contains(raw_key.as_str()).then_some(raw_key.clone()),
+                    });
+                }
+                row_prefix = row_id;
+                raw_prefix = raw_key;
+            }
+        }
     }
 
-    keys.iter()
-        .filter(|key| {
-            ancestor_rows(key)
+    rows
+}
+
+fn effective_expanded_keys(
+    rows: &[TreeRow],
+    expanded_keys: &HashSet<String>,
+    filtered: bool,
+) -> HashSet<String> {
+    let mut effective = expanded_keys.clone();
+
+    if filtered {
+        for row in rows {
+            if row.value_key.is_some() {
+                for ancestor in row_ancestors(&row.row_id) {
+                    effective.insert(ancestor);
+                }
+            }
+        }
+    }
+
+    effective
+}
+
+fn visible_rows<'a>(rows: &'a [TreeRow], expanded_keys: &HashSet<String>) -> Vec<&'a TreeRow> {
+    rows.iter()
+        .filter(|row| {
+            row_ancestors(&row.row_id)
                 .iter()
                 .all(|ancestor| expanded_keys.contains(ancestor))
         })
-        .cloned()
         .collect()
+}
+
+fn row_has_children(row_id: &str, rows: &[TreeRow]) -> bool {
+    rows.iter()
+        .any(|row| row.row_id != row_id && row_ancestors(&row.row_id).iter().any(|ancestor| ancestor == row_id))
 }
 
 /// Format a single tag segment with a human-readable name if possible.
 fn format_tag_segment(segment: &str) -> String {
+    if segment.starts_with('[') {
+        return segment.to_string();
+    }
+
     let dict = StandardDataDictionary;
     let (tag_text, suffix) = match segment.split_once('[') {
         Some((tag_text, rest)) => (tag_text, format!("[{}", rest)),
@@ -192,10 +259,10 @@ fn format_tag_segment(segment: &str) -> String {
 
 /// Prepare a key label for the table.
 /// Nested tags are shown as an indented leaf node, with the full path retained for hover text.
-fn get_key_display(key: &str) -> (usize, String, String) {
-    let segments: Vec<&str> = key.split('/').collect();
+fn get_key_display(row_id: &str) -> (usize, String, String) {
+    let segments: Vec<&str> = row_id.split('/').collect();
     let depth = segments.len().saturating_sub(1);
-    let leaf = segments.last().copied().unwrap_or(key);
+    let leaf = segments.last().copied().unwrap_or(row_id);
     let leaf_display = format_tag_segment(leaf);
     let full_display = segments
         .iter()
@@ -208,24 +275,25 @@ fn get_key_display(key: &str) -> (usize, String, String) {
 
 fn render_key_cell(
     ui: &mut egui::Ui,
-    key: &str,
-    all_keys: &[String],
+    row_id: &str,
+    rows: &[TreeRow],
+    effective_expanded_keys: &HashSet<String>,
     expanded_keys: &mut HashSet<String>,
 ) {
-    let (depth, key_display, key_hover) = get_key_display(key);
-    let has_children = key_has_children(key, all_keys);
+    let (depth, key_display, key_hover) = get_key_display(row_id);
+    let has_children = row_has_children(row_id, rows);
 
     ui.horizontal(|ui| {
         ui.add_space((depth as f32) * 18.0);
 
         if has_children {
-            let is_expanded = expanded_keys.contains(key);
+            let is_expanded = effective_expanded_keys.contains(row_id);
             let icon = if is_expanded { "▼" } else { "▶" };
             if ui.small_button(icon).clicked() {
                 if is_expanded {
-                    expanded_keys.remove(key);
+                    expanded_keys.remove(row_id);
                 } else {
-                    expanded_keys.insert(key.to_string());
+                    expanded_keys.insert(row_id.to_string());
                 }
             }
         } else {
@@ -478,11 +546,13 @@ impl DivueApp {
         });
 
         // build union of keys preserving order
-        let mut keys = build_key_union(&self.comps);
-        keys = filter_keys(&keys, &self.comps, &self.filter);
-        keys.sort();
+    let mut all_keys = build_key_union(&self.comps);
+    all_keys.sort();
         let filtered = !self.filter.is_empty();
-        let visible = visible_keys(&keys, &self.expanded_keys, filtered);
+    let keys = filter_keys(&all_keys, &self.comps, &self.filter);
+    let rows = build_tree_rows(&all_keys, &keys);
+    let effective_expanded = effective_expanded_keys(&rows, &self.expanded_keys, filtered);
+    let visible = visible_rows(&rows, &effective_expanded);
 
         // header row
         egui::Grid::new("meta_header")
@@ -504,27 +574,30 @@ impl DivueApp {
                     .num_columns(1 + self.comps.len())
                     .spacing([8.0, 4.0])
                     .show(ui, |ui| {
-                        for k in &visible {
-                            render_key_cell(ui, k, &keys, &mut self.expanded_keys);
-                            // collect values for this key
-                            let mut vals: Vec<Option<String>> = Vec::new();
-                            for (_name, map) in &self.comps {
-                                vals.push(map.get(k).cloned());
-                            }
-                            // detect differences
-                            let same = values_are_same(k, &self.comps);
-                            for v in vals {
-                                let full = v.unwrap_or_default();
-                                let display = truncate_string(&full, 120);
-                                let mut btn = egui::Button::new(display.clone());
-                                if !same {
-                                    btn = btn.fill(egui::Color32::from_rgb(255, 243, 205));
+                        for row in &visible {
+                            render_key_cell(ui, &row.row_id, &rows, &effective_expanded, &mut self.expanded_keys);
+                            if let Some(value_key) = &row.value_key {
+                                let mut vals: Vec<Option<String>> = Vec::new();
+                                for (_name, map) in &self.comps {
+                                    vals.push(map.get(value_key).cloned());
                                 }
-                                let resp = ui.add(btn).on_hover_text(full.clone());
-                                if resp.clicked() {
-                                    // open full text window for selection/copy
-                                    self.full_text = full.clone();
-                                    self.full_open = true;
+                                let same = values_are_same(value_key, &self.comps);
+                                for v in vals {
+                                    let full = v.unwrap_or_default();
+                                    let display = truncate_string(&full, 120);
+                                    let mut btn = egui::Button::new(display.clone());
+                                    if !same {
+                                        btn = btn.fill(egui::Color32::from_rgb(255, 243, 205));
+                                    }
+                                    let resp = ui.add(btn).on_hover_text(full.clone());
+                                    if resp.clicked() {
+                                        self.full_text = full.clone();
+                                        self.full_open = true;
+                                    }
+                                }
+                            } else {
+                                for _ in &self.comps {
+                                    ui.label("");
                                 }
                             }
                             ui.end_row();
@@ -575,11 +648,13 @@ impl eframe::App for MetaApp {
             });
 
             // build union of keys preserving order
-            let mut keys = build_key_union(&self.comps);
-            keys = filter_keys(&keys, &self.comps, &self.filter);
-            keys.sort();
+            let mut all_keys = build_key_union(&self.comps);
+            all_keys.sort();
             let filtered = !self.filter.is_empty();
-            let visible = visible_keys(&keys, &self.expanded_keys, filtered);
+            let keys = filter_keys(&all_keys, &self.comps, &self.filter);
+            let rows = build_tree_rows(&all_keys, &keys);
+            let effective_expanded = effective_expanded_keys(&rows, &self.expanded_keys, filtered);
+            let visible = visible_rows(&rows, &effective_expanded);
 
             // header row
             egui::Grid::new("meta_header").num_columns(1 + self.comps.len()).spacing([8.0, 4.0]).show(ui, |ui| {
@@ -593,27 +668,30 @@ impl eframe::App for MetaApp {
 
             egui::ScrollArea::vertical().max_height(900.0).show(ui, |ui| {
                 egui::Grid::new("meta_rows").num_columns(1 + self.comps.len()).spacing([8.0, 4.0]).show(ui, |ui| {
-                    for k in &visible {
-                        render_key_cell(ui, k, &keys, &mut self.expanded_keys);
-                        // collect values for this key
-                        let mut vals: Vec<Option<String>> = Vec::new();
-                        for (_name, map) in &self.comps {
-                            vals.push(map.get(k).cloned());
-                        }
-                        // detect differences
-                        let same = values_are_same(k, &self.comps);
-                        for v in vals {
-                            let full = v.unwrap_or_default();
-                            let display = truncate_string(&full, 120);
-                            let mut btn = egui::Button::new(display.clone());
-                            if !same {
-                                btn = btn.fill(egui::Color32::from_rgb(255, 243, 205));
+                    for row in &visible {
+                        render_key_cell(ui, &row.row_id, &rows, &effective_expanded, &mut self.expanded_keys);
+                        if let Some(value_key) = &row.value_key {
+                            let mut vals: Vec<Option<String>> = Vec::new();
+                            for (_name, map) in &self.comps {
+                                vals.push(map.get(value_key).cloned());
                             }
-                            let resp = ui.add(btn).on_hover_text(full.clone());
-                            if resp.clicked() {
-                                // open full text window for selection/copy
-                                self.full_text = full.clone();
-                                self.full_open = true;
+                            let same = values_are_same(value_key, &self.comps);
+                            for v in vals {
+                                let full = v.unwrap_or_default();
+                                let display = truncate_string(&full, 120);
+                                let mut btn = egui::Button::new(display.clone());
+                                if !same {
+                                    btn = btn.fill(egui::Color32::from_rgb(255, 243, 205));
+                                }
+                                let resp = ui.add(btn).on_hover_text(full.clone());
+                                if resp.clicked() {
+                                    self.full_text = full.clone();
+                                    self.full_open = true;
+                                }
+                            }
+                        } else {
+                            for _ in &self.comps {
+                                ui.label("");
                             }
                         }
                         ui.end_row();
