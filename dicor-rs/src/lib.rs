@@ -354,6 +354,7 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, pr
         Tag(0x0010,0x0040), Tag(0x0010,0x1010), Tag(0x0010,0x1020), Tag(0x0010,0x1030),
         Tag(0x0010,0x1090), Tag(0x0010,0x2160), Tag(0x0010,0x2180), Tag(0x0010,0x21B0),
         Tag(0x0018,0x1030), Tag(0x0020,0x4000), Tag(0x0040,0x0275),
+        Tag(0x0040,0xA730),
     ];
 
     let defaults: Vec<(Tag, VR, String)> = vec![(Tag(0x0008,0x1010), VR::SH, "ANON".to_string())];
@@ -404,6 +405,19 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, pr
                 let _ = obj.put_str(*tag, vr, "");
             }
         }
+    }
+
+    // Remove any overlay groups (60xx) and all annotation/presentation state groups (0x0070)
+    // to ensure burned-in overlay/annotation features are removed by default.
+    let mut dyn_remove: Vec<Tag> = Vec::new();
+    for el in obj.iter() {
+        let t = el.tag();
+        if (t.0 >= 0x6000 && t.0 <= 0x60FF) || t.0 == 0x0070 {
+            dyn_remove.push(t);
+        }
+    }
+    for t in dyn_remove {
+        let _ = obj.remove_element(t);
     }
 
     for (tag, vr, val) in &defaults {

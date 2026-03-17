@@ -95,12 +95,17 @@ impl RawImage {
     }
 }
 
-struct DicomViewApp {
-    pending_load: Option<PathBuf>,
-    current_file: Option<PathBuf>,
-    raw_image: Option<RawImage>,
-    texture: Option<egui::TextureHandle>,
+/// One loaded DICOM image with its decoded pixels and metadata.
+struct LoadedImage {
+    raw_image: RawImage,
     metadata: Vec<(String, String)>,
+}
+
+struct DicomViewApp {
+    pending_load: Option<Vec<PathBuf>>,
+    images: Vec<LoadedImage>,
+    current_slice: usize,
+    texture: Option<egui::TextureHandle>,
     zoom: f32,
     pan: Vec2,
     error: Option<String>,
@@ -112,12 +117,12 @@ struct DicomViewApp {
 
 impl DicomViewApp {
     fn new(path: Option<PathBuf>) -> Self {
+        let pending_load = path.map(|p| vec![p]);
         Self {
-            pending_load: path,
-            current_file: None,
-            raw_image: None,
+            pending_load,
+            images: Vec::new(),
+            current_slice: 0,
             texture: None,
-            metadata: Vec::new(),
             zoom: 1.0,
             pan: Vec2::ZERO,
             error: None,
@@ -128,165 +133,171 @@ impl DicomViewApp {
         }
     }
 
-    fn load_file(&mut self, ctx: &egui::Context, path: PathBuf) {
+    fn load_files(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
         self.error = None;
-        self.metadata.clear();
+        self.images.clear();
         self.texture = None;
-        self.raw_image = None;
+        self.current_slice = 0;
         self.pan = Vec2::ZERO;
         self.zoom = 1.0;
         self.wl_dirty = false;
 
-        let obj = match open_file(&path) {
-            Ok(o) => o,
-            Err(e) => {
-                self.error = Some(format!("Failed to open file: {}", e));
-                return;
-            }
-        };
+        for path in paths {
+            let obj = match open_file(&path) {
+                Ok(o) => o,
+                Err(e) => {
+                    self.error = Some(format!("Failed to open {}: {}", path.display(), e));
+                    return;
+                }
+            };
 
-        // Collect display metadata (text tags)
-        for (tag, label) in METADATA_TAGS {
-            if let Ok(elem) = obj.element(*tag) {
-                if let Ok(val) = elem.to_str() {
-                    let val = val.trim().to_string();
-                    if !val.is_empty() {
-                        self.metadata.push((label.to_string(), val));
+            // Collect display metadata (text tags)
+            let mut metadata = Vec::new();
+            for (tag, label) in METADATA_TAGS {
+                if let Ok(elem) = obj.element(*tag) {
+                    if let Ok(val) = elem.to_str() {
+                        let val = val.trim().to_string();
+                        if !val.is_empty() {
+                            metadata.push((label.to_string(), val));
+                        }
                     }
                 }
             }
-        }
 
-        // Helper: read a tag as string then parse
-        let get_str = |tag: Tag| -> Option<String> {
-            obj.element(tag)
-                .ok()?
-                .to_str()
-                .ok()
-                .map(|s| s.trim().to_string())
-        };
-        let get_f32 = |tag: Tag| -> Option<f32> {
-            // Window Center/Width can be multi-valued (backslash-separated); take first
-            get_str(tag).and_then(|s| {
-                s.split('\\').next().and_then(|v| v.trim().parse::<f32>().ok())
-            })
-        };
+            // Helper: read a tag as string then parse
+            let get_str = |tag: Tag| -> Option<String> {
+                obj.element(tag)
+                    .ok()?
+                    .to_str()
+                    .ok()
+                    .map(|s| s.trim().to_string())
+            };
+            let get_f32 = |tag: Tag| -> Option<f32> {
+                // Window Center/Width can be multi-valued (backslash-separated); take first
+                get_str(tag).and_then(|s| {
+                    s.split('\\').next().and_then(|v| v.trim().parse::<f32>().ok())
+                })
+            };
 
-        let rescale_intercept = get_f32(Tag(0x0028, 0x1052)).unwrap_or(0.0);
-        let rescale_slope = get_f32(Tag(0x0028, 0x1053)).unwrap_or(1.0);
-        let wc_dicom = get_f32(Tag(0x0028, 0x1050));
-        let ww_dicom = get_f32(Tag(0x0028, 0x1051));
+            let rescale_intercept = get_f32(Tag(0x0028, 0x1052)).unwrap_or(0.0);
+            let rescale_slope = get_f32(Tag(0x0028, 0x1053)).unwrap_or(1.0);
+            let wc_dicom = get_f32(Tag(0x0028, 0x1050));
+            let ww_dicom = get_f32(Tag(0x0028, 0x1051));
 
-        // Decode pixel data — PixelDecoder handles all standard transfer syntaxes
-        // (uncompressed, JPEG, JPEG-LS, RLE, deflate) transparently.
-        let pixel_data = match obj.decode_pixel_data() {
-            Ok(pd) => pd,
-            Err(e) => {
-                self.error = Some(format!("Failed to decode pixel data: {}", e));
-                return;
-            }
-        };
-
-        let rows = pixel_data.rows() as usize;
-        let cols = pixel_data.columns() as usize;
-        let bits = pixel_data.bits_allocated();
-        let samples = pixel_data.samples_per_pixel();
-        let signed = matches!(
-            pixel_data.pixel_representation(),
-            dicom_pixeldata::PixelRepresentation::Signed
-        );
-        let bytes: &[u8] = pixel_data.data();
-
-        // Decode to RawImage based on bit depth and sample count
-        let raw_image = match (bits, samples) {
-            (8, 1) => {
-                if bytes.len() < rows * cols {
-                    self.error = Some("Pixel data buffer is too short".to_string());
+            // Decode pixel data — PixelDecoder handles all standard transfer syntaxes
+            // (uncompressed, JPEG, JPEG-LS, RLE, deflate) transparently.
+            let pixel_data = match obj.decode_pixel_data() {
+                Ok(pd) => pd,
+                Err(e) => {
+                    self.error = Some(format!("Failed to decode pixel data in {}: {}", path.display(), e));
                     return;
                 }
-                RawImage::Gray8 {
-                    data: bytes[..rows * cols].to_vec(),
-                    width: cols,
-                    height: rows,
+            };
+
+            let rows = pixel_data.rows() as usize;
+            let cols = pixel_data.columns() as usize;
+            let bits = pixel_data.bits_allocated();
+            let samples = pixel_data.samples_per_pixel();
+            let signed = matches!(
+                pixel_data.pixel_representation(),
+                dicom_pixeldata::PixelRepresentation::Signed
+            );
+            let bytes: &[u8] = pixel_data.data();
+
+            // Decode to RawImage based on bit depth and sample count
+            let raw_image = match (bits, samples) {
+                (8, 1) => {
+                    if bytes.len() < rows * cols {
+                        self.error = Some("Pixel data buffer is too short".to_string());
+                        return;
+                    }
+                    RawImage::Gray8 {
+                        data: bytes[..rows * cols].to_vec(),
+                        width: cols,
+                        height: rows,
+                    }
                 }
-            }
-            (16, 1) => {
-                let expected = rows * cols * 2;
-                if bytes.len() < expected {
+                (16, 1) => {
+                    let expected = rows * cols * 2;
+                    if bytes.len() < expected {
+                        self.error = Some(format!(
+                            "Pixel data buffer too short: {} bytes, expected {}",
+                            bytes.len(),
+                            expected
+                        ));
+                        return;
+                    }
+                    // Parse 16-bit little-endian values and apply rescale
+                    let data: Vec<f32> = bytes
+                        .chunks_exact(2)
+                        .take(rows * cols)
+                        .map(|c| {
+                            let raw_u16 = u16::from_le_bytes([c[0], c[1]]);
+                            let raw_val = if signed {
+                                (raw_u16 as i16) as f32
+                            } else {
+                                raw_u16 as f32
+                            };
+                            raw_val * rescale_slope + rescale_intercept
+                        })
+                        .collect();
+                    RawImage::Gray16(Gray16 {
+                        data,
+                        width: cols,
+                        height: rows,
+                    })
+                }
+                (8, 3) => {
+                    let expected = rows * cols * 3;
+                    if bytes.len() < expected {
+                        self.error = Some("Pixel data buffer is too short".to_string());
+                        return;
+                    }
+                    RawImage::Rgb8 {
+                        data: bytes[..expected].to_vec(),
+                        width: cols,
+                        height: rows,
+                    }
+                }
+                _ => {
                     self.error = Some(format!(
-                        "Pixel data buffer too short: {} bytes, expected {}",
-                        bytes.len(),
-                        expected
+                        "Unsupported pixel format: {} bpp, {} samples per pixel",
+                        bits, samples
                     ));
                     return;
                 }
-                // Parse 16-bit little-endian values and apply rescale
-                let data: Vec<f32> = bytes
-                    .chunks_exact(2)
-                    .take(rows * cols)
-                    .map(|c| {
-                        let raw_u16 = u16::from_le_bytes([c[0], c[1]]);
-                        let raw_val = if signed {
-                            (raw_u16 as i16) as f32
-                        } else {
-                            raw_u16 as f32
-                        };
-                        raw_val * rescale_slope + rescale_intercept
-                    })
-                    .collect();
-                RawImage::Gray16(Gray16 {
-                    data,
-                    width: cols,
-                    height: rows,
-                })
-            }
-            (8, 3) => {
-                let expected = rows * cols * 3;
-                if bytes.len() < expected {
-                    self.error = Some("Pixel data buffer is too short".to_string());
-                    return;
-                }
-                RawImage::Rgb8 {
-                    data: bytes[..expected].to_vec(),
-                    width: cols,
-                    height: rows,
-                }
-            }
-            _ => {
-                self.error = Some(format!(
-                    "Unsupported pixel format: {} bpp, {} samples per pixel",
-                    bits, samples
-                ));
-                return;
-            }
-        };
-
-        // Determine initial window centre/width for 16-bit grayscale
-        if let RawImage::Gray16(ref g) = raw_image {
-            let (wc, ww) = if let (Some(wc), Some(ww)) = (wc_dicom, ww_dicom) {
-                (wc, ww)
-            } else {
-                // Compute from the actual pixel values
-                let min = g.data.iter().cloned().fold(f32::MAX, f32::min);
-                let max = g.data.iter().cloned().fold(f32::MIN, f32::max);
-                ((min + max) / 2.0, (max - min).max(1.0))
             };
-            self.window_center = wc;
-            self.window_width = ww;
+
+            // Determine initial window centre/width for 16-bit grayscale (from first image)
+            if self.images.is_empty() {
+                if let RawImage::Gray16(ref g) = raw_image {
+                    let (wc, ww) = if let (Some(wc), Some(ww)) = (wc_dicom, ww_dicom) {
+                        (wc, ww)
+                    } else {
+                        // Compute from the actual pixel values
+                        let min = g.data.iter().cloned().fold(f32::MAX, f32::min);
+                        let max = g.data.iter().cloned().fold(f32::MIN, f32::max);
+                        ((min + max) / 2.0, (max - min).max(1.0))
+                    };
+                    self.window_center = wc;
+                    self.window_width = ww;
+                }
+            }
+
+            self.images.push(LoadedImage { raw_image, metadata });
         }
 
-        self.raw_image = Some(raw_image);
-        self.current_file = Some(path);
-        self.rebuild_texture(ctx);
+        self.update_current_slice_view(ctx);
     }
 
-    fn rebuild_texture(&mut self, ctx: &egui::Context) {
-        let raw = match &self.raw_image {
-            Some(r) => r,
-            None => return,
-        };
-        let (width, height) = raw.dimensions();
-        let rgba = raw.to_rgba(self.window_center, self.window_width);
+    fn update_current_slice_view(&mut self, ctx: &egui::Context) {
+        if self.images.is_empty() {
+            self.texture = None;
+            return;
+        }
+        let img = &self.images[self.current_slice];
+        let (width, height) = img.raw_image.dimensions();
+        let rgba = img.raw_image.to_rgba(self.window_center, self.window_width);
         let color_image =
             egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
         self.texture = Some(ctx.load_texture(
@@ -301,31 +312,49 @@ impl DicomViewApp {
 impl eframe::App for DicomViewApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Process any pending file load (first frame, or after Open dialog)
-        if let Some(path) = self.pending_load.take() {
-            self.load_file(ctx, path);
+        if let Some(paths) = self.pending_load.take() {
+            self.load_files(ctx, paths);
         }
 
         // Rebuild texture when window/level values change
         if self.wl_dirty {
-            self.rebuild_texture(ctx);
+            self.update_current_slice_view(ctx);
         }
 
-        // Drag-and-drop: accept the first dropped file
-        let dropped = ctx.input(|i| i.raw.dropped_files.first().and_then(|f| f.path.clone()));
-        if let Some(path) = dropped {
-            self.load_file(ctx, path);
+        // Drag-and-drop: collect all dropped files
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+        });
+        if !dropped.is_empty() {
+            self.load_files(ctx, dropped);
         }
+
+        // Keyboard navigation: arrow keys
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowLeft) {
+                if self.current_slice > 0 {
+                    self.current_slice -= 1;
+                    self.wl_dirty = true;
+                }
+            }
+            if i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::ArrowRight) {
+                if self.current_slice < self.images.len().saturating_sub(1) {
+                    self.current_slice += 1;
+                    self.wl_dirty = true;
+                }
+            }
+        });
 
         // ── Toolbar ───────────────────────────────────────────────────────────
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("📂 Open").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
+                    if let Some(paths) = rfd::FileDialog::new()
                         .add_filter("DICOM", &["dcm", "DCM"])
                         .add_filter("All Files", &["*"])
-                        .pick_file()
+                        .pick_files()
                     {
-                        self.pending_load = Some(path);
+                        self.pending_load = Some(paths);
                     }
                 }
 
@@ -346,51 +375,69 @@ impl eframe::App for DicomViewApp {
                 ui.label(format!("{:.0}%", self.zoom * 100.0));
 
                 // Window/Level controls (only for 16-bit grayscale)
-                if self.raw_image.as_ref().map(|r| r.is_grayscale16()).unwrap_or(false) {
-                    ui.separator();
-                    ui.label("WC:");
-                    let wc_resp = ui.add(
-                        egui::DragValue::new(&mut self.window_center).speed(1.0),
-                    );
-                    ui.label("WW:");
-                    let ww_resp = ui.add(
-                        egui::DragValue::new(&mut self.window_width)
-                            .speed(1.0)
-                            .range(1.0..=f32::MAX),
-                    );
-                    if wc_resp.changed() || ww_resp.changed() {
-                        self.wl_dirty = true;
+                if !self.images.is_empty() {
+                    let is_grayscale16 = self.images[self.current_slice]
+                        .raw_image
+                        .is_grayscale16();
+                    if is_grayscale16 {
+                        ui.separator();
+                        ui.label("WC:");
+                        let wc_resp = ui.add(
+                            egui::DragValue::new(&mut self.window_center).speed(1.0),
+                        );
+                        ui.label("WW:");
+                        let ww_resp = ui.add(
+                            egui::DragValue::new(&mut self.window_width)
+                                .speed(1.0)
+                                .range(1.0..=f32::MAX),
+                        );
+                        if wc_resp.changed() || ww_resp.changed() {
+                            self.wl_dirty = true;
+                        }
                     }
                 }
 
-                if let Some(p) = &self.current_file {
+                // Slice navigation
+                if self.images.len() > 1 {
                     ui.separator();
-                    ui.label(p.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+                    ui.label(format!("Slice: {}/{}", self.current_slice + 1, self.images.len()));
+                    let mut slice_val = self.current_slice as i32;
+                    let slider = ui.add(
+                        egui::Slider::new(&mut slice_val, 0..=(self.images.len() - 1) as i32)
+                            .show_value(false)
+                    );
+                    if slider.changed() {
+                        self.current_slice = slice_val as usize;
+                        self.wl_dirty = true;
+                    }
                 }
             });
         });
 
         // ── Metadata side panel ───────────────────────────────────────────────
-        if self.show_metadata && !self.metadata.is_empty() {
-            egui::SidePanel::right("metadata_panel")
-                .min_width(180.0)
-                .max_width(300.0)
-                .show(ctx, |ui| {
-                    ui.heading("Metadata");
-                    ui.separator();
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        egui::Grid::new("meta_grid")
-                            .num_columns(2)
-                            .striped(true)
-                            .show(ui, |ui| {
-                                for (label, value) in &self.metadata {
-                                    ui.strong(label);
-                                    ui.label(value);
-                                    ui.end_row();
-                                }
-                            });
+        if self.show_metadata && !self.images.is_empty() {
+            let metadata = &self.images[self.current_slice].metadata;
+            if !metadata.is_empty() {
+                egui::SidePanel::right("metadata_panel")
+                    .min_width(180.0)
+                    .max_width(300.0)
+                    .show(ctx, |ui| {
+                        ui.heading("Metadata");
+                        ui.separator();
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            egui::Grid::new("meta_grid")
+                                .num_columns(2)
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    for (label, value) in metadata {
+                                        ui.strong(label);
+                                        ui.label(value);
+                                        ui.end_row();
+                                    }
+                                });
+                        });
                     });
-                });
+            }
         }
 
         // ── Image panel ───────────────────────────────────────────────────────
@@ -407,7 +454,7 @@ impl eframe::App for DicomViewApp {
 
             if self.texture.is_none() {
                 ui.centered_and_justified(|ui| {
-                    ui.label("Open a DICOM file or drag and drop one here");
+                    ui.label("Open DICOM files or drag and drop them here");
                 });
                 return;
             }
@@ -424,11 +471,24 @@ impl eframe::App for DicomViewApp {
 
                 let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
-                // Scroll wheel → zoom
+                // Scroll wheel → zoom; Shift+Scroll or Alt+Scroll → slice navigation
                 let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
                 if response.hovered() && scroll_delta != 0.0 {
-                    self.zoom =
-                        (self.zoom * (1.0 + scroll_delta * 0.004)).clamp(0.05, 20.0);
+                    let shift_or_alt = ctx.input(|i| i.modifiers.shift || i.modifiers.alt);
+                    if shift_or_alt && self.images.len() > 1 {
+                        // Scroll to change slice
+                        if scroll_delta > 0.0 && self.current_slice > 0 {
+                            self.current_slice -= 1;
+                            self.wl_dirty = true;
+                        } else if scroll_delta < 0.0 && self.current_slice < self.images.len() - 1 {
+                            self.current_slice += 1;
+                            self.wl_dirty = true;
+                        }
+                    } else {
+                        // Scroll to zoom
+                        self.zoom =
+                            (self.zoom * (1.0 + scroll_delta * 0.004)).clamp(0.05, 20.0);
+                    }
                 }
 
                 // Left-button drag → pan
@@ -440,14 +500,19 @@ impl eframe::App for DicomViewApp {
                 // Horizontal drag adjusts Window Width; vertical drag adjusts Window Centre.
                 // Only meaningful for 16-bit grayscale; ignored otherwise.
                 if response.dragged_by(egui::PointerButton::Secondary) {
-                    if self.raw_image.as_ref().map(|r| r.is_grayscale16()).unwrap_or(false) {
-                        let delta = response.drag_delta();
-                        // Scale factor: drag 1px ≈ 2 HU change (reasonable for CT).
-                        let ww_scale = 2.0_f32;
-                        let wc_scale = 2.0_f32;
-                        self.window_width = (self.window_width + delta.x * ww_scale).max(1.0);
-                        self.window_center += -delta.y * wc_scale;
-                        self.wl_dirty = true;
+                    if !self.images.is_empty() {
+                        let is_grayscale16 = self.images[self.current_slice]
+                            .raw_image
+                            .is_grayscale16();
+                        if is_grayscale16 {
+                            let delta = response.drag_delta();
+                            // Scale factor: drag 1px ≈ 2 HU change (reasonable for CT).
+                            let ww_scale = 2.0_f32;
+                            let wc_scale = 2.0_f32;
+                            self.window_width = (self.window_width + delta.x * ww_scale).max(1.0);
+                            self.window_center += -delta.y * wc_scale;
+                            self.wl_dirty = true;
+                        }
                     }
                 }
 
