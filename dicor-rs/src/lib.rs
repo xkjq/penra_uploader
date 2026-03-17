@@ -197,6 +197,34 @@ fn process_file<D: dicom_core::DataDictionary + Clone>(
 
     for el in ds.iter() {
         let t = el.tag();
+        let group = t.0;
+        if (group & 1) == 1 {
+            if preserve_private {
+                // MITRA global patient id special-case at file-level
+                let mitra_group = 0x0031u16;
+                let mitra_element_low = 0x0020u16;
+                if group == mitra_group && (t.1 & 0x00FF) == mitra_element_low {
+                    let private_tag_group = (t.1 >> 8) as u16;
+                    let creator_tag = Tag(mitra_group, private_tag_group);
+                    if let Ok(creator_el) = ds.element(creator_tag) {
+                        if let Ok(s) = creator_el.to_str() {
+                            if s == "MITRA LINKED ATTRIBUTES 1.0" {
+                                if let Ok(elv) = ds.element(t) {
+                                    let orig = elv.to_str().ok().map(|s| s.to_string()).unwrap_or_else(|| String::new());
+                                    let hb = hash_bytes(orig.as_ref());
+                                    let new_uid = uid_from_hash_bytes(&hb);
+                                    puts.push((t, VR::LO, new_uid.clone()));
+                                    map.insert(format!("UID:{}", orig), new_uid.clone());
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            // skip all other private tags when preserving (do not blank)
+            continue;
+        }
         if clear_tags.contains(&t) {
             if el.vr() == VR::SQ {
                 to_remove.push(t);
@@ -435,6 +463,30 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, pr
                         let new = shifted.format("%Y%m%d").to_string();
                         let _ = obj.put_str(tag, VR::DA, &new);
                     }
+
+                        // Ensure common time tags are shifted as well (StudyTime, SeriesTime, etc.)
+                        let time_tags = vec![Tag(0x0008,0x0030), Tag(0x0008,0x0031), Tag(0x0008,0x0032), Tag(0x0008,0x0033), Tag(0x0008,0x0034), Tag(0x0008,0x0035), Tag(0x0010,0x0032), Tag(0x0040,0xA122)];
+                        for tag in time_tags {
+                            if let Ok(elem) = obj.element(tag) {
+                                if let Ok(s) = elem.to_str() {
+                                    let patterns = ["%H%M%S", "%H%M", "%H:%M:%S"];
+                                    let mut parsed: Option<NaiveTime> = None;
+                                    for p in &patterns {
+                                        if let Ok(tm) = NaiveTime::parse_from_str(&s, p) {
+                                            parsed = Some(tm);
+                                            break;
+                                        }
+                                    }
+                                    if let Some(tm) = parsed {
+                                        let minutes = (shift_days % 1440) as i64;
+                                        let shifted_time = tm + Duration::minutes(minutes);
+                                        let secs = shifted_time.num_seconds_from_midnight();
+                                        let new = NaiveTime::from_num_seconds_from_midnight_opt(secs, 0).map(|t| t.format("%H%M%S").to_string()).unwrap_or_else(|| s.to_string());
+                                        let _ = obj.put_str(tag, VR::TM, &new);
+                                    }
+                                }
+                            }
+                        }
                 }
             }
         }
