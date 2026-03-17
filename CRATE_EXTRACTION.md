@@ -1,4 +1,4 @@
-# DICOM Viewer & Meta Viewer - Independent Rust Crates
+# DICOM Viewer & Divue-rs - Independent Rust Crates
 
 This extraction creates two standalone Rust crates from the original uploader project:
 
@@ -43,8 +43,8 @@ for (key, value) in metadata {
 
 ---
 
-### 2. `meta_viewer`
-Located at: `/home/ross/penra_uploader/meta_viewer`
+### 2. `divue-rs` (DICOM Viewer - Rust)
+Located at: `/home/ross/penra_uploader/divue-rs`
 
 A GUI application (and library) for viewing and comparing DICOM metadata from multiple files using egui.
 
@@ -58,14 +58,19 @@ A GUI application (and library) for viewing and comparing DICOM metadata from mu
 
 **Building:**
 ```bash
-cd meta_viewer
+cd divue-rs
 cargo build --release
 ```
 
 **Running as Standalone Application:**
 ```bash
-cd meta_viewer
-cargo run -- /path/to/file1.dcm /path/to/file2.dcm ...
+cd divue-rs
+cargo run --release -- /path/to/file1.dcm /path/to/file2.dcm ...
+```
+
+Or directly:
+```bash
+./divue-rs/target/release/divue /path/to/file1.dcm /path/to/file2.dcm ...
 ```
 
 The GUI allows you to:
@@ -78,12 +83,12 @@ The GUI allows you to:
 Add to your `Cargo.toml`:
 ```toml
 [dependencies]
-meta_viewer = { path = "../meta_viewer" }
+divue_rs = { package = "divue-rs", path = "../divue-rs" }
 ```
 
 Then in your code:
 ```rust
-use meta_viewer::run_meta_viewer;
+use divue_rs::run_meta_viewer;
 
 let file_paths = vec![
     "/path/to/file1.dcm".to_string(),
@@ -102,13 +107,13 @@ The `uploader_rs` crate has been updated to use these new crates as dependencies
 ```toml
 [dependencies]
 dicom_viewer = { path = "../dicom_viewer" }
-meta_viewer = { path = "../meta_viewer" }
+divue_rs = { package = "divue-rs", path = "../divue-rs" }
 ```
 
 And the imports in `src/main.rs` have been changed from module references to external crate imports:
 ```rust
 use dicom_viewer::{read_metadata, read_metadata_all};
-use meta_viewer::run_meta_viewer;
+use divue_rs::run_meta_viewer;
 ```
 
 ---
@@ -124,5 +129,5 @@ These crates can now be:
 ## Build Status
 
 - ✅ `dicom_viewer` - Compiles successfully
-- ✅ `meta_viewer` - Compiles successfully  
+- ✅ `divue-rs` - Compiles successfully  
 - ✅ Both crates can be used independently

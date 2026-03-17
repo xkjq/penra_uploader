@@ -1,5 +1,5 @@
 [package]
-name = "meta_viewer"
+name = "divue-rs"
 version = "0.1.0"
 edition = "2021"
 
@@ -9,9 +9,9 @@ egui = "0.33"
 dicom_viewer = { path = "../dicom_viewer" }
 
 [[bin]]
-name = "meta_viewer"
+name = "divue"
 path = "src/main.rs"
 
 [lib]
-name = "meta_viewer"
+name = "divue_rs"
 path = "src/lib.rs"

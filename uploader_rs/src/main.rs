@@ -4,7 +4,7 @@ use dicor_rs::anonymize_file;
 mod upload;
 use upload::{upload_anon_dir, UploadResult, scan_for_upload, SeriesInfo, FileEntry};
 use dicom_viewer::{read_metadata, read_metadata_all};
-use meta_viewer::run_meta_viewer;
+use divue_rs::run_meta_viewer;
 use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
 use std::path::PathBuf;

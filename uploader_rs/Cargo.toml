@@ -21,7 +21,7 @@ dirs = "4.0"
 # local crates
 dicor_rs = { package = "dicor-rs", path = "../dicor-rs" }
 dicom_viewer = { path = "../dicom_viewer" }
-meta_viewer = { path = "../meta_viewer" }
+divue_rs = { package = "divue-rs", path = "../divue-rs" }
 
 [dev-dependencies]
 tempfile = "3.6"
