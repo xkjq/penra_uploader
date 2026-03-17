@@ -28,24 +28,65 @@ fn burned_in_annotation_is_error_by_default() {
     assert!(res.is_err(), "Expected anonymize_file to error for burned-in image");
 }
 
-// The tests below mirror dicognito behaviour and are placeholders to be
-// enabled once the library supports the corresponding CLI/config options.
+// Additional tests to cover allowed and missing/other values.
 
 #[test]
-#[ignore]
 fn burned_in_annotation_when_permitted_allows_anonymisation() {
-    // Placeholder: when a "permit burned-in" flag is provided, anonymisation
-    // should proceed. To be implemented after adding option to API.
+    let tmp = tempdir().expect("tempdir");
+    let in_path = tmp.path().join("burned_in_yes.dcm");
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    copy_vendored_fixture("burned_in_yes.dcm", &in_path);
+
+    // permit_burned_in = true should allow anonymisation to proceed
+    let res = anonymize_file(&in_path, &out_dir, false, false, true, None);
+    assert!(res.is_ok(), "Expected anonymize_file to succeed when burned-in is permitted");
+    let out_path = res.unwrap();
+    assert!(out_path.exists(), "output file should exist");
 }
 
 #[test]
-#[ignore]
-fn burned_in_annotation_warn_logs_warning_but_allows() {
-    // Placeholder for "warn" behaviour.
+fn burned_in_annotation_no_allows_anonymisation() {
+    let tmp = tempdir().expect("tempdir");
+    let in_path = tmp.path().join("burned_in_no.dcm");
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    copy_vendored_fixture("burned_in_no.dcm", &in_path);
+
+    let res = anonymize_file(&in_path, &out_dir, false, false, false, None);
+    assert!(res.is_ok(), "Expected anonymize_file to succeed for burned_in=NO");
+    let out_path = res.unwrap();
+    assert!(out_path.exists());
 }
 
 #[test]
-#[ignore]
-fn burned_in_annotation_never_allows_all() {
-    // Placeholder for "never"/assume-burned settings.
+fn burned_in_annotation_missing_allows_anonymisation() {
+    let tmp = tempdir().expect("tempdir");
+    let in_path = tmp.path().join("burned_in_missing.dcm");
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    copy_vendored_fixture("burned_in_missing.dcm", &in_path);
+
+    let res = anonymize_file(&in_path, &out_dir, false, false, false, None);
+    assert!(res.is_ok(), "Expected anonymize_file to succeed when Burned In tag is missing");
+    let out_path = res.unwrap();
+    assert!(out_path.exists());
+}
+
+#[test]
+fn burned_in_annotation_other_value_allows_anonymisation() {
+    let tmp = tempdir().expect("tempdir");
+    let in_path = tmp.path().join("burned_in_other.dcm");
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    copy_vendored_fixture("burned_in_other.dcm", &in_path);
+
+    let res = anonymize_file(&in_path, &out_dir, false, false, false, None);
+    assert!(res.is_ok(), "Expected anonymize_file to succeed for non-YES burned-in values");
+    let out_path = res.unwrap();
+    assert!(out_path.exists());
 }
