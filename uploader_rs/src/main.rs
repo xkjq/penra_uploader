@@ -92,7 +92,7 @@ impl Default for AppState {
             logged_in_user: upload::token_username(),
             move_files: false,
             recurse_depth: -1,
-            ext_filter: "dcm".to_string(),
+            ext_filter: "".to_string(),
             notify_on_process: false,
             ready_series: Vec::new(),
             selected_series: Vec::new(),
@@ -317,7 +317,10 @@ impl eframe::App for AppState {
                                             let next = if dleft > 0 { dleft - 1 } else { dleft };
                                             stack.push((p, next));
                                         } else if p.is_file() {
-                                            if let Some(exts) = p.extension().and_then(|s| s.to_str()) {
+                                            // If the extension filter is empty, accept all files; otherwise match extension (case-insensitive)
+                                            if ext.is_empty() {
+                                                found.push(p);
+                                            } else if let Some(exts) = p.extension().and_then(|s| s.to_str()) {
                                                 if exts.eq_ignore_ascii_case(&ext) {
                                                     found.push(p);
                                                 }
@@ -357,7 +360,13 @@ impl eframe::App for AppState {
                                 if !copied_files.is_empty() {
                                     let anon_dir = export.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
                                     for p in &copied_files {
-                                        if p.extension().map(|e| e == "dcm").unwrap_or(false) {
+                                        // process only if ext_filter empty (accept all) or file extension matches
+                                        let should_process = if ext.is_empty() {
+                                            true
+                                        } else {
+                                            p.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case(&ext)).unwrap_or(false)
+                                        };
+                                        if should_process {
                                             match anonymize_file(p, &anon_dir, true, false, false, seed_clone.as_deref()) {
                                                 Ok(out) => {
                                                     let _ = tx.send(format!("Anonymized: {}", out.display()));
@@ -402,7 +411,7 @@ impl eframe::App for AppState {
                     ui.checkbox(&mut self.notify_on_process, "Notify exporters after processing");
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Extension filter:");
+                    ui.label("Extension filter (empty = try all files):");
                     ui.text_edit_singleline(&mut self.ext_filter);
                 });
 
