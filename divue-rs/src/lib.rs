@@ -30,6 +30,7 @@ pub fn run_meta_viewer_with_mode(paths: Vec<String>, mode: MetadataReadMode) {
         comps,
         expanded_keys: HashSet::new(),
         filter: String::new(),
+        identifiable_only: false,
         full_open: false,
         full_text: String::new(),
     };
@@ -86,6 +87,86 @@ pub fn filter_keys(
         })
         .cloned()
         .collect()
+}
+
+fn key_segments(key: &str) -> Vec<&str> {
+    key.split('/').collect()
+}
+
+fn segment_alias(segment: &str) -> Option<String> {
+    if segment.starts_with('[') {
+        return None;
+    }
+
+    let dict = StandardDataDictionary;
+    let tag_text = segment.split_once('[').map(|(tag_text, _)| tag_text).unwrap_or(segment);
+    let (group_str, elem_str) = tag_text.split_once(',')?;
+    let g = u16::from_str_radix(group_str, 16).ok()?;
+    let e = u16::from_str_radix(elem_str, 16).ok()?;
+    let entry = dict.by_tag(Tag(g, e))?;
+    Some(entry.alias().to_string())
+}
+
+fn row_may_contain_identifiable_data(key: &str, comps: &[(String, HashMap<String, String>)]) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "patient",
+        "person",
+        "name",
+        "birth",
+        "address",
+        "institution",
+        "physician",
+        "operator",
+        "performing",
+        "referring",
+        "requesting",
+        "telephone",
+        "phone",
+        "email",
+        "mail",
+        "accession",
+        "medicalrecord",
+        "medical record",
+        "studyid",
+        "admission",
+        "insurance",
+        "occupation",
+        "religion",
+        "ethnic",
+        "uid",
+        "identifier",
+        "id",
+    ];
+
+    let mut haystacks = Vec::new();
+    haystacks.push(key.to_lowercase());
+    haystacks.extend(
+        key_segments(key)
+            .into_iter()
+            .filter_map(segment_alias)
+            .map(|alias| alias.to_lowercase()),
+    );
+
+    if haystacks
+        .iter()
+        .any(|text| KEYWORDS.iter().any(|keyword| text.contains(keyword)))
+    {
+        return true;
+    }
+
+    for (_name, map) in comps {
+        if let Some(value) = map.get(key) {
+            let value_lower = value.to_lowercase();
+            if value_lower.contains('@') {
+                return true;
+            }
+            if value.chars().filter(|ch| ch.is_ascii_digit()).count() >= 8 {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Detect if all values for a given key are the same across all metadata maps.
@@ -315,6 +396,7 @@ struct DivueApp {
     comps: Vec<(String, HashMap<String, String>)>,
     expanded_keys: HashSet<String>,
     filter: String,
+    identifiable_only: bool,
     full_open: bool,
     full_text: String,
 }
@@ -328,6 +410,7 @@ impl DivueApp {
             comps: Vec::new(),
             expanded_keys: HashSet::new(),
             filter: String::new(),
+            identifiable_only: false,
             full_open: false,
             full_text: String::new(),
         }
@@ -544,12 +627,17 @@ impl DivueApp {
                 self.filter.clear();
             }
         });
+        ui.checkbox(&mut self.identifiable_only, "Only show rows likely to contain identifiable data")
+            .on_hover_text("Heuristic filter based on DICOM tag names and suspicious values such as IDs, emails, or long digit strings.");
 
         // build union of keys preserving order
     let mut all_keys = build_key_union(&self.comps);
     all_keys.sort();
         let filtered = !self.filter.is_empty();
-    let keys = filter_keys(&all_keys, &self.comps, &self.filter);
+        let mut keys = filter_keys(&all_keys, &self.comps, &self.filter);
+        if self.identifiable_only {
+            keys.retain(|key| row_may_contain_identifiable_data(key, &self.comps));
+        }
     let rows = build_tree_rows(&all_keys, &keys);
     let effective_expanded = effective_expanded_keys(&rows, &self.expanded_keys, filtered);
     let visible = visible_rows(&rows, &effective_expanded);
@@ -628,6 +716,7 @@ struct MetaApp {
     comps: Vec<(String, HashMap<String, String>)>,
     expanded_keys: HashSet<String>,
     filter: String,
+    identifiable_only: bool,
     full_open: bool,
     full_text: String,
 }
@@ -646,12 +735,17 @@ impl eframe::App for MetaApp {
                 ui.text_edit_singleline(&mut self.filter);
                 if ui.button("Clear").clicked() { self.filter.clear(); }
             });
+            ui.checkbox(&mut self.identifiable_only, "Only show rows likely to contain identifiable data")
+                .on_hover_text("Heuristic filter based on DICOM tag names and suspicious values such as IDs, emails, or long digit strings.");
 
             // build union of keys preserving order
             let mut all_keys = build_key_union(&self.comps);
             all_keys.sort();
             let filtered = !self.filter.is_empty();
-            let keys = filter_keys(&all_keys, &self.comps, &self.filter);
+            let mut keys = filter_keys(&all_keys, &self.comps, &self.filter);
+            if self.identifiable_only {
+                keys.retain(|key| row_may_contain_identifiable_data(key, &self.comps));
+            }
             let rows = build_tree_rows(&all_keys, &keys);
             let effective_expanded = effective_expanded_keys(&rows, &self.expanded_keys, filtered);
             let visible = visible_rows(&rows, &effective_expanded);

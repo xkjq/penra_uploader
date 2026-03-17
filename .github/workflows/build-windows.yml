@@ -23,6 +23,26 @@ jobs:
         env:
           RUSTFLAGS: "-C link-args=/DEFAULTLIB:Advapi32.lib"
         run: cargo build --release
+      - name: Build dicor-rs (MSVC)
+        working-directory: dicor-rs
+        env:
+          RUSTFLAGS: "-C link-args=/DEFAULTLIB:Advapi32.lib"
+        run: cargo build --release
+      - name: Upload dicor-rs MSVC artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dicor-rs-windows-msvc
+          path: dicor-rs\\target\\release\\dicor-rs.exe
+      - name: Build divue-rs (MSVC)
+        working-directory: divue-rs
+        env:
+          RUSTFLAGS: "-C link-args=/DEFAULTLIB:Advapi32.lib"
+        run: cargo build --release
+      - name: Upload divue-rs MSVC artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: divue-rs-windows-msvc
+          path: divue-rs\\target\\release\\divue-rs.exe
       - name: Upload diviz-rs MSVC artifact
         uses: actions/upload-artifact@v4
         with:
@@ -60,6 +80,30 @@ jobs:
           source $HOME/.cargo/env
           cargo build --release --target x86_64-pc-windows-gnu
         working-directory: diviz-rs
+      - name: Build dicor-rs (GNU target)
+        env:
+          RUSTFLAGS: "-C linker=x86_64-w64-mingw32-gcc -C link-args=-ladvapi32"
+        run: |
+          source $HOME/.cargo/env
+          cargo build --release --target x86_64-pc-windows-gnu
+        working-directory: dicor-rs
+      - name: Upload dicor-rs GNU artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dicor-rs-windows-gnu
+          path: dicor-rs/target/x86_64-pc-windows-gnu/release/dicor-rs.exe
+      - name: Build divue-rs (GNU target)
+        env:
+          RUSTFLAGS: "-C linker=x86_64-w64-mingw32-gcc -C link-args=-ladvapi32"
+        run: |
+          source $HOME/.cargo/env
+          cargo build --release --target x86_64-pc-windows-gnu
+        working-directory: divue-rs
+      - name: Upload divue-rs GNU artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: divue-rs-windows-gnu
+          path: divue-rs/target/x86_64-pc-windows-gnu/release/divue-rs.exe
       - name: Upload diviz-rs GNU artifact
         uses: actions/upload-artifact@v4
         with:
