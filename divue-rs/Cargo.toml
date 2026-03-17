@@ -7,6 +7,7 @@ edition = "2021"
 eframe = "0.33"
 egui = "0.33"
 dicom_viewer = { path = "../dicom_viewer" }
+rfd = "0.17"
 
 [[bin]]
 name = "divue"
