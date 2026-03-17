@@ -717,26 +717,65 @@ impl eframe::App for AppState {
                                     Command::new(cmd).args(args).spawn()
                                 };
 
-                                // first try by name
+                                // first try by name (in PATH)
                                 match try_spawn("dicom-view", &paths) {
                                     Ok(_) => { self.last_msg = "Launched dicom-view".to_string(); }
                                     Err(_) => {
-                                        // try common workspace build locations relative to current dir
-                                        let fallback1 = std::env::current_dir()
-                                            .ok()
-                                            .and_then(|cwd| Some(cwd.join("dicom-view/target/debug/dicom-view")));
-                                        let fallback2 = std::env::current_exe()
-                                            .ok()
-                                            .and_then(|exe| exe.parent().and_then(|p| p.parent()).map(|p| p.join("dicom-view/target/debug/dicom-view")));
-                                        let mut launched = false;
-                                        if let Some(bin) = fallback1 { if bin.exists() {
-                                            if try_spawn(bin.to_string_lossy().as_ref(), &paths).is_ok() { launched = true; }
-                                        }}
-                                        if !launched {
-                                            if let Some(bin) = fallback2 { if bin.exists() {
-                                                if try_spawn(bin.to_string_lossy().as_ref(), &paths).is_ok() { launched = true; }
-                                            }}
+                                        // Attempt to locate a workspace-built binary by walking up ancestor directories
+                                        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+                                        // helper to push debug/release targets for a root path
+                                        let mut push_targets = |root: &std::path::Path| {
+                                            candidates.push(root.join("dicom-view/target/debug/dicom-view"));
+                                            candidates.push(root.join("dicom-view/target/release/dicom-view"));
+                                        };
+
+                                        if let Ok(cwd) = std::env::current_dir() {
+                                            let mut cur = Some(cwd.as_path());
+                                            for _ in 0..6 {
+                                                if let Some(p) = cur {
+                                                    push_targets(p);
+                                                    cur = p.parent();
+                                                } else { break; }
+                                            }
                                         }
+
+                                        if let Ok(exe) = std::env::current_exe() {
+                                            let mut cur = exe.parent();
+                                            for _ in 0..8 {
+                                                if let Some(p) = cur {
+                                                    push_targets(p);
+                                                    cur = p.parent();
+                                                } else { break; }
+                                            }
+                                        }
+
+                                        // Also try the parent of the uploader_rs directory (workspace root sibling)
+                                        if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+                                            let mut cur = std::path::Path::new(&manifest_dir).parent();
+                                            for _ in 0..6 {
+                                                if let Some(p) = cur {
+                                                    push_targets(p);
+                                                    cur = p.parent();
+                                                } else { break; }
+                                            }
+                                        }
+
+                                        // remove duplicates and try each candidate
+                                        let mut launched = false;
+                                        use std::collections::HashSet;
+                                        let mut seen = HashSet::new();
+                                        for cand in candidates.into_iter() {
+                                            let key = cand.to_string_lossy().to_string();
+                                            if seen.contains(&key) { continue; }
+                                            seen.insert(key.clone());
+                                            if cand.exists() {
+                                                if try_spawn(cand.to_string_lossy().as_ref(), &paths).is_ok() {
+                                                    launched = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+
                                         if launched {
                                             self.last_msg = "Launched dicom-view (fallback)".to_string();
                                         } else {
