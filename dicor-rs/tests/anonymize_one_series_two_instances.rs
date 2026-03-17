@@ -41,8 +41,8 @@ fn test_one_series_two_instances_anonymize_consistently() {
     make_instance_file(&in2, 1, 1, 1, 2);
 
     // anonymize with same seed to ensure deterministic mapping across files
-    let out1 = anonymize_file(&in1, &out_dir, false, false, Some("")).expect("anonymize1");
-    let out2 = anonymize_file(&in2, &out_dir, false, false, Some("")).expect("anonymize2");
+    let out1 = anonymize_file(&in1, &out_dir, false, false, false, Some("")).expect("anonymize1");
+    let out2 = anonymize_file(&in2, &out_dir, false, false, false, Some("")).expect("anonymize2");
 
     let o1 = open_file(&out1).expect("open out1");
     let o2 = open_file(&out2).expect("open out2");

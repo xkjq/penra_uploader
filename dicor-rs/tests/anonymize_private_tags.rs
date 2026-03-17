@@ -44,7 +44,7 @@ fn mitra_global_patient_id_is_updated() {
     // fixture in the upstream dicognito tree
     copy_third_party_fixture("third_party/dicognito/tests/orig_data/test_mitra_global_patient_id_is_updated/global_patient_id_implicit_vr.dcm", &in_path);
 
-    let _ = anonymize_file(&in_path, &out_dir, false, true, None).expect("anonymize mitra fixture");
+    let _ = anonymize_file(&in_path, &out_dir, false, true, false, None).expect("anonymize mitra fixture");
     let out_files = std::fs::read_dir(&out_dir).unwrap().collect::<Vec<_>>();
     assert!(!out_files.is_empty());
 
@@ -69,7 +69,7 @@ fn tag_0031_0040_not_updated() {
     let orig = open_file(&obj_path).expect("open orig");
     let orig_val = orig.element(Tag(0x0031,0x0040)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
 
-    let res = anonymize_file(&obj_path, &out_dir, false, true, None).expect("anonymize");
+    let res = anonymize_file(&obj_path, &out_dir, false, true, false, None).expect("anonymize");
     let out = open_file(&res).expect("open out");
     let new_val = out.element(Tag(0x0031,0x0040)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
 
@@ -88,7 +88,7 @@ fn private_creator_0031_0020_not_updated() {
     let orig = open_file(&obj_path).expect("open orig");
     let orig_val = orig.element(Tag(0x0031,0x0020)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
 
-    let res = anonymize_file(&obj_path, &out_dir, false, true, None).expect("anonymize");
+    let res = anonymize_file(&obj_path, &out_dir, false, true, false, None).expect("anonymize");
     let out = open_file(&res).expect("open out");
     let new_val = out.element(Tag(0x0031,0x0020)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
 
@@ -114,7 +114,7 @@ fn binary_mitra_global_patient_id_is_updated() {
     let orig = open_file(&obj_path).expect("open orig");
     let orig_val = orig.element(Tag(0x0031,0x1020)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
 
-    let res = anonymize_file(&obj_path, &out_dir, false, true, None).expect("anonymize");
+    let res = anonymize_file(&obj_path, &out_dir, false, true, false, None).expect("anonymize");
     let out = open_file(&res).expect("open out");
     let new_val = out.element(Tag(0x0031,0x1020)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
 

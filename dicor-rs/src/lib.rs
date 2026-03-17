@@ -298,8 +298,17 @@ fn process_file<D: dicom_core::DataDictionary + Clone>(
     }
 }
 
-pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, preserve_private: bool, seed: Option<&str>) -> Result<PathBuf, String> {
+pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, preserve_private: bool, permit_burned_in: bool, seed: Option<&str>) -> Result<PathBuf, String> {
     let mut obj: FileDicomObject<_> = open_file(input).map_err(|e| format!("Failed to open DICOM: {}", e))?;
+
+    // Detect Burned In Annotation (0028,0301) and fail unless permitted.
+    if let Ok(elem) = obj.element(Tag(0x0028, 0x0301)) {
+        if let Ok(s) = elem.to_str() {
+            if s.eq_ignore_ascii_case("YES") && !permit_burned_in {
+                return Err(format!("Burned In Annotation is YES in {}", input.display()));
+            }
+        }
+    }
 
     let study_uid = obj.element(Tag(0x0020, 0x000D)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()).unwrap_or_else(|| "NO_STUDY_UID".to_string());
     let pat_name = obj.element(Tag(0x0010, 0x0010)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()).unwrap_or_else(|| "ANON".to_string());

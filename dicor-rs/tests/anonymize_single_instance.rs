@@ -71,7 +71,7 @@ fn minimal_instance_anonymizes_safely() {
 
     copy_fixture("p01_s01_s01_i01.dcm", &in_path);
 
-    let res = anonymize_file(&in_path, &out_dir, false, false, None).expect("anonymize minimal");
+    let res = anonymize_file(&in_path, &out_dir, false, false, false, None).expect("anonymize minimal");
     assert!(res.exists());
 }
 
@@ -89,7 +89,7 @@ fn nonidentifying_uis_are_left_alone() {
     let orig_media_class = orig.element(Tag(0x0002, 0x0002)).ok().and_then(|e| e.to_str().ok()).map(|s| s.into_owned());
     let orig_sop_class = orig.element(Tag(0x0008, 0x0016)).ok().and_then(|e| e.to_str().ok()).map(|s| s.into_owned());
 
-    let res = anonymize_file(&in_path, &out_dir, false, false, None).expect("anonymize");
+    let res = anonymize_file(&in_path, &out_dir, false, false, false, None).expect("anonymize");
     let out = open_file(&res).expect("open out");
 
     let new_media_class = out.meta().media_storage_sop_class_uid.clone();
@@ -113,7 +113,7 @@ fn identifying_uis_are_updated() {
     let orig_study = orig.element(Tag(0x0020, 0x000D)).ok().and_then(|e| e.to_str().ok()).map(|s| s.into_owned());
     let orig_series = orig.element(Tag(0x0020, 0x000E)).ok().and_then(|e| e.to_str().ok()).map(|s| s.into_owned());
 
-    let res = anonymize_file(&in_path, &out_dir, false, false, None).expect("anonymize");
+    let res = anonymize_file(&in_path, &out_dir, false, false, false, None).expect("anonymize");
     let out = open_file(&res).expect("open out");
 
     let new_sop_instance = out.element(Tag(0x0008, 0x0018)).ok().and_then(|e| e.to_str().ok()).map(|s| s.into_owned());
@@ -138,7 +138,7 @@ fn repeated_identifying_uis_get_same_values() {
     let orig = open_file(&in_path).expect("open orig");
     let orig_uid = orig.element(Tag(0x0008, 0x0018)).ok().and_then(|e| e.to_str().ok()).map(|s| s.into_owned()).expect("orig uid");
 
-    let res = anonymize_file(&in_path, &out_dir, false, false, None).expect("anonymize");
+    let res = anonymize_file(&in_path, &out_dir, false, false, false, None).expect("anonymize");
     assert!(res.exists());
     let map_path = out_dir.join(format!("{}.anon_map.json", in_path.file_name().unwrap().to_string_lossy()));
     let map_contents = std::fs::read_to_string(&map_path).expect("read map");
@@ -162,7 +162,7 @@ fn issuer_of_patient_id_changed_if_not_empty_and_not_added_if_empty() {
         let file_obj = obj.with_meta(FileMetaTableBuilder::new().transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN).media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.1").media_storage_sop_instance_uid("2.25.4444")).unwrap();
         file_obj.write_to_file(&obj_path).unwrap();
     }
-    let res = anonymize_file(&obj_path, &out_dir, false, false, None).expect("anonymize case1");
+    let res = anonymize_file(&obj_path, &out_dir, false, false, false, None).expect("anonymize case1");
     assert!(res.exists());
     let map_path = out_dir.join(format!("{}.anon_map.json", obj_path.file_name().unwrap().to_string_lossy()));
     assert!(map_path.exists());
@@ -178,7 +178,7 @@ fn issuer_of_patient_id_changed_if_not_empty_and_not_added_if_empty() {
     }
     let out_dir2 = tmp.path().join("out2");
     std::fs::create_dir_all(&out_dir2).unwrap();
-    let res2 = anonymize_file(&in_path2, &out_dir2, false, false, None).expect("anonymize case2");
+    let res2 = anonymize_file(&in_path2, &out_dir2, false, false, false, None).expect("anonymize case2");
     assert!(res2.exists());
     let map_path2 = out_dir2.join(format!("{}.anon_map.json", in_path2.file_name().unwrap().to_string_lossy()));
     assert!(map_path2.exists());
@@ -199,7 +199,7 @@ fn dates_and_times_get_anonymized_when_both_are_present() {
     let file_obj = obj.with_meta(FileMetaTableBuilder::new().transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN).media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.1").media_storage_sop_instance_uid("2.25.6666")).unwrap();
     file_obj.write_to_file(&in_path).unwrap();
 
-    let res = anonymize_file(&in_path, &out_dir, false, false, None).expect("anonymize");
+    let res = anonymize_file(&in_path, &out_dir, false, false, false, None).expect("anonymize");
     assert!(res.exists());
     // ensure file not empty
     let md = std::fs::metadata(&res).expect("stat out");

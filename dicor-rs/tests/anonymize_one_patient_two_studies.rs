@@ -38,8 +38,8 @@ fn one_patient_two_studies() {
     make_instance(&a, 1, 1, 1, 1);
     make_instance(&b, 1, 2, 1, 1);
 
-    let oa = anonymize_file(&a, &out, false, false, Some("")).expect("anonymize a");
-    let ob = anonymize_file(&b, &out, false, false, Some("")).expect("anonymize b");
+    let oa = anonymize_file(&a, &out, false, false, false, Some("")).expect("anonymize a");
+    let ob = anonymize_file(&b, &out, false, false, false, Some("")).expect("anonymize b");
 
     let ra = open_file(&oa).expect("open a");
     let rb = open_file(&ob).expect("open b");
