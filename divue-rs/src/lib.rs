@@ -3,7 +3,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use dicom_viewer::{read_metadata_all, read_metadata_in_depth, MetadataReadMode};
 use dicom_core::Tag;
-use dicom_dictionary_std;
+use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry};
+use dicom_dictionary_std::StandardDataDictionary;
 
 pub fn run_meta_viewer(paths: Vec<String>) {
     run_meta_viewer_with_mode(paths, MetadataReadMode::Simple);
@@ -117,10 +118,11 @@ fn get_formatted_tag_name(key: &str) -> String {
     if let Some((group_str, elem_str)) = key.split_once(',') {
         if let (Ok(g), Ok(e)) = (u16::from_str_radix(group_str, 16), u16::from_str_radix(elem_str, 16)) {
             let tag = Tag(g, e);
-            if let Some(entry) = dicom_dictionary_std::from_tag(tag) {
-                let name = entry.name();
-                if name != "Unknown Tag" { // Skip if dictionary doesn't have a real name
-                    return format!("{} ({})", name, key);
+            let dict = StandardDataDictionary;
+            if let Some(entry) = dict.by_tag(tag) {
+                let alias = entry.alias();
+                if !alias.is_empty() {
+                    return format!("{} ({})", alias, key);
                 }
             }
         }
