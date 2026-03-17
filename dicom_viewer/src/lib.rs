@@ -14,6 +14,19 @@ pub enum MetadataReadMode {
     InDepth,
 }
 
+/// Diagnostic information about extraction issues encountered during metadata reading.
+#[derive(Clone, Debug, Default)]
+pub struct ExtractionDiagnostics {
+    /// Sequences we encountered but couldn't fully descend into, with reason.
+    pub failed_sequences: Vec<(String, String)>,
+    /// Elements that had errors during extraction, with reason.
+    pub failed_elements: Vec<(String, String)>,
+    /// Count of successfully extracted elements.
+    pub successful_count: usize,
+    /// Human-readable summary of issues.
+    pub summary: String,
+}
+
 /// Read a small selection of DICOM metadata fields from `path`.
 /// Returns a map of `label -> string` for display.
 pub fn read_metadata(path: &Path) -> Result<HashMap<String, String>, String> {
@@ -88,6 +101,7 @@ fn extract_deep_metadata(
     obj: &dicom_object::InMemDicomObject,
     prefix: &str,
     out: &mut HashMap<String, String>,
+    diagnostics: &mut ExtractionDiagnostics,
 ) -> Result<(), String> {
     for elem in obj.iter() {
         let tag = elem.tag();
@@ -102,10 +116,24 @@ fn extract_deep_metadata(
             out.insert(key.clone(), "<SQ sequence>".to_string());
             
             // Try to access sequence items
-            if let Some(items) = elem.items() {
-                for (item_idx, item) in items.iter().enumerate() {
-                    let item_prefix = format!("{}[{}]", key, item_idx);
-                    extract_deep_metadata(item, &item_prefix, out)?;
+            match elem.items() {
+                Some(items) => {
+                    for (item_idx, item) in items.iter().enumerate() {
+                        let item_prefix = format!("{}[{}]", key, item_idx);
+                        // Attempt to recurse; if it fails, log it
+                        if let Err(e) = extract_deep_metadata(item, &item_prefix, out, diagnostics) {
+                            diagnostics.failed_sequences.push((
+                                item_prefix.clone(),
+                                format!("Recursion failed: {}", e),
+                            ));
+                        }
+                    }
+                }
+                None => {
+                    diagnostics.failed_sequences.push((
+                        key.clone(),
+                        "No items() iterator available for sequence".to_string(),
+                    ));
                 }
             }
         } else {
@@ -129,16 +157,19 @@ fn extract_deep_metadata(
                 format!("<{:?} non-text>", elem.vr())
             };
 
-            out.insert(key, value);
+            out.insert(key.clone(), value);
+            diagnostics.successful_count += 1;
         }
     }
     Ok(())
 }
 
+
 /// Read metadata from the file using a selectable extraction mode.
 pub fn read_metadata_with_mode(path: &Path, mode: MetadataReadMode) -> Result<HashMap<String, String>, String> {
     let obj = open_file(path).map_err(|e| format!("open_file error: {}", e))?;
     let mut out: HashMap<String, String> = HashMap::new();
+    let mut _diagnostics = ExtractionDiagnostics::default();
 
     match mode {
         MetadataReadMode::Simple => {
@@ -160,9 +191,66 @@ pub fn read_metadata_with_mode(path: &Path, mode: MetadataReadMode) -> Result<Ha
         MetadataReadMode::InDepth => {
             // Iterate all available elements for maximum comparison coverage,
             // including nested elements within sequences.
-            extract_deep_metadata(&obj, "", &mut out)?;
+            extract_deep_metadata(&obj, "", &mut out, &mut _diagnostics)?;
         }
     }
 
     Ok(out)
+}
+
+/// Read metadata from the file with diagnostic information about extraction issues.
+/// Returns both the metadata map and detailed diagnostics about any sequences or elements
+/// that couldn't be fully descended into.
+pub fn read_metadata_with_diagnostics(path: &Path, mode: MetadataReadMode) -> Result<(HashMap<String, String>, ExtractionDiagnostics), String> {
+    let obj = open_file(path).map_err(|e| format!("open_file error: {}", e))?;
+    let mut out: HashMap<String, String> = HashMap::new();
+    let mut diagnostics = ExtractionDiagnostics::default();
+
+    match mode {
+        MetadataReadMode::Simple => {
+            // Best-effort extraction: probe common groups and element ranges.
+            let groups: &[u16] = &[0x0008, 0x0010, 0x0020, 0x0028, 0x0040, 0x7FE0];
+            for &g in groups {
+                for el in 0x0000u16..=0xFFFFu16 {
+                    let tag = Tag(g, el);
+                    if let Ok(elem) = obj.element(tag) {
+                        if let Ok(s) = elem.to_str() {
+                            out.insert(format!("{:04X},{:04X}", g, el), s.to_string());
+                            diagnostics.successful_count += 1;
+                        }
+                    }
+                    if out.len() > 2000 { break; }
+                }
+                if out.len() > 2000 { break; }
+            }
+        }
+        MetadataReadMode::InDepth => {
+            // Iterate all available elements with full diagnostic logging.
+            extract_deep_metadata(&obj, "", &mut out, &mut diagnostics)?;
+        }
+    }
+
+    // Build summary message
+    let mut summary = String::new();
+    if !diagnostics.failed_sequences.is_empty() {
+        summary.push_str(&format!(
+            "Failed to descend into {} sequence(s)\n",
+            diagnostics.failed_sequences.len()
+        ));
+    }
+    if !diagnostics.failed_elements.is_empty() {
+        summary.push_str(&format!(
+            "Failed to extract {} element(s)\n",
+            diagnostics.failed_elements.len()
+        ));
+    }
+    if summary.is_empty() {
+        summary = format!(
+            "Successfully extracted {} element(s) with no descent issues",
+            diagnostics.successful_count
+        );
+    }
+    diagnostics.summary = summary;
+
+    Ok((out, diagnostics))
 }

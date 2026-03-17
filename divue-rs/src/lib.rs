@@ -1,7 +1,7 @@
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use dicom_viewer::{read_metadata_all, read_metadata_in_depth, MetadataReadMode};
+use dicom_viewer::{read_metadata_with_diagnostics, MetadataReadMode, ExtractionDiagnostics};
 use dicom_core::Tag;
 use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry};
 use dicom_dictionary_std::StandardDataDictionary;
@@ -13,26 +13,37 @@ pub fn run_meta_viewer(paths: Vec<String>) {
 pub fn run_meta_viewer_with_mode(paths: Vec<String>, mode: MetadataReadMode) {
     // load metadata maps
     let mut comps: Vec<(String, HashMap<String, String>)> = Vec::new();
+    let mut diagnostics: Vec<(String, ExtractionDiagnostics)> = Vec::new();
+    
     for p in &paths {
-        let result = match mode {
-            MetadataReadMode::Simple => read_metadata_all(std::path::Path::new(p)),
-            MetadataReadMode::InDepth => read_metadata_in_depth(std::path::Path::new(p)),
-        };
-        match result {
-            Ok(map) => comps.push((p.clone(), map)),
-            Err(e) => comps.push((p.clone(), {
-                let mut m = HashMap::new(); m.insert("error".to_string(), e); m
-            })),
+        match read_metadata_with_diagnostics(std::path::Path::new(p), mode) {
+            Ok((map, diags)) => {
+                comps.push((p.clone(), map));
+                diagnostics.push((p.clone(), diags));
+            }
+            Err(e) => {
+                let mut m = HashMap::new(); 
+                m.insert("error".to_string(), e.clone());
+                comps.push((p.clone(), m));
+                diagnostics.push((p.clone(), ExtractionDiagnostics {
+                    failed_sequences: vec![],
+                    failed_elements: vec![],
+                    successful_count: 0,
+                    summary: format!("Error loading file: {}", e),
+                }));
+            }
         }
     }
 
     let app = MetaApp {
         comps,
+        diagnostics,
         expanded_keys: HashSet::new(),
         filter: String::new(),
         identifiable_only: false,
         full_open: false,
         full_text: String::new(),
+        show_diagnostics: false,
     };
     let native_options = eframe::NativeOptions::default();
     eframe::run_native("DICOM Metadata Viewer", native_options, Box::new(|_cc| Ok(Box::new(app)))).ok();
@@ -394,11 +405,13 @@ struct DivueApp {
     read_mode: MetadataReadMode,
     show_comparison: bool,
     comps: Vec<(String, HashMap<String, String>)>,
+    diagnostics: Vec<(String, ExtractionDiagnostics)>,
     expanded_keys: HashSet<String>,
     filter: String,
     identifiable_only: bool,
     full_open: bool,
     full_text: String,
+    show_diagnostics: bool,
 }
 
 impl DivueApp {
@@ -408,29 +421,37 @@ impl DivueApp {
             read_mode: MetadataReadMode::InDepth,
             show_comparison: false,
             comps: Vec::new(),
+            diagnostics: Vec::new(),
             expanded_keys: HashSet::new(),
             filter: String::new(),
             identifiable_only: false,
             full_open: false,
             full_text: String::new(),
+            show_diagnostics: false,
         }
     }
 
     fn load_files(&mut self) {
         self.comps.clear();
+        self.diagnostics.clear();
         self.expanded_keys.clear();
         for selected_file in &self.selected_files {
             if let Some(path_str) = selected_file.to_str() {
-                let result = match self.read_mode {
-                    MetadataReadMode::Simple => read_metadata_all(selected_file),
-                    MetadataReadMode::InDepth => read_metadata_in_depth(selected_file),
-                };
-                match result {
-                    Ok(map) => self.comps.push((path_str.to_string(), map)),
+                match read_metadata_with_diagnostics(selected_file, self.read_mode) {
+                    Ok((map, diags)) => {
+                        self.comps.push((path_str.to_string(), map));
+                        self.diagnostics.push((path_str.to_string(), diags));
+                    }
                     Err(e) => {
                         let mut m = HashMap::new();
-                        m.insert("error".to_string(), e);
+                        m.insert("error".to_string(), e.clone());
                         self.comps.push((path_str.to_string(), m));
+                        self.diagnostics.push((path_str.to_string(), ExtractionDiagnostics {
+                            failed_sequences: vec![],
+                            failed_elements: vec![],
+                            successful_count: 0,
+                            summary: format!("Error loading file: {}", e),
+                        }));
                     }
                 }
             }
@@ -440,6 +461,7 @@ impl DivueApp {
     fn go_back_to_selection(&mut self) {
         self.show_comparison = false;
         self.comps.clear();
+        self.diagnostics.clear();
         self.expanded_keys.clear();
         self.filter.clear();
         self.full_open = false;
@@ -629,6 +651,40 @@ impl DivueApp {
         });
         ui.checkbox(&mut self.identifiable_only, "Only show rows likely to contain identifiable data")
             .on_hover_text("Heuristic filter based on DICOM tag names and suspicious values such as IDs, emails, or long digit strings.");
+        
+        if ui.button("📋 Extraction Diagnostics").clicked() {
+            self.show_diagnostics = !self.show_diagnostics;
+        }
+
+        if self.show_diagnostics {
+            egui::CollapsingHeader::new("Extraction Diagnostics")
+                .default_open(true)
+                .show(ui, |ui| {
+                    for (file_path, diags) in &self.diagnostics {
+                        ui.label(format!("📄 {}", file_path));
+                        ui.indent("diag_indent", |ui| {
+                            ui.label(format!("Summary: {}", diags.summary));
+                            if !diags.failed_sequences.is_empty() {
+                                ui.label(format!("Failed Sequences ({}):", diags.failed_sequences.len()));
+                                ui.indent("seq_list", |ui| {
+                                    for (path, reason) in &diags.failed_sequences {
+                                        ui.label(format!("  ❌ {}: {}", path, reason));
+                                    }
+                                });
+                            }
+                            if !diags.failed_elements.is_empty() {
+                                ui.label(format!("Failed Elements ({}):", diags.failed_elements.len()));
+                                ui.indent("elem_list", |ui| {
+                                    for (path, reason) in &diags.failed_elements {
+                                        ui.label(format!("  ❌ {}: {}", path, reason));
+                                    }
+                                });
+                            }
+                        });
+                        ui.separator();
+                    }
+                });
+        }
 
         // build union of keys preserving order
     let mut all_keys = build_key_union(&self.comps);
@@ -714,11 +770,13 @@ impl DivueApp {
 
 struct MetaApp {
     comps: Vec<(String, HashMap<String, String>)>,
+    diagnostics: Vec<(String, ExtractionDiagnostics)>,
     expanded_keys: HashSet<String>,
     filter: String,
     identifiable_only: bool,
     full_open: bool,
     full_text: String,
+    show_diagnostics: bool,
 }
 
 impl eframe::App for MetaApp {
@@ -737,6 +795,40 @@ impl eframe::App for MetaApp {
             });
             ui.checkbox(&mut self.identifiable_only, "Only show rows likely to contain identifiable data")
                 .on_hover_text("Heuristic filter based on DICOM tag names and suspicious values such as IDs, emails, or long digit strings.");
+            
+            if ui.button("📋 Extraction Diagnostics").clicked() {
+                self.show_diagnostics = !self.show_diagnostics;
+            }
+
+            if self.show_diagnostics {
+                egui::CollapsingHeader::new("Extraction Diagnostics")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for (file_path, diags) in &self.diagnostics {
+                            ui.label(format!("📄 {}", file_path));
+                            ui.indent("diag_indent", |ui| {
+                                ui.label(format!("Summary: {}", diags.summary));
+                                if !diags.failed_sequences.is_empty() {
+                                    ui.label(format!("Failed Sequences ({}):", diags.failed_sequences.len()));
+                                    ui.indent("seq_list", |ui| {
+                                        for (path, reason) in &diags.failed_sequences {
+                                            ui.label(format!("  ❌ {}: {}", path, reason));
+                                        }
+                                    });
+                                }
+                                if !diags.failed_elements.is_empty() {
+                                    ui.label(format!("Failed Elements ({}):", diags.failed_elements.len()));
+                                    ui.indent("elem_list", |ui| {
+                                        for (path, reason) in &diags.failed_elements {
+                                            ui.label(format!("  ❌ {}: {}", path, reason));
+                                        }
+                                    });
+                                }
+                            });
+                            ui.separator();
+                        }
+                    });
+            }
 
             // build union of keys preserving order
             let mut all_keys = build_key_union(&self.comps);
