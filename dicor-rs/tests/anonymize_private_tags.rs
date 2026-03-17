@@ -7,16 +7,18 @@ use std::fs::copy as copy_file;
 
 fn copy_third_party_fixture(rel_path: &str, dest: &std::path::Path) {
     use std::path::Path;
+    // Use only the vendored fixture copied into this crate under `tests/fixtures`.
+    // Original source: upstream `dicognito` tests —
+    // `third_party/dicognito/tests/orig_data/test_mitra_global_patient_id_is_updated/global_patient_id_implicit_vr.dcm`.
+    // The file was copied into this repo to avoid submodule dependence.
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let fname = Path::new(rel_path).file_name().expect("filename");
     let vendored = manifest.join("tests").join("fixtures").join(fname);
-    let fixture_path = if vendored.exists() {
-        vendored
-    } else {
-        manifest.join("..").join(rel_path)
-    };
+    if !vendored.exists() {
+        panic!("Vendored fixture not found: {}", vendored.display());
+    }
     std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
-    copy_file(&fixture_path, dest).expect("copy third_party fixture");
+    copy_file(&vendored, dest).expect("copy vendored fixture");
 }
 
 fn make_file_with_element(path: &std::path::Path, tag: Tag, vr: VR, val: &str, sop_uid: &str) {
