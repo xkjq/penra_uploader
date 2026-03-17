@@ -35,6 +35,21 @@ fn no_plaintext_phi_in_output() {
 
     file_obj.write_to_file(&in_path).expect("write input DICOM");
 
+    // Verify the input file contains the PHI strings (sanity check)
+    let in_bytes = std::fs::read(&in_path).expect("read input");
+    let in_text = String::from_utf8_lossy(&in_bytes).to_lowercase();
+    let forbidden = vec![
+        "confidential^alice",
+        "pat999",
+        "19900101",
+        "555-123-4567",
+        "alice@example.com",
+        "dr.^who",
+    ];
+    for s in &forbidden {
+        assert!(in_text.contains(s), "Expected input to contain plaintext '{}', but it did not", s);
+    }
+
     // Run anonymiser
     let res = anonymize_file(&in_path, &out_dir, false, false, false, None).expect("anonymize");
     assert!(res.exists());
