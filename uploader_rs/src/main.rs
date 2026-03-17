@@ -293,9 +293,10 @@ impl eframe::App for AppState {
                     });
                 }
 
-                if ui.button("Import from folder").clicked() {
-                    // Pick a source folder and copy .dcm files into the export dir in background
-                    if let Some(src) = FileDialog::new().pick_folder() {
+                ui.group(|ui| {
+                    if ui.button("Import from folder").clicked() {
+                        // Pick a source folder and copy .dcm files into the export dir in background
+                        if let Some(src) = FileDialog::new().pick_folder() {
                         let do_move = self.move_files;
                         let seed_clone = self.seed.clone();
                         let depth = self.recurse_depth;
@@ -400,19 +401,20 @@ impl eframe::App for AppState {
                     } else {
                         self.last_msg = "No folder selected".to_string();
                     }
-                }
+                    }
 
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.move_files, "Move files (don\'t keep originals)");
-                    ui.add(egui::widgets::DragValue::new(&mut self.recurse_depth).clamp_range(-1..=100).speed(1.0));
-                    ui.label("Recursion depth (-1 = infinite)");
-                });
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.notify_on_process, "Notify exporters after processing");
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Extension filter (empty = try all files):");
-                    ui.text_edit_singleline(&mut self.ext_filter);
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.move_files, "Move files (don\'t keep originals)");
+                        ui.add(egui::widgets::DragValue::new(&mut self.recurse_depth).clamp_range(-1..=100).speed(1.0));
+                        ui.label("Recursion depth (-1 = infinite)");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.notify_on_process, "Notify exporters after processing");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Extension filter (empty = try all files):");
+                        ui.text_edit_singleline(&mut self.ext_filter);
+                    });
                 });
 
                 
