@@ -1,0 +1,19 @@
+[package]
+name = "dicom-view"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.33"
+egui = "0.33"
+dicom-object = "0.6"
+dicom-core = "0.6"
+rfd = "0.17"
+
+[[bin]]
+name = "dicom-view"
+path = "src/main.rs"
+
+[lib]
+name = "dicom_view_app"
+path = "src/lib.rs"
