@@ -6,8 +6,15 @@ use tempfile::tempdir;
 use std::fs::copy as copy_file;
 
 fn copy_third_party_fixture(rel_path: &str, dest: &std::path::Path) {
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    let fixture_path = repo_root.join(rel_path);
+    use std::path::Path;
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fname = Path::new(rel_path).file_name().expect("filename");
+    let vendored = manifest.join("tests").join("fixtures").join(fname);
+    let fixture_path = if vendored.exists() {
+        vendored
+    } else {
+        manifest.join("..").join(rel_path)
+    };
     std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
     copy_file(&fixture_path, dest).expect("copy third_party fixture");
 }
