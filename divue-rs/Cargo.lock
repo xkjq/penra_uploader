@@ -622,7 +622,9 @@ version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
 dependencies = [
+ "iana-time-zone",
  "num-traits",
+ "windows-link 0.2.1",
 ]
 
 [[package]]
@@ -778,11 +780,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "935961b4cd45b51d3f61a61ca0da300506fa6b80d7653cdec2a3635672a490af"
 dependencies = [
  "chrono",
- "itertools",
+ "itertools 0.12.1",
  "num-traits",
  "safe-transmute",
  "smallvec",
- "snafu",
+ "snafu 0.7.5",
+]
+
+[[package]]
+name = "dicom-core"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31f6e9f0a581bffa2630b1bd381d8114b09b3f66d1ed76ab924104ad153e0c59"
+dependencies = [
+ "chrono",
+ "either",
+ "itertools 0.14.0",
+ "num-traits",
+ "safe-transmute",
+ "smallvec",
+ "snafu 0.8.9",
 ]
 
 [[package]]
@@ -791,7 +808,17 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e3032f0a8030641fb0dc7b316cf8d096c0fe1d7e365058c563ffbab67e6cccc"
 dependencies = [
- "dicom-core",
+ "dicom-core 0.6.3",
+ "once_cell",
+]
+
+[[package]]
+name = "dicom-dictionary-std"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "057250ea38d2e716cfde2f0c211f07c53be307c98b2bc6bf0e4f330f8e506968"
+dependencies = [
+ "dicom-core 0.9.0",
  "once_cell",
 ]
 
@@ -802,10 +829,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8a391dcae5610110274aad781ec3f8a45b79864321d9cc30da0783fcf11dec3"
 dependencies = [
  "byteordered",
- "dicom-core",
- "dicom-dictionary-std",
+ "dicom-core 0.6.3",
+ "dicom-dictionary-std 0.6.1",
  "encoding",
- "snafu",
+ "snafu 0.7.5",
 ]
 
 [[package]]
@@ -815,14 +842,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8969380c67c72ecf85d1b5b39926bd4876a7a0e7c0c5ea029a0231f024eb17cd"
 dependencies = [
  "byteordered",
- "dicom-core",
- "dicom-dictionary-std",
+ "dicom-core 0.6.3",
+ "dicom-dictionary-std 0.6.1",
  "dicom-encoding",
  "dicom-parser",
  "dicom-transfer-syntax-registry",
- "itertools",
+ "itertools 0.12.1",
  "smallvec",
- "snafu",
+ "snafu 0.7.5",
  "tracing",
 ]
 
@@ -833,11 +860,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b47e080ca7cb9a10abf1a444e9c6c237e59f5f499353b01464fdfdea75c4391"
 dependencies = [
  "chrono",
- "dicom-core",
- "dicom-dictionary-std",
+ "dicom-core 0.6.3",
+ "dicom-dictionary-std 0.6.1",
  "dicom-encoding",
  "smallvec",
- "snafu",
+ "snafu 0.7.5",
  "tracing",
 ]
 
@@ -848,7 +875,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35bd8c14bcfbd43c71f0769ef92838ad4d193093dbe89617ab9b52bd53341202"
 dependencies = [
  "byteordered",
- "dicom-core",
+ "dicom-core 0.6.3",
  "dicom-encoding",
  "jpeg-decoder",
  "jpeg-encoder",
@@ -860,7 +887,7 @@ dependencies = [
 name = "dicom_viewer"
 version = "0.1.0"
 dependencies = [
- "dicom-core",
+ "dicom-core 0.6.3",
  "dicom-object",
 ]
 
@@ -897,6 +924,8 @@ dependencies = [
 name = "divue-rs"
 version = "0.1.0"
 dependencies = [
+ "dicom-core 0.9.0",
+ "dicom-dictionary-std 0.9.0",
  "dicom_viewer",
  "eframe",
  "egui",
@@ -1624,6 +1653,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
+name = "iana-time-zone"
+version = "0.1.65"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e31bc9ad994ba00e440a8aa5c9ef0ec67d5cb5e5cb0cc7f8b744a35b389cc470"
+dependencies = [
+ "android_system_properties",
+ "core-foundation-sys",
+ "iana-time-zone-haiku",
+ "js-sys",
+ "log",
+ "wasm-bindgen",
+ "windows-core 0.61.2",
+]
+
+[[package]]
+name = "iana-time-zone-haiku"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "icu_collections"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1762,6 +1815,15 @@ name = "itertools"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
 dependencies = [
  "either",
 ]
@@ -3089,7 +3151,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4de37ad025c587a29e8f3f5605c00f70b98715ef90b9061a815b9e59e9042d6"
 dependencies = [
  "doc-comment",
- "snafu-derive",
+ "snafu-derive 0.7.5",
+]
+
+[[package]]
+name = "snafu"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e84b3f4eacbf3a1ce05eac6763b4d629d60cbc94d632e4092c54ade71f1e1a2"
+dependencies = [
+ "snafu-derive 0.8.9",
 ]
 
 [[package]]
@@ -3102,6 +3173,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "snafu-derive"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

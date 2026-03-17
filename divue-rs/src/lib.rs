@@ -2,6 +2,8 @@ use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use dicom_viewer::{read_metadata_all, read_metadata_in_depth, MetadataReadMode};
+use dicom_core::Tag;
+use dicom_dictionary_std;
 
 pub fn run_meta_viewer(paths: Vec<String>) {
     run_meta_viewer_with_mode(paths, MetadataReadMode::Simple);
@@ -105,6 +107,26 @@ pub fn truncate_string(s: &str, max_len: usize) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Format a tag key with human-readable name if possible.
+/// For hex format "GGGG,EEEE", looks up the tag in the DICOM dictionary.
+/// For friendly labels like "PatientName", leaves them as-is.
+fn get_formatted_tag_name(key: &str) -> String {
+    // Try to parse as hex format "GGGG,EEEE"
+    if let Some((group_str, elem_str)) = key.split_once(',') {
+        if let (Ok(g), Ok(e)) = (u16::from_str_radix(group_str, 16), u16::from_str_radix(elem_str, 16)) {
+            let tag = Tag(g, e);
+            if let Some(entry) = dicom_dictionary_std::from_tag(tag) {
+                let name = entry.name();
+                if name != "Unknown Tag" { // Skip if dictionary doesn't have a real name
+                    return format!("{} ({})", name, key);
+                }
+            }
+        }
+    }
+    // Return original key for friendly labels or if tag lookup failed
+    key.to_string()
 }
 
 /// App state that manages both file selection and comparison views
@@ -369,7 +391,7 @@ impl DivueApp {
                     .spacing([8.0, 4.0])
                     .show(ui, |ui| {
                         for k in &keys {
-                            ui.label(k);
+                            ui.label(get_formatted_tag_name(k));
                             // collect values for this key
                             let mut vals: Vec<Option<String>> = Vec::new();
                             for (_name, map) in &self.comps {
@@ -454,7 +476,7 @@ impl eframe::App for MetaApp {
             egui::ScrollArea::vertical().max_height(900.0).show(ui, |ui| {
                 egui::Grid::new("meta_rows").num_columns(1 + self.comps.len()).spacing([8.0, 4.0]).show(ui, |ui| {
                     for k in &keys {
-                        ui.label(k);
+                        ui.label(get_formatted_tag_name(k));
                         // collect values for this key
                         let mut vals: Vec<Option<String>> = Vec::new();
                         for (_name, map) in &self.comps {
