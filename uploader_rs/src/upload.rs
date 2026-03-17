@@ -476,8 +476,21 @@ pub fn scan_for_upload(anon_dir: &Path) -> Result<Vec<SeriesInfo>, String> {
     let rd = std::fs::read_dir(anon_dir).map_err(|e| format!("read_dir failed: {}", e))?;
     for e in rd.flatten() {
         let p = e.path();
-        if p.is_file() && p.extension().map(|ex| ex.eq_ignore_ascii_case("dcm")).unwrap_or(false) {
-            files.push(p);
+        if p.is_file() {
+            // Accept files that either have a .dcm extension or can be opened as DICOM
+            let mut accept = false;
+            if p.extension().map(|ex| ex.eq_ignore_ascii_case("dcm")).unwrap_or(false) {
+                accept = true;
+            } else {
+                // try opening as DICOM; if it succeeds, include
+                if open_file(&p).is_ok() {
+                    accept = true;
+                }
+            }
+
+            if accept {
+                files.push(p);
+            }
         }
     }
 
