@@ -3,10 +3,10 @@ use blake3;
 use chrono::{NaiveDate, Duration, NaiveTime, Timelike};
 use dicom_core::header::{VR, Header};
 use num_bigint::BigUint;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::fs::File;
-use std::collections::HashMap;
 
 fn hash_bytes(input: &str) -> [u8; 16] {
     let mut out = [0u8; 16];
@@ -36,7 +36,241 @@ fn shift_date_by_study(study_uid: &str, seed: Option<&str>) -> i64 {
     offset
 }
 
-pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, seed: Option<&str>) -> Result<PathBuf, String> {
+fn process_inmem_top<D: dicom_core::DataDictionary + Clone>(
+    ds: &mut dicom_object::InMemDicomObject<D>,
+    study_uid: &str,
+    preserve_private: bool,
+    seed: Option<&str>,
+    clear_tags: &Vec<Tag>,
+    date_tags: &Vec<Tag>,
+    map: &mut HashMap<String,String>,
+    text_vrs: &Vec<VR>,
+    vr_whitelist: &Vec<Tag>
+) {
+    use dicom_core::value::Value;
+    let mut to_remove: Vec<Tag> = Vec::new();
+    let mut seq_tags: Vec<Tag> = Vec::new();
+    let mut puts: Vec<(Tag, VR, String)> = Vec::new();
+
+    for el in ds.iter() {
+        let t = el.tag();
+        let group = t.0;
+
+        if (group & 1) == 1 {
+            if preserve_private {
+                // MITRA special-case
+                let mitra_group = 0x0031u16;
+                let mitra_element_low = 0x0020u16;
+                if group == mitra_group && (t.1 & 0x00FF) == mitra_element_low {
+                    let private_tag_group = (t.1 >> 8) as u16;
+                    let creator_tag = Tag(mitra_group, private_tag_group);
+                    if let Ok(creator_el) = ds.element(creator_tag) {
+                        if let Ok(s) = creator_el.to_str() {
+                            if s == "MITRA LINKED ATTRIBUTES 1.0" {
+                                let orig = el.to_str().ok().map(|s| s.to_string()).unwrap_or_else(|| String::new());
+                                let hb = hash_bytes(orig.as_ref());
+                                let new_uid = uid_from_hash_bytes(&hb);
+                                puts.push((t, VR::LO, new_uid));
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        if clear_tags.contains(&t) {
+            if el.vr() == VR::SQ {
+                to_remove.push(t);
+            } else {
+                puts.push((t, el.vr(), "".to_string()));
+            }
+            continue;
+        }
+
+        if el.vr() == VR::UI {
+            if let Ok(s) = el.to_str() {
+                let hb = hash_bytes(s.as_ref());
+                let new_uid = uid_from_hash_bytes(&hb);
+                map.insert(format!("UID:{}", s), new_uid.clone());
+                puts.push((t, VR::UI, new_uid));
+                continue;
+            }
+        }
+
+        if text_vrs.contains(&el.vr()) && !vr_whitelist.contains(&t) {
+            puts.push((t, el.vr(), "".to_string()));
+            continue;
+        }
+
+        if el.vr() == VR::DA || date_tags.contains(&t) {
+            if let Ok(s) = el.to_str() {
+                if s.len() >= 8 {
+                    let date_part = &s[0..8];
+                    if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
+                        let shifted = dt + Duration::days(shift_date_by_study(study_uid, seed));
+                        let new = shifted.format("%Y%m%d").to_string();
+                        puts.push((t, VR::DA, new));
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if el.vr() == VR::DT {
+            if let Ok(s) = el.to_str() {
+                if s.len() >= 8 {
+                    let date_part = &s[0..8];
+                    if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
+                        let shifted = dt + Duration::days(shift_date_by_study(study_uid, seed));
+                        let new_date = shifted.format("%Y%m%d").to_string();
+                        let mut new = s.to_string();
+                        new.replace_range(0..8, &new_date);
+                        puts.push((t, VR::DT, new));
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if el.vr() == VR::TM || t == Tag(0x0010,0x0032) {
+            if let Ok(s) = el.to_str() {
+                let patterns = ["%H%M%S", "%H%M", "%H:%M:%S"];
+                let mut parsed: Option<NaiveTime> = None;
+                for p in &patterns {
+                    if let Ok(tm) = NaiveTime::parse_from_str(&s, p) {
+                        parsed = Some(tm);
+                        break;
+                    }
+                }
+                if let Some(tm) = parsed {
+                    let minutes = (shift_date_by_study(study_uid, seed) % 1440) as i64;
+                    let shifted_time = tm + Duration::minutes(minutes);
+                    let secs = shifted_time.num_seconds_from_midnight();
+                    let new = NaiveTime::from_num_seconds_from_midnight_opt(secs, 0).map(|t| t.format("%H%M%S").to_string()).unwrap_or_else(|| s.to_string());
+                    puts.push((t, VR::TM, new));
+                    continue;
+                }
+            }
+        }
+
+        if el.vr() == VR::SQ {
+            seq_tags.push(t);
+        }
+    }
+
+    for t in to_remove {
+        let _ = ds.remove_element(t);
+    }
+
+    for (t, vr, val) in puts {
+        let _ = ds.put_str(t, vr, &val);
+    }
+
+    for t in seq_tags {
+        let _ = ds.update_value(t, |v| {
+            if let Some(items) = v.items_mut() {
+                for item in items.iter_mut() {
+                    process_inmem_top(item, study_uid, preserve_private, seed, clear_tags, date_tags, map, text_vrs, vr_whitelist);
+                }
+            }
+        });
+    }
+}
+
+fn process_file<D: dicom_core::DataDictionary + Clone>(
+    ds: &mut dicom_object::FileDicomObject<dicom_object::InMemDicomObject<D>>,
+    study_uid: &str,
+    preserve_private: bool,
+    seed: Option<&str>,
+    clear_tags: &Vec<Tag>,
+    date_tags: &Vec<Tag>,
+    map: &mut HashMap<String,String>,
+    text_vrs: &Vec<VR>,
+    vr_whitelist: &Vec<Tag>
+) {
+    use dicom_core::value::Value;
+    let mut to_remove: Vec<Tag> = Vec::new();
+    let mut seq_tags: Vec<Tag> = Vec::new();
+    let mut puts: Vec<(Tag, VR, String)> = Vec::new();
+
+    for el in ds.iter() {
+        let t = el.tag();
+        if clear_tags.contains(&t) {
+            if el.vr() == VR::SQ {
+                to_remove.push(t);
+            } else {
+                puts.push((t, el.vr(), "".to_string()));
+            }
+            continue;
+        }
+        if el.vr() == VR::UI {
+            if let Ok(s) = el.to_str() {
+                let hb = hash_bytes(s.as_ref());
+                let new_uid = uid_from_hash_bytes(&hb);
+                map.insert(format!("UID:{}", s), new_uid.clone());
+                puts.push((t, VR::UI, new_uid));
+                continue;
+            }
+        }
+        if text_vrs.contains(&el.vr()) && !vr_whitelist.contains(&t) {
+            puts.push((t, el.vr(), "".to_string()));
+            continue;
+        }
+        if el.vr() == VR::DA || date_tags.contains(&t) {
+            if let Ok(s) = el.to_str() {
+                if s.len() >= 8 {
+                    let date_part = &s[0..8];
+                    if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
+                        let shifted = dt + Duration::days(shift_date_by_study(study_uid, seed));
+                        let new = shifted.format("%Y%m%d").to_string();
+                        puts.push((t, VR::DA, new));
+                        continue;
+                    }
+                }
+            }
+        }
+        if el.vr() == VR::DT {
+            if let Ok(s) = el.to_str() {
+                if s.len() >= 8 {
+                    let date_part = &s[0..8];
+                    if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
+                        let shifted = dt + Duration::days(shift_date_by_study(study_uid, seed));
+                        let new_date = shifted.format("%Y%m%d").to_string();
+                        let mut new = s.to_string();
+                        new.replace_range(0..8, &new_date);
+                        puts.push((t, VR::DT, new));
+                        continue;
+                    }
+                }
+            }
+        }
+        if el.vr() == VR::SQ {
+            seq_tags.push(t);
+        }
+    }
+
+    for t in to_remove {
+        let _ = ds.remove_element(t);
+    }
+
+    for (t, vr, val) in puts {
+        let _ = ds.put_str(t, vr, &val);
+    }
+
+    for t in seq_tags {
+        let _ = ds.update_value(t, |v| {
+            if let Some(items) = v.items_mut() {
+                for item in items.iter_mut() {
+                    process_inmem_top(item, study_uid, preserve_private, seed, clear_tags, date_tags, map, text_vrs, vr_whitelist);
+                }
+            }
+        });
+    }
+}
+
+pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, preserve_private: bool, seed: Option<&str>) -> Result<PathBuf, String> {
     let mut obj: FileDicomObject<_> = open_file(input).map_err(|e| format!("Failed to open DICOM: {}", e))?;
 
     let study_uid = obj.element(Tag(0x0020, 0x000D)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()).unwrap_or_else(|| "NO_STUDY_UID".to_string());
@@ -53,6 +287,20 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
     let mut map: HashMap<String, String> = HashMap::new();
     map.insert(format!("PatientName:{}", pat_name), pn.clone());
     map.insert(format!("PatientID:{}", pid), pid.clone());
+
+    // Collect private-group tags; if not preserving, remove them now
+    let mut private_tags: Vec<Tag> = Vec::new();
+    for el in obj.iter() {
+        let t = el.tag();
+        if (t.0 & 1) == 1 {
+            private_tags.push(t);
+        }
+    }
+    if !preserve_private {
+        for t in &private_tags {
+            let _ = obj.remove_element(*t);
+        }
+    }
 
     let shift_days = shift_date_by_study(&study_uid, seed);
 
@@ -108,217 +356,7 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
     let text_vrs = vec![VR::UT, VR::LT, VR::SH, VR::LO, VR::PN];
     let vr_whitelist = vec![Tag(0x0010,0x0010), Tag(0x0010,0x0020)];
 
-    fn process_inmem<D: dicom_core::DataDictionary + Clone>(ds: &mut InMemDicomObject<D>, study_uid: &str, seed: Option<&str>, clear_tags: &Vec<Tag>, date_tags: &Vec<Tag>, map: &mut HashMap<String,String>, text_vrs: &Vec<VR>, vr_whitelist: &Vec<Tag>) {
-        use dicom_core::value::Value;
-
-        let mut to_remove: Vec<Tag> = Vec::new();
-        let mut seq_tags: Vec<Tag> = Vec::new();
-        let mut puts: Vec<(Tag, VR, String)> = Vec::new();
-
-        for el in ds.iter() {
-            let t = el.tag();
-            let group = t.0;
-            if (group & 1) == 1 {
-                to_remove.push(t);
-                continue;
-            }
-            if clear_tags.contains(&t) {
-                if el.vr() == VR::SQ {
-                    to_remove.push(t);
-                } else {
-                    puts.push((t, el.vr(), "".to_string()));
-                }
-                continue;
-            }
-            if el.vr() == VR::UI {
-                if let Ok(s) = el.to_str() {
-                    let hb = hash_bytes(s.as_ref());
-                    let new_uid = uid_from_hash_bytes(&hb);
-                    map.insert(format!("UID:{}", s), new_uid.clone());
-                    puts.push((t, VR::UI, new_uid));
-                    continue;
-                }
-            }
-            if text_vrs.contains(&el.vr()) && !vr_whitelist.contains(&t) {
-                puts.push((t, el.vr(), "".to_string()));
-                continue;
-            }
-            if el.vr() == VR::DA || date_tags.contains(&t) {
-                if let Ok(s) = el.to_str() {
-                    if s.len() >= 8 {
-                        let date_part = &s[0..8];
-                        if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
-                            let shifted = dt + Duration::days(shift_date_by_study(study_uid, seed));
-                            let new = shifted.format("%Y%m%d").to_string();
-                            puts.push((t, VR::DA, new));
-                            continue;
-                        }
-                    }
-                }
-            }
-            if el.vr() == VR::DT {
-                if let Ok(s) = el.to_str() {
-                    if s.len() >= 8 {
-                        let date_part = &s[0..8];
-                        if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
-                            let shifted = dt + Duration::days(shift_date_by_study(study_uid, seed));
-                            let new_date = shifted.format("%Y%m%d").to_string();
-                            let mut new = s.to_string();
-                            new.replace_range(0..8, &new_date);
-                            puts.push((t, VR::DT, new));
-                            continue;
-                        }
-                    }
-                }
-            }
-            if el.vr() == VR::TM || t == Tag(0x0010,0x0032) {
-                if let Ok(s) = el.to_str() {
-                    let patterns = ["%H%M%S", "%H%M", "%H:%M:%S"];
-                    let mut parsed: Option<NaiveTime> = None;
-                    for p in &patterns {
-                        if let Ok(tm) = NaiveTime::parse_from_str(&s, p) {
-                            parsed = Some(tm);
-                            break;
-                        }
-                    }
-                    if let Some(tm) = parsed {
-                        let minutes = (shift_date_by_study(study_uid, seed) % 1440) as i64;
-                        let shifted_time = tm + Duration::minutes(minutes);
-                        let secs = shifted_time.num_seconds_from_midnight();
-                        let new = NaiveTime::from_num_seconds_from_midnight_opt(secs, 0).map(|t| t.format("%H%M%S").to_string()).unwrap_or_else(|| s.to_string());
-                        puts.push((t, VR::TM, new));
-                        continue;
-                    }
-                }
-            }
-            if el.vr() == VR::SQ {
-                seq_tags.push(t);
-            }
-        }
-
-        for t in to_remove {
-            let _ = ds.remove_element(t);
-        }
-
-        for (t, vr, val) in puts {
-            let _ = ds.put_str(t, vr, &val);
-        }
-
-        for t in seq_tags {
-            let _ = ds.update_value(t, |v| {
-                if let Some(items) = v.items_mut() {
-                    for item in items.iter_mut() {
-                        process_inmem(item, study_uid, seed, clear_tags, date_tags, map, text_vrs, vr_whitelist);
-                    }
-                }
-            });
-        }
-    }
-    fn process_file<D: dicom_core::DataDictionary + Clone>(ds: &mut dicom_object::FileDicomObject<dicom_object::InMemDicomObject<D>>, study_uid: &str, seed: Option<&str>, clear_tags: &Vec<Tag>, date_tags: &Vec<Tag>, map: &mut HashMap<String,String>, text_vrs: &Vec<VR>, vr_whitelist: &Vec<Tag>) {
-        use dicom_core::value::Value;
-        let mut to_remove: Vec<Tag> = Vec::new();
-        let mut seq_tags: Vec<Tag> = Vec::new();
-        let mut puts: Vec<(Tag, VR, String)> = Vec::new();
-
-        for el in ds.iter() {
-            let t = el.tag();
-            let group = t.0;
-            if (group & 1) == 1 {
-                to_remove.push(t);
-                continue;
-            }
-            if clear_tags.contains(&t) {
-                if el.vr() == VR::SQ {
-                    to_remove.push(t);
-                } else {
-                    puts.push((t, el.vr(), "".to_string()));
-                }
-                continue;
-            }
-            if el.vr() == VR::UI {
-                if let Ok(s) = el.to_str() {
-                    let hb = hash_bytes(s.as_ref());
-                    let new_uid = uid_from_hash_bytes(&hb);
-                    map.insert(format!("UID:{}", s), new_uid.clone());
-                    puts.push((t, VR::UI, new_uid));
-                    continue;
-                }
-            }
-            if text_vrs.contains(&el.vr()) && !vr_whitelist.contains(&t) {
-                puts.push((t, el.vr(), "".to_string()));
-                continue;
-            }
-            if el.vr() == VR::DA || date_tags.contains(&t) {
-                if let Ok(s) = el.to_str() {
-                    if s.len() >= 8 {
-                        let date_part = &s[0..8];
-                        if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
-                            let shifted = dt + Duration::days(shift_date_by_study(study_uid, seed));
-                            let new = shifted.format("%Y%m%d").to_string();
-                            puts.push((t, VR::DA, new));
-                            continue;
-                        }
-                    }
-                }
-            }
-            if el.vr() == VR::DT {
-                if let Ok(s) = el.to_str() {
-                    if s.len() >= 8 {
-                        let date_part = &s[0..8];
-                        if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
-                            let shifted = dt + Duration::days(shift_date_by_study(study_uid, seed));
-                            let new_date = shifted.format("%Y%m%d").to_string();
-                            let mut new = s.to_string();
-                            new.replace_range(0..8, &new_date);
-                            puts.push((t, VR::DT, new));
-                            continue;
-                        }
-                    }
-                }
-            }
-            if el.vr() == VR::TM || t == Tag(0x0010,0x0032) {
-                if let Ok(s) = el.to_str() {
-                    let patterns = ["%H%M%S", "%H%M", "%H:%M:%S"];
-                    let mut parsed: Option<NaiveTime> = None;
-                    for p in &patterns {
-                        if let Ok(tm) = NaiveTime::parse_from_str(&s, p) {
-                            parsed = Some(tm);
-                            break;
-                        }
-                    }
-                    if let Some(tm) = parsed {
-                        let minutes = (shift_date_by_study(study_uid, seed) % 1440) as i64;
-                        let shifted_time = tm + Duration::minutes(minutes);
-                        let secs = shifted_time.num_seconds_from_midnight();
-                        let new = NaiveTime::from_num_seconds_from_midnight_opt(secs, 0).map(|t| t.format("%H%M%S").to_string()).unwrap_or_else(|| s.to_string());
-                        puts.push((t, VR::TM, new));
-                        continue;
-                    }
-                }
-            }
-            if el.vr() == VR::SQ {
-                seq_tags.push(t);
-            }
-        }
-
-        for t in to_remove {
-            let _ = ds.remove_element(t);
-        }
-
-        for (t, vr, val) in puts {
-            let _ = ds.put_str(t, vr, &val);
-        }
-
-        for t in seq_tags {
-            let _ = ds.update_value(t, |v| {
-                if let Some(items) = v.items_mut() {
-                    for item in items.iter_mut() {
-                        process_inmem(item, study_uid, seed, clear_tags, date_tags, map, text_vrs, vr_whitelist);
-                    }
-                }
-            });
-        }
-    }
+    
 
     for tag in &clear_tags {
         if let Ok(elem) = obj.element(*tag) {
@@ -352,14 +390,39 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
     if let Ok(_) = obj.element(Tag(0x0040,0xA730)) {
         let _ = obj.update_value(Tag(0x0040,0xA730), |v| {
             if let Some(items) = v.items_mut() {
-                for item in items.iter_mut() {
-                    process_inmem(item, &study_uid, seed, &clear_tags, &date_tags, &mut map, &text_vrs, &vr_whitelist);
+                    for item in items.iter_mut() {
+                    process_inmem_top(item, &study_uid, preserve_private, seed, &clear_tags, &date_tags, &mut map, &text_vrs, &vr_whitelist);
                 }
             }
         });
     }
 
-    process_file(&mut obj, &study_uid, seed, &clear_tags, &date_tags, &mut map, &text_vrs, &vr_whitelist);
+    // If preserving private tags, handle MITRA private Global Patient ID at file root
+    if preserve_private {
+        for t in &private_tags {
+            if t.0 == 0x0031 && (t.1 & 0x00FF) == 0x0020 {
+                let private_tag_group = (t.1 >> 8) as u16;
+                let creator_tag = Tag(0x0031, private_tag_group);
+                if let Ok(creator_el) = obj.element(creator_tag) {
+                    if let Ok(s) = creator_el.to_str() {
+                        if s == "MITRA LINKED ATTRIBUTES 1.0" {
+                            if let Ok(el) = obj.element(*t) {
+                                let orig = el.to_str().ok().map(|s| s.to_string()).unwrap_or_else(|| String::new());
+                                let hb = hash_bytes(orig.as_ref());
+                                let new_uid = uid_from_hash_bytes(&hb);
+                                let _ = obj.put_str(*t, VR::LO, &new_uid);
+                                map.insert(format!("UID:{}", orig), new_uid.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    process_file(&mut obj, &study_uid, preserve_private, seed, &clear_tags, &date_tags, &mut map, &text_vrs, &vr_whitelist);
+
+    // (private tags restoration will be applied below)
 
     let date_tags = vec![Tag(0x0008,0x0020), Tag(0x0008,0x0021), Tag(0x0008,0x0022), Tag(0x0008,0x0023), Tag(0x0010,0x0030)];
     for tag in date_tags {

@@ -95,7 +95,7 @@ fn tags_are_anonymised() {
     make_test_file(&in_path);
 
     // call anonymizer
-    let res = anonymize_file(&in_path, &out_dir, false, None).expect("anonymize");
+    let res = anonymize_file(&in_path, &out_dir, false, false, None).expect("anonymize");
 
     // open result
     let out_file_path = res;

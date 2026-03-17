@@ -247,12 +247,12 @@ impl eframe::App for AppState {
                     // capture notify flag before moving into the thread
                     let notify_flag = self.notify_on_process;
                     let seed_clone = self.seed.clone();
-                    thread::spawn(move || {
+                                                match anonymize_file(&p, &anon_dir, true, false, seed_clone.as_deref()) {
                         if let Ok(entries) = fs::read_dir(&export) {
                             for ent in entries.flatten() {
                                 let p = ent.path();
                                 if p.extension().map(|e| e == "dcm").unwrap_or(false) {
-                                    match anonymize_file(&p, &anon_dir, true, seed_clone.as_deref()) {
+                                    match anonymize_file(&p, &anon_dir, true, false, seed_clone.as_deref()) {
                                         Ok(out) => {
                                             let _ = tx.send(format!("Anonymized: {}", out.display()));
                                             if let Ok(bytes) = fs::read(&out) {
@@ -275,7 +275,7 @@ impl eframe::App for AppState {
                             match Socket::new(Protocol::Pair0) {
                                 Ok(s) => {
                                     if s.dial("tcp://127.0.0.1:9976").is_ok() {
-                                        let _ = s.send(&b"loaded"[..]);
+                                            match anonymize_file(p, &anon_dir, true, false, seed_clone.as_deref()) {
                                         let _ = tx.send("Sent NNG 'loaded'".to_string());
                                     } else {
                                         let _ = tx.send("Failed to dial NNG socket".to_string());
@@ -296,7 +296,7 @@ impl eframe::App for AppState {
                                 }
                             }
                             Err(e) => { let _ = tx.send(format!("Post-process scan failed: {}", e)); }
-                        }
+                                    match anonymize_file(&src, &anon_dir2, true, false, seed2.as_deref()) {
 
                         let _ = tx.send("done".to_string());
                     });
@@ -367,7 +367,7 @@ impl eframe::App for AppState {
                                     let anon_dir = export.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
                                     for p in &copied_files {
                                         if p.extension().map(|e| e == "dcm").unwrap_or(false) {
-                                            match anonymize_file(p, &anon_dir, true, seed_clone.as_deref()) {
+                                            match anonymize_file(p, &anon_dir, true, false, seed_clone.as_deref()) {
                                                 Ok(out) => {
                                                     let _ = tx.send(format!("Anonymized: {}", out.display()));
                                                     if let Ok(bytes) = fs::read(&out) {
@@ -943,7 +943,7 @@ fn main() {
     if args.len() >= 4 && args[1] == "--anon" {
         let in_path = std::path::Path::new(&args[2]);
         let out_path = std::path::Path::new(&args[3]);
-        match anonymize_file(in_path, out_path.parent().unwrap_or_else(||std::path::Path::new(".")), false, None) {
+        match anonymize_file(in_path, out_path.parent().unwrap_or_else(||std::path::Path::new(".")), false, false, None) {
             Ok(p) => {
                 // if anonymizer wrote a file with same name under output dir, move/rename to requested path
                 if p != out_path {
@@ -1060,7 +1060,7 @@ fn main() {
                                     for (i, p) in std::fs::read_dir(&proc_dir).unwrap_or_else(|_| std::fs::read_dir(&export_dir2).unwrap()).flatten().enumerate() {
                                         let src = p.path();
                                         if src.extension().map(|s| s.to_string_lossy().eq_ignore_ascii_case("dcm")).unwrap_or(false) {
-                                            match anonymize_file(&src, &anon_dir2, true, seed2.as_deref()) {
+                                            match anonymize_file(&src, &anon_dir2, true, false, seed2.as_deref()) {
                                                 Ok(out) => {
                                                     let _ = tx2.send(format!("Anonymized: {}", out.display()));
                                                     // remove the source file from processing dir when anonymization succeeded

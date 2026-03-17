@@ -53,8 +53,8 @@ fn one_study_two_serieses_preserve_patient_and_study() {
     make_instance_full(&a, 1, 1, 1, 1);
     make_instance_full(&b, 1, 1, 2, 1);
 
-    let oa = anonymize_file(&a, &out, false, Some("")).expect("anonymize a");
-    let ob = anonymize_file(&b, &out, false, Some("")).expect("anonymize b");
+    let oa = anonymize_file(&a, &out, false, false, Some("")).expect("anonymize a");
+    let ob = anonymize_file(&b, &out, false, false, Some("")).expect("anonymize b");
 
     let ra = open_file(&oa).expect("open a");
     let rb = open_file(&ob).expect("open b");
@@ -78,8 +78,8 @@ fn two_patients_are_anonymized_differently() {
     make_instance_full(&a, 1, 1, 1, 1);
     make_instance_full(&b, 2, 1, 1, 1);
 
-    let oa = anonymize_file(&a, &out, false, None).expect("anonymize a");
-    let ob = anonymize_file(&b, &out, false, None).expect("anonymize b");
+    let oa = anonymize_file(&a, &out, false, false, None).expect("anonymize a");
+    let ob = anonymize_file(&b, &out, false, false, None).expect("anonymize b");
 
     let ra = open_file(&oa).expect("open a");
     let rb = open_file(&ob).expect("open b");
