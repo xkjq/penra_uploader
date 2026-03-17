@@ -3,6 +3,7 @@ use egui::Vec2;
 use dicom_object::{open_file, Tag};
 use dicom_pixeldata::PixelDecoder;
 use std::path::PathBuf;
+use std::sync::mpsc;
 
 const METADATA_TAGS: &[(Tag, &str)] = &[
     (Tag(0x0010, 0x0010), "Patient Name"),
@@ -101,6 +102,148 @@ struct LoadedImage {
     metadata: Vec<(String, String)>,
 }
 
+/// Message sent from the background loading thread to the UI thread.
+enum LoadMsg {
+    /// One file decoded successfully. `wc_ww` is set for Gray16 images.
+    Image {
+        image: LoadedImage,
+        wc_ww: Option<(f32, f32)>,
+        filename: String,
+    },
+    /// A file failed to decode.
+    Error(String),
+}
+
+struct LoadingState {
+    rx: mpsc::Receiver<LoadMsg>,
+    total: usize,
+    received: usize,
+    current_filename: String,
+}
+
+/// Decode a single DICOM file into a `LoadedImage`. Runs on a worker thread.
+fn decode_single_file(path: &PathBuf) -> Result<(LoadedImage, Option<(f32, f32)>), String> {
+    let obj = open_file(path)
+        .map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+
+    let mut metadata = Vec::new();
+    for (tag, label) in METADATA_TAGS {
+        if let Ok(elem) = obj.element(*tag) {
+            if let Ok(val) = elem.to_str() {
+                let val = val.trim().to_string();
+                if !val.is_empty() {
+                    metadata.push((label.to_string(), val));
+                }
+            }
+        }
+    }
+
+    let get_str = |tag: Tag| -> Option<String> {
+        obj.element(tag)
+            .ok()?
+            .to_str()
+            .ok()
+            .map(|s| s.trim().to_string())
+    };
+    let get_f32 = |tag: Tag| -> Option<f32> {
+        get_str(tag).and_then(|s| {
+            s.split('\\').next().and_then(|v| v.trim().parse::<f32>().ok())
+        })
+    };
+
+    let rescale_intercept = get_f32(Tag(0x0028, 0x1052)).unwrap_or(0.0);
+    let rescale_slope = get_f32(Tag(0x0028, 0x1053)).unwrap_or(1.0);
+    let wc_dicom = get_f32(Tag(0x0028, 0x1050));
+    let ww_dicom = get_f32(Tag(0x0028, 0x1051));
+
+    let pixel_data = obj
+        .decode_pixel_data()
+        .map_err(|e| format!("Failed to decode pixel data in {}: {}", path.display(), e))?;
+
+    let rows = pixel_data.rows() as usize;
+    let cols = pixel_data.columns() as usize;
+    let bits = pixel_data.bits_allocated();
+    let samples = pixel_data.samples_per_pixel();
+    let signed = matches!(
+        pixel_data.pixel_representation(),
+        dicom_pixeldata::PixelRepresentation::Signed
+    );
+    let bytes: &[u8] = pixel_data.data();
+
+    let raw_image = match (bits, samples) {
+        (8, 1) => {
+            if bytes.len() < rows * cols {
+                return Err("Pixel data buffer is too short".to_string());
+            }
+            RawImage::Gray8 {
+                data: bytes[..rows * cols].to_vec(),
+                width: cols,
+                height: rows,
+            }
+        }
+        (16, 1) => {
+            let expected = rows * cols * 2;
+            if bytes.len() < expected {
+                return Err(format!(
+                    "Pixel data buffer too short: {} bytes, expected {}",
+                    bytes.len(),
+                    expected
+                ));
+            }
+            let data: Vec<f32> = bytes
+                .chunks_exact(2)
+                .take(rows * cols)
+                .map(|c| {
+                    let raw_u16 = u16::from_le_bytes([c[0], c[1]]);
+                    let raw_val = if signed {
+                        (raw_u16 as i16) as f32
+                    } else {
+                        raw_u16 as f32
+                    };
+                    raw_val * rescale_slope + rescale_intercept
+                })
+                .collect();
+            RawImage::Gray16(Gray16 {
+                data,
+                width: cols,
+                height: rows,
+            })
+        }
+        (8, 3) => {
+            let expected = rows * cols * 3;
+            if bytes.len() < expected {
+                return Err("Pixel data buffer is too short".to_string());
+            }
+            RawImage::Rgb8 {
+                data: bytes[..expected].to_vec(),
+                width: cols,
+                height: rows,
+            }
+        }
+        _ => {
+            return Err(format!(
+                "Unsupported pixel format: {} bpp, {} samples per pixel",
+                bits, samples
+            ));
+        }
+    };
+
+    let wc_ww = if let RawImage::Gray16(ref g) = raw_image {
+        let (wc, ww) = if let (Some(wc), Some(ww)) = (wc_dicom, ww_dicom) {
+            (wc, ww)
+        } else {
+            let min = g.data.iter().cloned().fold(f32::MAX, f32::min);
+            let max = g.data.iter().cloned().fold(f32::MIN, f32::max);
+            ((min + max) / 2.0, (max - min).max(1.0))
+        };
+        Some((wc, ww))
+    } else {
+        None
+    };
+
+    Ok((LoadedImage { raw_image, metadata }, wc_ww))
+}
+
 struct DicomViewApp {
     pending_load: Option<Vec<PathBuf>>,
     images: Vec<LoadedImage>,
@@ -114,11 +257,12 @@ struct DicomViewApp {
     window_width: f32,
     wl_dirty: bool,
     files_hovered: bool,
+    loading: Option<LoadingState>,
 }
 
 impl DicomViewApp {
-    fn new(path: Option<PathBuf>) -> Self {
-        let pending_load = path.map(|p| vec![p]);
+    fn new(paths: Option<Vec<PathBuf>>) -> Self {
+        let pending_load = paths;
         Self {
             pending_load,
             images: Vec::new(),
@@ -132,10 +276,11 @@ impl DicomViewApp {
             window_width: 1.0,
             wl_dirty: false,
             files_hovered: false,
+            loading: None,
         }
     }
 
-    fn load_files(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
+    fn load_files(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
         self.error = None;
         self.images.clear();
         self.texture = None;
@@ -144,152 +289,32 @@ impl DicomViewApp {
         self.zoom = 1.0;
         self.wl_dirty = false;
 
-        for path in paths {
-            let obj = match open_file(&path) {
-                Ok(o) => o,
-                Err(e) => {
-                    self.error = Some(format!("Failed to open {}: {}", path.display(), e));
-                    return;
-                }
-            };
+        let total = paths.len();
+        let (tx, rx) = mpsc::channel::<LoadMsg>();
+        let ctx_clone = ctx.clone();
 
-            // Collect display metadata (text tags)
-            let mut metadata = Vec::new();
-            for (tag, label) in METADATA_TAGS {
-                if let Ok(elem) = obj.element(*tag) {
-                    if let Ok(val) = elem.to_str() {
-                        let val = val.trim().to_string();
-                        if !val.is_empty() {
-                            metadata.push((label.to_string(), val));
-                        }
-                    }
-                }
+        std::thread::spawn(move || {
+            for path in paths {
+                let filename = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let msg = match decode_single_file(&path) {
+                    Ok((image, wc_ww)) => LoadMsg::Image { image, wc_ww, filename },
+                    Err(e) => LoadMsg::Error(e),
+                };
+                let _ = tx.send(msg);
+                ctx_clone.request_repaint();
             }
+        });
 
-            // Helper: read a tag as string then parse
-            let get_str = |tag: Tag| -> Option<String> {
-                obj.element(tag)
-                    .ok()?
-                    .to_str()
-                    .ok()
-                    .map(|s| s.trim().to_string())
-            };
-            let get_f32 = |tag: Tag| -> Option<f32> {
-                // Window Center/Width can be multi-valued (backslash-separated); take first
-                get_str(tag).and_then(|s| {
-                    s.split('\\').next().and_then(|v| v.trim().parse::<f32>().ok())
-                })
-            };
-
-            let rescale_intercept = get_f32(Tag(0x0028, 0x1052)).unwrap_or(0.0);
-            let rescale_slope = get_f32(Tag(0x0028, 0x1053)).unwrap_or(1.0);
-            let wc_dicom = get_f32(Tag(0x0028, 0x1050));
-            let ww_dicom = get_f32(Tag(0x0028, 0x1051));
-
-            // Decode pixel data — PixelDecoder handles all standard transfer syntaxes
-            // (uncompressed, JPEG, JPEG-LS, RLE, deflate) transparently.
-            let pixel_data = match obj.decode_pixel_data() {
-                Ok(pd) => pd,
-                Err(e) => {
-                    self.error = Some(format!("Failed to decode pixel data in {}: {}", path.display(), e));
-                    return;
-                }
-            };
-
-            let rows = pixel_data.rows() as usize;
-            let cols = pixel_data.columns() as usize;
-            let bits = pixel_data.bits_allocated();
-            let samples = pixel_data.samples_per_pixel();
-            let signed = matches!(
-                pixel_data.pixel_representation(),
-                dicom_pixeldata::PixelRepresentation::Signed
-            );
-            let bytes: &[u8] = pixel_data.data();
-
-            // Decode to RawImage based on bit depth and sample count
-            let raw_image = match (bits, samples) {
-                (8, 1) => {
-                    if bytes.len() < rows * cols {
-                        self.error = Some("Pixel data buffer is too short".to_string());
-                        return;
-                    }
-                    RawImage::Gray8 {
-                        data: bytes[..rows * cols].to_vec(),
-                        width: cols,
-                        height: rows,
-                    }
-                }
-                (16, 1) => {
-                    let expected = rows * cols * 2;
-                    if bytes.len() < expected {
-                        self.error = Some(format!(
-                            "Pixel data buffer too short: {} bytes, expected {}",
-                            bytes.len(),
-                            expected
-                        ));
-                        return;
-                    }
-                    // Parse 16-bit little-endian values and apply rescale
-                    let data: Vec<f32> = bytes
-                        .chunks_exact(2)
-                        .take(rows * cols)
-                        .map(|c| {
-                            let raw_u16 = u16::from_le_bytes([c[0], c[1]]);
-                            let raw_val = if signed {
-                                (raw_u16 as i16) as f32
-                            } else {
-                                raw_u16 as f32
-                            };
-                            raw_val * rescale_slope + rescale_intercept
-                        })
-                        .collect();
-                    RawImage::Gray16(Gray16 {
-                        data,
-                        width: cols,
-                        height: rows,
-                    })
-                }
-                (8, 3) => {
-                    let expected = rows * cols * 3;
-                    if bytes.len() < expected {
-                        self.error = Some("Pixel data buffer is too short".to_string());
-                        return;
-                    }
-                    RawImage::Rgb8 {
-                        data: bytes[..expected].to_vec(),
-                        width: cols,
-                        height: rows,
-                    }
-                }
-                _ => {
-                    self.error = Some(format!(
-                        "Unsupported pixel format: {} bpp, {} samples per pixel",
-                        bits, samples
-                    ));
-                    return;
-                }
-            };
-
-            // Determine initial window centre/width for 16-bit grayscale (from first image)
-            if self.images.is_empty() {
-                if let RawImage::Gray16(ref g) = raw_image {
-                    let (wc, ww) = if let (Some(wc), Some(ww)) = (wc_dicom, ww_dicom) {
-                        (wc, ww)
-                    } else {
-                        // Compute from the actual pixel values
-                        let min = g.data.iter().cloned().fold(f32::MAX, f32::min);
-                        let max = g.data.iter().cloned().fold(f32::MIN, f32::max);
-                        ((min + max) / 2.0, (max - min).max(1.0))
-                    };
-                    self.window_center = wc;
-                    self.window_width = ww;
-                }
-            }
-
-            self.images.push(LoadedImage { raw_image, metadata });
-        }
-
-        self.update_current_slice_view(ctx);
+        self.loading = Some(LoadingState {
+            rx,
+            total,
+            received: 0,
+            current_filename: String::new(),
+        });
     }
 
     fn update_current_slice_view(&mut self, ctx: &egui::Context) {
@@ -315,7 +340,46 @@ impl eframe::App for DicomViewApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Process any pending file load (first frame, or after Open dialog)
         if let Some(paths) = self.pending_load.take() {
-            self.load_files(ctx, paths);
+            self.load_files(paths, ctx);
+        }
+
+        // ── Poll background loading thread ─────────────────────────────────
+        let mut loading_complete = false;
+        if let Some(state) = &mut self.loading {
+            loop {
+                match state.rx.try_recv() {
+                    Ok(LoadMsg::Image { image, wc_ww, filename }) => {
+                        // Set W/L from the first Gray16 image
+                        if self.images.is_empty() {
+                            if let Some((wc, ww)) = wc_ww {
+                                self.window_center = wc;
+                                self.window_width = ww;
+                            }
+                        }
+                        state.received += 1;
+                        state.current_filename = filename;
+                        self.images.push(image);
+                    }
+                    Ok(LoadMsg::Error(e)) => {
+                        state.received += 1;
+                        self.error = Some(e);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        loading_complete = true;
+                        break;
+                    }
+                }
+            }
+            if let Some(state) = &self.loading {
+                if state.received >= state.total {
+                    loading_complete = true;
+                }
+            }
+        }
+        if loading_complete {
+            self.loading = None;
+            self.update_current_slice_view(ctx);
         }
 
         // Rebuild texture when window/level values change
@@ -333,7 +397,7 @@ impl eframe::App for DicomViewApp {
         });
         if !dropped.is_empty() {
             self.files_hovered = false;
-            self.load_files(ctx, dropped);
+            self.load_files(dropped, ctx);
         }
 
         // Keyboard navigation: arrow keys
@@ -586,6 +650,52 @@ impl eframe::App for DicomViewApp {
                 );
             }
         });
+        // ── Loading progress modal ────────────────────────────────────────────
+        if let Some(state) = &self.loading {
+            let total = state.total;
+            let received = state.received;
+            let filename = state.current_filename.clone();
+
+            // Dim the background
+            let screen = ctx.viewport_rect();
+            egui::Area::new(egui::Id::new("loading_overlay"))
+                .fixed_pos(screen.min)
+                .order(egui::Order::Background)
+                .show(ctx, |ui| {
+                    ui.painter().rect_filled(
+                        screen,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+                    );
+                });
+
+            egui::Window::new("Loading")
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .resizable(false)
+                .collapsible(false)
+                .title_bar(false)
+                .fixed_size([300.0, 90.0])
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(8.0);
+                        ui.label(format!("Loading {}/{}", received, total));
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::ProgressBar::new(received as f32 / total as f32)
+                                .desired_width(260.0),
+                        );
+                        ui.add_space(4.0);
+                        if !filename.is_empty() {
+                            ui.label(
+                                egui::RichText::new(&filename)
+                                    .small()
+                                    .color(egui::Color32::GRAY),
+                            );
+                        }
+                        ui.add_space(8.0);
+                    });
+                });
+        }
     }
 }
 
@@ -604,17 +714,22 @@ pub fn run_viewer() {
     .expect("failed to launch DICOM Viewer");
 }
 
-pub fn run_viewer_with_file(path: String) {
+pub fn run_viewer_with_files(paths: Vec<String>) {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("DICOM Viewer")
             .with_inner_size([1024.0, 768.0]),
         ..Default::default()
     };
+    let path_bufs = paths.into_iter().map(PathBuf::from).collect::<Vec<_>>();
     eframe::run_native(
         "DICOM Viewer",
         options,
-        Box::new(|_cc| Ok(Box::new(DicomViewApp::new(Some(PathBuf::from(path)))))),
+        Box::new(move |_cc| {
+            let mut app = DicomViewApp::new(None);
+            app.pending_load = Some(path_bufs);
+            Ok(Box::new(app))
+        }),
     )
     .expect("failed to launch DICOM Viewer");
 }

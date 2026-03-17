@@ -255,8 +255,9 @@ fn calculate_hash(path: &Path) -> Option<String> {
             // so attempt a couple of reasonably-supported approaches and
             // fall back to hashing the whole file.
             // 1) If the element exposes a raw value-to-bytes conversion
-            if let Ok(bytes) = elem.to_bytes() {
-                return Some(blake3::hash(&bytes).to_hex().to_string());
+            match elem.to_bytes() {
+                Ok(bytes) => return Some(blake3::hash(&bytes).to_hex().to_string()),
+                Err(_) => {}
             }
 
             // 2) Try taking the element value as a string/byte slice representation

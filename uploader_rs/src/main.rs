@@ -233,19 +233,18 @@ impl eframe::App for AppState {
                     ui.add(egui::ProgressBar::new(self.processing_progress).show_percentage());
                 }
                 if ui.button("Process export (anonymize + notify)").clicked() {
-                    // spawn a background thread to process .dcm files in export_dir via the Python directory wrapper
                     let export = self.export_dir.clone();
                     let anon_dir = export
                         .parent()
                         .map(|p| p.to_path_buf())
                         .unwrap_or_else(|| PathBuf::from("."))
                         .join("anon");
-                    // reuse shared tx for UI messages
                     let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
-                    // capture notify flag before moving into the thread
                     let notify_flag = self.notify_on_process;
                     let seed_clone = self.seed.clone();
-                                                match anonymize_file(&p, &anon_dir, true, false, false, seed_clone.as_deref()) {
+
+                    thread::spawn(move || {
+                        // iterate files in export and anonymize .dcm files
                         if let Ok(entries) = fs::read_dir(&export) {
                             for ent in entries.flatten() {
                                 let p = ent.path();
@@ -268,24 +267,18 @@ impl eframe::App for AppState {
                             let _ = tx.send("No export dir or read error".to_string());
                         }
 
-                        // optionally send NNG 'loaded' message to notify other components
                         if notify_flag {
-                            match Socket::new(Protocol::Pair0) {
-                                Ok(s) => {
-                                    if s.dial("tcp://127.0.0.1:9976").is_ok() {
-                                            match anonymize_file(p, &anon_dir, true, false, false, seed_clone.as_deref()) {
-                                        let _ = tx.send("Sent NNG 'loaded'".to_string());
-                                    } else {
-                                        let _ = tx.send("Failed to dial NNG socket".to_string());
-                                    }
+                            if let Ok(s) = Socket::new(Protocol::Pair0) {
+                                if s.dial("tcp://127.0.0.1:9976").is_ok() {
+                                    let _ = tx.send("Sent NNG 'loaded'".to_string());
+                                } else {
+                                    let _ = tx.send("Failed to dial NNG socket".to_string());
                                 }
-                                Err(e) => {
-                                    let _ = tx.send(format!("Failed to create NNG socket: {:?}", e));
-                                }
+                            } else {
+                                let _ = tx.send("Failed to create NNG socket".to_string());
                             }
                         }
 
-                        // after processing, refresh ready-to-upload by scanning anon dir
                         match scan_for_upload(&anon_dir) {
                             Ok(series) => {
                                 if let Ok(json) = serde_json::to_string(&series) {
@@ -294,7 +287,7 @@ impl eframe::App for AppState {
                                 }
                             }
                             Err(e) => { let _ = tx.send(format!("Post-process scan failed: {}", e)); }
-                                        match anonymize_file(&src, &anon_dir2, true, false, false, seed2.as_deref()) {
+                        }
 
                         let _ = tx.send("done".to_string());
                     });
@@ -698,6 +691,50 @@ impl eframe::App for AppState {
                                     });
                                 }
                             });
+                        // Add a "View series" button to launch dicom-view with the series files
+                        if ui.small_button("View series").clicked() {
+                            // collect file paths for this series
+                            let mut paths: Vec<String> = Vec::new();
+                            for f in &series.files {
+                                paths.push(f.path.to_string_lossy().to_string());
+                            }
+                            if paths.is_empty() {
+                                self.last_msg = "No files in series to view".to_string();
+                            } else {
+                                // Try to launch `dicom-view` (in PATH) with all file args; fall back to workspace target path
+                                let try_spawn = |cmd: &str, args: &[String]| -> Result<std::process::Child, std::io::Error> {
+                                    Command::new(cmd).args(args).spawn()
+                                };
+
+                                // first try by name
+                                match try_spawn("dicom-view", &paths) {
+                                    Ok(_) => { self.last_msg = "Launched dicom-view".to_string(); }
+                                    Err(_) => {
+                                        // try common workspace build locations relative to current dir
+                                        let fallback1 = std::env::current_dir()
+                                            .ok()
+                                            .and_then(|cwd| Some(cwd.join("dicom-view/target/debug/dicom-view")));
+                                        let fallback2 = std::env::current_exe()
+                                            .ok()
+                                            .and_then(|exe| exe.parent().and_then(|p| p.parent()).map(|p| p.join("dicom-view/target/debug/dicom-view")));
+                                        let mut launched = false;
+                                        if let Some(bin) = fallback1 { if bin.exists() {
+                                            if try_spawn(bin.to_string_lossy().as_ref(), &paths).is_ok() { launched = true; }
+                                        }}
+                                        if !launched {
+                                            if let Some(bin) = fallback2 { if bin.exists() {
+                                                if try_spawn(bin.to_string_lossy().as_ref(), &paths).is_ok() { launched = true; }
+                                            }}
+                                        }
+                                        if launched {
+                                            self.last_msg = "Launched dicom-view (fallback)".to_string();
+                                        } else {
+                                            self.last_msg = "Failed to launch dicom-view; ensure it is built or in PATH".to_string();
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         ui.separator();
                     }
                 });
@@ -941,7 +978,7 @@ fn main() {
     if args.len() >= 4 && args[1] == "--anon" {
         let in_path = std::path::Path::new(&args[2]);
         let out_path = std::path::Path::new(&args[3]);
-        match anonymize_file(in_path, out_path.parent().unwrap_or_else(||std::path::Path::new(".")), false, false, None) {
+        match anonymize_file(in_path, out_path.parent().unwrap_or_else(||std::path::Path::new(".")), false, false, false, None) {
             Ok(p) => {
                 // if anonymizer wrote a file with same name under output dir, move/rename to requested path
                 if p != out_path {
