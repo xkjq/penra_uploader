@@ -113,6 +113,7 @@ struct DicomViewApp {
     window_center: f32,
     window_width: f32,
     wl_dirty: bool,
+    files_hovered: bool,
 }
 
 impl DicomViewApp {
@@ -130,6 +131,7 @@ impl DicomViewApp {
             window_center: 0.0,
             window_width: 1.0,
             wl_dirty: false,
+            files_hovered: false,
         }
     }
 
@@ -321,11 +323,16 @@ impl eframe::App for DicomViewApp {
             self.update_current_slice_view(ctx);
         }
 
-        // Drag-and-drop: collect all dropped files
+        // Drag-and-drop: detect hovered and dropped files
+        ctx.input(|i| {
+            self.files_hovered = !i.raw.hovered_files.is_empty();
+        });
+
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
         });
         if !dropped.is_empty() {
+            self.files_hovered = false;
             self.load_files(ctx, dropped);
         }
 
@@ -448,6 +455,25 @@ impl eframe::App for DicomViewApp {
                         egui::Color32::from_rgb(220, 60, 60),
                         format!("⚠ {}", err),
                     );
+                });
+                return;
+            }
+
+            // Show drop zone if files are being hovered
+            if self.files_hovered {
+                let rect = ui.available_rect_before_wrap();
+                // Draw a semi-transparent overlay to indicate drop zone
+                ui.painter().rect_filled(
+                    rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(100, 150, 255, 32),
+                );
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(100.0);
+                        ui.heading("📥 Drop DICOM files here");
+                        ui.add_space(100.0);
+                    });
                 });
                 return;
             }
