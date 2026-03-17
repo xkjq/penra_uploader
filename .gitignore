@@ -27,6 +27,13 @@ uploader_rs/Cargo.lock
 uploader_rs/export/
 uploader_rs/anon/
 
+# New crate dicor-rs build artifacts
+dicor-rs/target/
+dicor-rs/Cargo.lock
+
+# Cargo build artifacts (workspace-level)
+target/
+
 test_dicoms/
 
 uploader_rs/.last_scan.json

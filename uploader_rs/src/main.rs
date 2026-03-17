@@ -1,7 +1,6 @@
 use eframe::{egui, NativeOptions};
 use egui::CentralPanel;
-mod anonymizer;
-use anonymizer::anonymize_file;
+use dicor_rs::anonymize_file;
 mod upload;
 use upload::{upload_anon_dir, UploadResult, scan_for_upload, SeriesInfo, FileEntry};
 mod dicom_viewer;
@@ -944,7 +943,7 @@ fn main() {
     if args.len() >= 4 && args[1] == "--anon" {
         let in_path = std::path::Path::new(&args[2]);
         let out_path = std::path::Path::new(&args[3]);
-        match anonymizer::anonymize_file(in_path, out_path.parent().unwrap_or_else(||std::path::Path::new(".")), false, None) {
+        match anonymize_file(in_path, out_path.parent().unwrap_or_else(||std::path::Path::new(".")), false, None) {
             Ok(p) => {
                 // if anonymizer wrote a file with same name under output dir, move/rename to requested path
                 if p != out_path {

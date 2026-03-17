@@ -20,5 +20,8 @@ hex = "0.4"
 serde_json = "1.0"
 dirs = "4.0"
 
+# local anonymizer crate
+dicor_rs = { package = "dicor-rs", path = "../dicor-rs" }
+
 [dev-dependencies]
 tempfile = "3.6"
