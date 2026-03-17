@@ -12,16 +12,16 @@ reqwest = { version = "0.11", default-features = false, features = ["blocking", 
 blake3 = "1.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 rfd = "0.17"
-dicom-object = "0.6"
-dicom-core = "0.6"
 chrono = { version = "0.4", features = ["serde"] }
 num-bigint = "0.4"
 hex = "0.4"
 serde_json = "1.0"
 dirs = "4.0"
 
-# local anonymizer crate
+# local crates
 dicor_rs = { package = "dicor-rs", path = "../dicor-rs" }
+dicom_viewer = { path = "../dicom_viewer" }
+meta_viewer = { path = "../meta_viewer" }
 
 [dev-dependencies]
 tempfile = "3.6"

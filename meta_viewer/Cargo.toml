@@ -1,0 +1,17 @@
+[package]
+name = "meta_viewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.33"
+egui = "0.33"
+dicom_viewer = { path = "../dicom_viewer" }
+
+[[bin]]
+name = "meta_viewer"
+path = "src/main.rs"
+
+[lib]
+name = "meta_viewer"
+path = "src/lib.rs"

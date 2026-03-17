@@ -1,0 +1,8 @@
+[package]
+name = "dicom_viewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dicom-object = "0.6"
+dicom-core = "0.6"
