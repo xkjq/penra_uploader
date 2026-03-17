@@ -1,6 +1,7 @@
 use eframe::egui;
 use egui::Vec2;
 use dicom_object::{open_file, Tag};
+use dicom_pixeldata::PixelDecoder;
 use std::path::PathBuf;
 
 const METADATA_TAGS: &[(Tag, &str)] = &[
@@ -164,9 +165,6 @@ impl DicomViewApp {
                 .ok()
                 .map(|s| s.trim().to_string())
         };
-        let get_u16 = |tag: Tag| -> Option<u16> {
-            get_str(tag).and_then(|s| s.parse::<u16>().ok())
-        };
         let get_f32 = |tag: Tag| -> Option<f32> {
             // Window Center/Width can be multi-valued (backslash-separated); take first
             get_str(tag).and_then(|s| {
@@ -174,48 +172,30 @@ impl DicomViewApp {
             })
         };
 
-        let rows = match get_u16(Tag(0x0028, 0x0010)) {
-            Some(v) => v as usize,
-            None => {
-                self.error = Some("Missing or unreadable Rows tag".to_string());
-                return;
-            }
-        };
-        let cols = match get_u16(Tag(0x0028, 0x0011)) {
-            Some(v) => v as usize,
-            None => {
-                self.error = Some("Missing or unreadable Columns tag".to_string());
-                return;
-            }
-        };
-
-        let bits = get_u16(Tag(0x0028, 0x0100)).unwrap_or(8);
-        let samples = get_u16(Tag(0x0028, 0x0002)).unwrap_or(1);
-        let signed = get_u16(Tag(0x0028, 0x0103)).unwrap_or(0) == 1;
         let rescale_intercept = get_f32(Tag(0x0028, 0x1052)).unwrap_or(0.0);
         let rescale_slope = get_f32(Tag(0x0028, 0x1053)).unwrap_or(1.0);
         let wc_dicom = get_f32(Tag(0x0028, 0x1050));
         let ww_dicom = get_f32(Tag(0x0028, 0x1051));
 
-        // Read raw pixel bytes (fails for compressed transfer syntaxes)
-        let pixel_elem = match obj.element(Tag(0x7FE0, 0x0010)) {
-            Ok(e) => e,
-            Err(_) => {
-                self.error = Some("No pixel data found in this file".to_string());
-                return;
-            }
-        };
-        let raw_bytes = match pixel_elem.to_bytes() {
-            Ok(b) => b,
+        // Decode pixel data — PixelDecoder handles all standard transfer syntaxes
+        // (uncompressed, JPEG, JPEG-LS, RLE, deflate) transparently.
+        let pixel_data = match obj.decode_pixel_data() {
+            Ok(pd) => pd,
             Err(e) => {
-                self.error = Some(format!(
-                    "Cannot read pixel data (compressed format not supported): {}",
-                    e
-                ));
+                self.error = Some(format!("Failed to decode pixel data: {}", e));
                 return;
             }
         };
-        let bytes: &[u8] = &raw_bytes;
+
+        let rows = pixel_data.rows() as usize;
+        let cols = pixel_data.columns() as usize;
+        let bits = pixel_data.bits_allocated();
+        let samples = pixel_data.samples_per_pixel();
+        let signed = matches!(
+            pixel_data.pixel_representation(),
+            dicom_pixeldata::PixelRepresentation::Signed
+        );
+        let bytes: &[u8] = pixel_data.data();
 
         // Decode to RawImage based on bit depth and sample count
         let raw_image = match (bits, samples) {
@@ -454,6 +434,21 @@ impl eframe::App for DicomViewApp {
                 // Left-button drag → pan
                 if response.dragged_by(egui::PointerButton::Primary) {
                     self.pan += response.drag_delta();
+                }
+
+                // Right-button drag → window / level
+                // Horizontal drag adjusts Window Width; vertical drag adjusts Window Centre.
+                // Only meaningful for 16-bit grayscale; ignored otherwise.
+                if response.dragged_by(egui::PointerButton::Secondary) {
+                    if self.raw_image.as_ref().map(|r| r.is_grayscale16()).unwrap_or(false) {
+                        let delta = response.drag_delta();
+                        // Scale factor: drag 1px ≈ 2 HU change (reasonable for CT).
+                        let ww_scale = 2.0_f32;
+                        let wc_scale = 2.0_f32;
+                        self.window_width = (self.window_width + delta.x * ww_scale).max(1.0);
+                        self.window_center += -delta.y * wc_scale;
+                        self.wl_dirty = true;
+                    }
                 }
 
                 // Double-click → reset view

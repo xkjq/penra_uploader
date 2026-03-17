@@ -6,8 +6,9 @@ edition = "2021"
 [dependencies]
 eframe = "0.33"
 egui = "0.33"
-dicom-object = "0.6"
-dicom-core = "0.6"
+dicom-object = "0.9"
+dicom-core = "0.9"
+dicom-pixeldata = "0.9"
 rfd = "0.17"
 
 [[bin]]
