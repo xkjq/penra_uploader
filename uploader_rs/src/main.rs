@@ -712,7 +712,7 @@ impl eframe::App for AppState {
                             if paths.is_empty() {
                                 self.last_msg = "No files in series to view".to_string();
                             } else {
-                                // Try to launch `dicom-view` (in PATH) with all file args; fall back to workspace target path
+                                // Try to launch `diviz-rs` (in PATH) with all file args; fall back to workspace target path
                                 let try_spawn = |cmd: &str, args: &[String]| -> Result<std::process::Child, std::io::Error> {
                                     Command::new(cmd).args(args).spawn()
                                 };
@@ -725,8 +725,8 @@ impl eframe::App for AppState {
                                         let mut candidates: Vec<std::path::PathBuf> = Vec::new();
                                         // helper to push debug/release targets for a root path
                                         let mut push_targets = |root: &std::path::Path| {
-                                            candidates.push(root.join("dicom-view/target/debug/diviz-rs"));
-                                            candidates.push(root.join("dicom-view/target/release/diviz-rs"));
+                                            candidates.push(root.join("diviz-rs/target/debug/diviz-rs"));
+                                            candidates.push(root.join("diviz-rs/target/release/diviz-rs"));
                                         };
 
                                         if let Ok(cwd) = std::env::current_dir() {

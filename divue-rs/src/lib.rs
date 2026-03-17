@@ -26,7 +26,13 @@ pub fn run_meta_viewer_with_mode(paths: Vec<String>, mode: MetadataReadMode) {
         }
     }
 
-    let app = MetaApp { comps, filter: String::new(), full_open: false, full_text: String::new() };
+    let app = MetaApp {
+        comps,
+        expanded_keys: HashSet::new(),
+        filter: String::new(),
+        full_open: false,
+        full_text: String::new(),
+    };
     let native_options = eframe::NativeOptions::default();
     eframe::run_native("DICOM Metadata Viewer", native_options, Box::new(|_cc| Ok(Box::new(app)))).ok();
 }
@@ -110,6 +116,54 @@ pub fn truncate_string(s: &str, max_len: usize) -> String {
     }
 }
 
+fn strip_item_suffix(segment: &str) -> &str {
+    segment.split_once('[').map(|(tag_text, _)| tag_text).unwrap_or(segment)
+}
+
+fn strip_item_suffix_from_path(path: &str) -> String {
+    if let Some((prefix, segment)) = path.rsplit_once('/') {
+        format!("{}/{}", prefix, strip_item_suffix(segment))
+    } else {
+        strip_item_suffix(path).to_string()
+    }
+}
+
+fn ancestor_rows(key: &str) -> Vec<String> {
+    let segments: Vec<&str> = key.split('/').collect();
+    let mut ancestors = Vec::new();
+    let mut raw_path = String::new();
+
+    for segment in segments.iter().take(segments.len().saturating_sub(1)) {
+        if !raw_path.is_empty() {
+            raw_path.push('/');
+        }
+        raw_path.push_str(segment);
+        ancestors.push(strip_item_suffix_from_path(&raw_path));
+    }
+
+    ancestors
+}
+
+fn key_has_children(key: &str, keys: &[String]) -> bool {
+    keys.iter()
+        .any(|candidate| candidate != key && ancestor_rows(candidate).iter().any(|ancestor| ancestor == key))
+}
+
+fn visible_keys(keys: &[String], expanded_keys: &HashSet<String>, filtered: bool) -> Vec<String> {
+    if filtered {
+        return keys.to_vec();
+    }
+
+    keys.iter()
+        .filter(|key| {
+            ancestor_rows(key)
+                .iter()
+                .all(|ancestor| expanded_keys.contains(ancestor))
+        })
+        .cloned()
+        .collect()
+}
+
 /// Format a single tag segment with a human-readable name if possible.
 fn format_tag_segment(segment: &str) -> String {
     let dict = StandardDataDictionary;
@@ -127,7 +181,7 @@ fn format_tag_segment(segment: &str) -> String {
             if let Some(entry) = dict.by_tag(tag) {
                 let alias = entry.alias();
                 if !alias.is_empty() {
-                    return format!("{} ({}){}", alias, tag_text, suffix);
+                    return format!("{} {}{}", tag_text, alias, suffix);
                 }
             }
         }
@@ -138,7 +192,7 @@ fn format_tag_segment(segment: &str) -> String {
 
 /// Prepare a key label for the table.
 /// Nested tags are shown as an indented leaf node, with the full path retained for hover text.
-fn get_key_display(key: &str) -> (String, String) {
+fn get_key_display(key: &str) -> (usize, String, String) {
     let segments: Vec<&str> = key.split('/').collect();
     let depth = segments.len().saturating_sub(1);
     let leaf = segments.last().copied().unwrap_or(key);
@@ -149,7 +203,37 @@ fn get_key_display(key: &str) -> (String, String) {
         .collect::<Vec<_>>()
         .join(" / ");
 
-    (format!("{}{}", "  ".repeat(depth), leaf_display), full_display)
+    (depth, leaf_display, full_display)
+}
+
+fn render_key_cell(
+    ui: &mut egui::Ui,
+    key: &str,
+    all_keys: &[String],
+    expanded_keys: &mut HashSet<String>,
+) {
+    let (depth, key_display, key_hover) = get_key_display(key);
+    let has_children = key_has_children(key, all_keys);
+
+    ui.horizontal(|ui| {
+        ui.add_space((depth as f32) * 18.0);
+
+        if has_children {
+            let is_expanded = expanded_keys.contains(key);
+            let icon = if is_expanded { "▼" } else { "▶" };
+            if ui.small_button(icon).clicked() {
+                if is_expanded {
+                    expanded_keys.remove(key);
+                } else {
+                    expanded_keys.insert(key.to_string());
+                }
+            }
+        } else {
+            ui.add_space(24.0);
+        }
+
+        ui.label(key_display).on_hover_text(key_hover);
+    });
 }
 
 /// App state that manages both file selection and comparison views
@@ -161,6 +245,7 @@ struct DivueApp {
     read_mode: MetadataReadMode,
     show_comparison: bool,
     comps: Vec<(String, HashMap<String, String>)>,
+    expanded_keys: HashSet<String>,
     filter: String,
     full_open: bool,
     full_text: String,
@@ -173,6 +258,7 @@ impl DivueApp {
             read_mode: MetadataReadMode::InDepth,
             show_comparison: false,
             comps: Vec::new(),
+            expanded_keys: HashSet::new(),
             filter: String::new(),
             full_open: false,
             full_text: String::new(),
@@ -181,6 +267,7 @@ impl DivueApp {
 
     fn load_files(&mut self) {
         self.comps.clear();
+        self.expanded_keys.clear();
         for selected_file in &self.selected_files {
             if let Some(path_str) = selected_file.to_str() {
                 let result = match self.read_mode {
@@ -202,6 +289,7 @@ impl DivueApp {
     fn go_back_to_selection(&mut self) {
         self.show_comparison = false;
         self.comps.clear();
+        self.expanded_keys.clear();
         self.filter.clear();
         self.full_open = false;
         self.full_text.clear();
@@ -392,6 +480,9 @@ impl DivueApp {
         // build union of keys preserving order
         let mut keys = build_key_union(&self.comps);
         keys = filter_keys(&keys, &self.comps, &self.filter);
+        keys.sort();
+        let filtered = !self.filter.is_empty();
+        let visible = visible_keys(&keys, &self.expanded_keys, filtered);
 
         // header row
         egui::Grid::new("meta_header")
@@ -413,9 +504,8 @@ impl DivueApp {
                     .num_columns(1 + self.comps.len())
                     .spacing([8.0, 4.0])
                     .show(ui, |ui| {
-                        for k in &keys {
-                            let (key_display, key_hover) = get_key_display(k);
-                            ui.label(key_display).on_hover_text(key_hover);
+                        for k in &visible {
+                            render_key_cell(ui, k, &keys, &mut self.expanded_keys);
                             // collect values for this key
                             let mut vals: Vec<Option<String>> = Vec::new();
                             for (_name, map) in &self.comps {
@@ -463,6 +553,7 @@ impl DivueApp {
 
 struct MetaApp {
     comps: Vec<(String, HashMap<String, String>)>,
+    expanded_keys: HashSet<String>,
     filter: String,
     full_open: bool,
     full_text: String,
@@ -486,6 +577,9 @@ impl eframe::App for MetaApp {
             // build union of keys preserving order
             let mut keys = build_key_union(&self.comps);
             keys = filter_keys(&keys, &self.comps, &self.filter);
+            keys.sort();
+            let filtered = !self.filter.is_empty();
+            let visible = visible_keys(&keys, &self.expanded_keys, filtered);
 
             // header row
             egui::Grid::new("meta_header").num_columns(1 + self.comps.len()).spacing([8.0, 4.0]).show(ui, |ui| {
@@ -499,9 +593,8 @@ impl eframe::App for MetaApp {
 
             egui::ScrollArea::vertical().max_height(900.0).show(ui, |ui| {
                 egui::Grid::new("meta_rows").num_columns(1 + self.comps.len()).spacing([8.0, 4.0]).show(ui, |ui| {
-                    for k in &keys {
-                        let (key_display, key_hover) = get_key_display(k);
-                        ui.label(key_display).on_hover_text(key_hover);
+                    for k in &visible {
+                        render_key_cell(ui, k, &keys, &mut self.expanded_keys);
                         // collect values for this key
                         let mut vals: Vec<Option<String>> = Vec::new();
                         for (_name, map) in &self.comps {
