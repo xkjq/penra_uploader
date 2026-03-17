@@ -497,6 +497,15 @@ impl eframe::App for DicomViewApp {
 
                 let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
+                // Check button states for multi-button combinations
+                let (left_down, right_down, middle_down) = ctx.input(|i| {
+                    (
+                        i.pointer.button_down(egui::PointerButton::Primary),
+                        i.pointer.button_down(egui::PointerButton::Secondary),
+                        i.pointer.button_down(egui::PointerButton::Middle),
+                    )
+                });
+
                 // Scroll wheel → zoom; Shift+Scroll or Alt+Scroll → slice navigation
                 let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
                 if response.hovered() && scroll_delta != 0.0 {
@@ -517,15 +526,34 @@ impl eframe::App for DicomViewApp {
                     }
                 }
 
-                // Left-button drag → pan
-                if response.dragged_by(egui::PointerButton::Primary) {
+                // Both left and right buttons → zoom
+                if response.hovered() && left_down && right_down {
+                    let delta = response.drag_delta();
+                    // Downward drag zooms in, upward zooms out
+                    if delta.y != 0.0 {
+                        self.zoom = (self.zoom * (1.0 + delta.y * 0.01)).clamp(0.05, 20.0);
+                    }
+                }
+                // Middle mouse button → scroll through slices (if multiple images)
+                else if response.hovered() && middle_down && self.images.len() > 1 {
+                    let delta = response.drag_delta();
+                    // Upward drag → previous slice, downward → next slice
+                    if delta.y > 2.0 && self.current_slice > 0 {
+                        self.current_slice -= 1;
+                        self.wl_dirty = true;
+                    } else if delta.y < -2.0 && self.current_slice < self.images.len() - 1 {
+                        self.current_slice += 1;
+                        self.wl_dirty = true;
+                    }
+                }
+                // Left-button drag → pan (only if right button is not pressed)
+                else if response.dragged_by(egui::PointerButton::Primary) && !right_down {
                     self.pan += response.drag_delta();
                 }
-
-                // Right-button drag → window / level
+                // Right-button drag → window / level (only if left button is not pressed)
                 // Horizontal drag adjusts Window Width; vertical drag adjusts Window Centre.
                 // Only meaningful for 16-bit grayscale; ignored otherwise.
-                if response.dragged_by(egui::PointerButton::Secondary) {
+                else if response.dragged_by(egui::PointerButton::Secondary) && !left_down {
                     if !self.images.is_empty() {
                         let is_grayscale16 = self.images[self.current_slice]
                             .raw_image
