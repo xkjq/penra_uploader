@@ -42,9 +42,12 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, se
     let study_uid = obj.element(Tag(0x0020, 0x000D)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()).unwrap_or_else(|| "NO_STUDY_UID".to_string());
     let pat_name = obj.element(Tag(0x0010, 0x0010)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()).unwrap_or_else(|| "ANON".to_string());
 
-    let name_hash = hash_bytes(&format!("{}:{}:{}", seed.unwrap_or(""), study_uid, pat_name));
+    // Patient-level hashes should not vary by study so that the same patient
+    // is anonymized consistently across multiple studies. Use the patient
+    // name (and optional seed) only.
+    let name_hash = hash_bytes(&format!("{}:{}", seed.unwrap_or(""), pat_name));
     let pn = format!("ANON-{}", &hex::encode(&name_hash)[..12]);
-    let pid_hash = hash_bytes(&format!("{}:{}:{}:id", seed.unwrap_or(""), study_uid, pat_name));
+    let pid_hash = hash_bytes(&format!("{}:{}:id", seed.unwrap_or(""), pat_name));
     let pid = format!("ID-{}", &hex::encode(&pid_hash)[..12]);
 
     let mut map: HashMap<String, String> = HashMap::new();
