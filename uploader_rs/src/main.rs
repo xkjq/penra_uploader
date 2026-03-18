@@ -232,7 +232,7 @@ impl eframe::App for AppState {
                     ui.label(format!("Step: {}", step));
                     ui.add(egui::ProgressBar::new(self.processing_progress).show_percentage());
                 }
-                if ui.button("Process export (anonymize + notify)").clicked() {
+                    if ui.button("Process export (anonymize + notify)").clicked() {
                     let export = self.export_dir.clone();
                     let anon_dir = export
                         .parent()
@@ -244,27 +244,40 @@ impl eframe::App for AppState {
                     let seed_clone = self.seed.clone();
 
                     thread::spawn(move || {
-                        // iterate files in export and anonymize .dcm files
+                        // collect .dcm files first so we can report progress
+                        let mut dcm_files: Vec<std::path::PathBuf> = Vec::new();
                         if let Ok(entries) = fs::read_dir(&export) {
                             for ent in entries.flatten() {
                                 let p = ent.path();
                                 if p.extension().map(|e| e == "dcm").unwrap_or(false) {
-                                    match anonymize_file(&p, &anon_dir, true, false, false, seed_clone.as_deref()) {
-                                        Ok(out) => {
-                                            let _ = tx.send(format!("Anonymized: {}", out.display()));
-                                            if let Ok(bytes) = fs::read(&out) {
-                                                let hash = blake3::hash(&bytes);
-                                                let _ = tx.send(format!("Hash {}: {}", out.display(), hash.to_hex()));
-                                            }
-                                        }
-                                        Err(e) => {
-                                            let _ = tx.send(format!("Anon failed {}: {}", p.display(), e));
-                                        }
-                                    }
+                                    dcm_files.push(p);
                                 }
                             }
                         } else {
                             let _ = tx.send("No export dir or read error".to_string());
+                        }
+
+                        let total = dcm_files.len();
+                        if total > 0 {
+                            let _ = tx.send("PROC:STEP:Anonymizing export files".to_string());
+                        }
+                        for (i, p) in dcm_files.into_iter().enumerate() {
+                            match anonymize_file(&p, &anon_dir, true, false, false, seed_clone.as_deref()) {
+                                Ok(out) => {
+                                    let _ = tx.send(format!("Anonymized: {}", out.display()));
+                                    if let Ok(bytes) = fs::read(&out) {
+                                        let hash = blake3::hash(&bytes);
+                                        let _ = tx.send(format!("Hash {}: {}", out.display(), hash.to_hex()));
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(format!("Anon failed {}: {}", p.display(), e));
+                                }
+                            }
+                            if total > 0 {
+                                let prog = (i + 1) as f32 / total as f32;
+                                let _ = tx.send(format!("PROC:PROG:{}", prog));
+                            }
                         }
 
                         if notify_flag {
@@ -360,7 +373,7 @@ impl eframe::App for AppState {
                                 // After files have been copied/moved, automatically process them
                                 if !copied_files.is_empty() {
                                     let anon_dir = export.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
-                                    for p in &copied_files {
+                                    for (i, p) in copied_files.iter().enumerate() {
                                         // process only if ext_filter empty (accept all) or file extension matches
                                         let should_process = if ext.is_empty() {
                                             true
@@ -368,6 +381,11 @@ impl eframe::App for AppState {
                                             p.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case(&ext)).unwrap_or(false)
                                         };
                                         if should_process {
+                                            // report progress for import processing
+                                            let total = copied_files.len();
+                                            if total > 0 {
+                                                let _ = tx.send("PROC:STEP:Anonymizing imported files".to_string());
+                                            }
                                             match anonymize_file(p, &anon_dir, true, false, false, seed_clone.as_deref()) {
                                                 Ok(out) => {
                                                     let _ = tx.send(format!("Anonymized: {}", out.display()));
@@ -379,6 +397,10 @@ impl eframe::App for AppState {
                                                 Err(e) => {
                                                     let _ = tx.send(format!("Anon failed {}: {}", p.display(), e));
                                                 }
+                                            }
+                                            if total > 0 {
+                                                let prog = (i + 1) as f32 / total as f32;
+                                                let _ = tx.send(format!("PROC:PROG:{}", prog));
                                             }
                                         }
                                     }
@@ -509,11 +531,11 @@ impl eframe::App for AppState {
                     ui.horizontal(|ui| {
                         // Styled Upload button moved here to Ready-to-Upload (prominent)
                         if !self.metadata_select_mode {
-                            if ui.add(egui::Button::new("Upload anonymized files").fill(egui::Color32::from_rgb(0,150,60))).clicked() {
+                                if ui.add(egui::Button::new("Upload anonymized files").fill(egui::Color32::from_rgb(0,150,60))).clicked() {
                                 let anon_dir = self.anon_dir();
                                 let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
                                 thread::spawn(move || {
-                                    match upload_anon_dir(&anon_dir, None) {
+                                    match upload_anon_dir(&anon_dir, None, Some(tx.clone())) {
                                         Ok(res) => {
                                             let _ = tx.send(format!("Uploaded: {}", res.uploaded.len()));
                                             let _ = tx.send(format!("Duplicates: {}", res.duplicates.len()));

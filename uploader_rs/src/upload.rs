@@ -277,7 +277,7 @@ fn calculate_hash(path: &Path) -> Option<String> {
     }
 }
 
-pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>) -> Result<UploadResult, String> {
+pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::sync::mpsc::Sender<String>>) -> Result<UploadResult, String> {
     // Use `scan_for_upload` to determine which files are considered ready-to-upload
     // This ensures we reuse the same hashing and server precheck that `scan_for_upload` performed,
     // avoiding inconsistencies between the UI and the uploader.
@@ -322,6 +322,14 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>) -> Result<UploadR
     let base = base_site_url();
 
     let total_chunks = (files_to_upload.len() + chunk_size - 1) / chunk_size;
+    let total_files = files_to_upload.len();
+    let mut files_processed = 0usize;
+
+    // notify UI that upload is starting
+    if let Some(ref s) = tx {
+        let _ = s.send("PROC:STEP:Uploading files".to_string());
+        if total_files > 0 { let _ = s.send(format!("PROC:PROG:{}", 0.0)); }
+    }
 
     for (i, chunk) in files_to_upload.chunks(chunk_size).enumerate() {
         let chunk_pairs: Vec<(PathBuf, String)> = chunk.iter().map(|(p, f)| (p.clone(), f.clone())).collect();
@@ -420,6 +428,14 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>) -> Result<UploadR
                 failed.push(fname.clone());
             }
         }
+            // update processed count and notify progress
+            files_processed = files_processed.saturating_add(chunk_pairs.len());
+            if let Some(ref s) = tx {
+                if total_files > 0 {
+                    let prog = (files_processed as f32 / total_files as f32).clamp(0.0, 1.0);
+                    let _ = s.send(format!("PROC:PROG:{}", prog));
+                }
+            }
     }
 
     Ok(UploadResult { uploaded, duplicates, failed, duplicate_series })
