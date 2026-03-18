@@ -34,7 +34,7 @@ enum ViewMode {
     Mpr,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MprPlane {
     Axial,
     Coronal,
@@ -51,6 +51,53 @@ impl MprPlane {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PatientAxis {
+    X,
+    Y,
+    Z,
+}
+
+impl MprPlane {
+    fn normal_axis(self) -> PatientAxis {
+        match self {
+            MprPlane::Axial => PatientAxis::Z,
+            MprPlane::Coronal => PatientAxis::Y,
+            MprPlane::Sagittal => PatientAxis::X,
+        }
+    }
+}
+
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn dominant_patient_axis(direction: [f32; 3]) -> Option<PatientAxis> {
+    let magnitudes = [direction[0].abs(), direction[1].abs(), direction[2].abs()];
+    let mut best_index = 0usize;
+    let mut best_value = magnitudes[0];
+    for (idx, value) in magnitudes.iter().enumerate().skip(1) {
+        if *value > best_value {
+            best_index = idx;
+            best_value = *value;
+        }
+    }
+
+    if best_value < 0.75 {
+        return None;
+    }
+
+    Some(match best_index {
+        0 => PatientAxis::X,
+        1 => PatientAxis::Y,
+        _ => PatientAxis::Z,
+    })
+}
+
 #[derive(Debug)]
 struct MprVolume {
     data: Vec<f32>,
@@ -61,6 +108,9 @@ struct MprVolume {
     col_spacing: f32,
     slice_spacing: f32,
     default_wc_ww: (f32, f32),
+    column_axis: PatientAxis,
+    row_axis: PatientAxis,
+    slice_axis: PatientAxis,
 }
 
 impl MprVolume {
@@ -84,6 +134,18 @@ impl MprVolume {
 
         let (width, height) = first.raw_image.dimensions();
         let pixel_spacing = first.pixel_spacing.unwrap_or([1.0, 1.0]);
+        let (column_axis, row_axis, slice_axis) = first
+            .image_orientation_patient
+            .and_then(|orientation| {
+                let column = dominant_patient_axis([orientation[0], orientation[1], orientation[2]])?;
+                let row = dominant_patient_axis([orientation[3], orientation[4], orientation[5]])?;
+                let slice = dominant_patient_axis(cross(
+                    [orientation[0], orientation[1], orientation[2]],
+                    [orientation[3], orientation[4], orientation[5]],
+                ))?;
+                ((column != row) && (column != slice) && (row != slice)).then_some((column, row, slice))
+            })
+            .unwrap_or((PatientAxis::X, PatientAxis::Y, PatientAxis::Z));
         let fallback_spacing = first
             .spacing_between_slices
             .or(first.slice_thickness)
@@ -117,6 +179,20 @@ impl MprVolume {
                     && (spacing[1] - pixel_spacing[1]).abs() < 1e-3;
                 if !same_spacing {
                     return Err("MPR requires consistent pixel spacing across the series".to_string());
+                }
+            }
+
+            if let Some(orientation) = slice.image_orientation_patient {
+                let slice_axes = (
+                    dominant_patient_axis([orientation[0], orientation[1], orientation[2]]),
+                    dominant_patient_axis([orientation[3], orientation[4], orientation[5]]),
+                    dominant_patient_axis(cross(
+                        [orientation[0], orientation[1], orientation[2]],
+                        [orientation[3], orientation[4], orientation[5]],
+                    )),
+                );
+                if slice_axes != (Some(column_axis), Some(row_axis), Some(slice_axis)) {
+                    return Err("MPR requires a series with consistent slice orientation".to_string());
                 }
             }
 
@@ -165,10 +241,26 @@ impl MprVolume {
             col_spacing: pixel_spacing[1].abs().max(0.001),
             slice_spacing: slice_spacing.abs().max(0.001),
             default_wc_ww,
+            column_axis,
+            row_axis,
+            slice_axis,
         })
     }
 
-    fn plane_len(&self, plane: MprPlane) -> usize {
+    fn native_plane(&self, plane: MprPlane) -> MprPlane {
+        let target = plane.normal_axis();
+        if self.slice_axis == target {
+            MprPlane::Axial
+        } else if self.row_axis == target {
+            MprPlane::Coronal
+        } else if self.column_axis == target {
+            MprPlane::Sagittal
+        } else {
+            plane
+        }
+    }
+
+    fn native_plane_len(&self, plane: MprPlane) -> usize {
         match plane {
             MprPlane::Axial => self.depth,
             MprPlane::Coronal => self.height,
@@ -176,7 +268,7 @@ impl MprVolume {
         }
     }
 
-    fn plane_dimensions(&self, plane: MprPlane) -> (usize, usize) {
+    fn native_plane_dimensions(&self, plane: MprPlane) -> (usize, usize) {
         match plane {
             MprPlane::Axial => (self.width, self.height),
             MprPlane::Coronal => (self.width, self.depth),
@@ -184,7 +276,7 @@ impl MprVolume {
         }
     }
 
-    fn physical_size(&self, plane: MprPlane) -> Vec2 {
+    fn native_physical_size(&self, plane: MprPlane) -> Vec2 {
         match plane {
             MprPlane::Axial => egui::vec2(
                 self.width as f32 * self.col_spacing,
@@ -201,8 +293,8 @@ impl MprVolume {
         }
     }
 
-    fn extract_plane(&self, plane: MprPlane, index: usize) -> Vec<f32> {
-        let (plane_width, plane_height) = self.plane_dimensions(plane);
+    fn extract_native_plane(&self, plane: MprPlane, index: usize) -> Vec<f32> {
+        let (plane_width, plane_height) = self.native_plane_dimensions(plane);
         let mut out = vec![0.0; plane_width * plane_height];
         let slice_len = self.width * self.height;
 
@@ -233,6 +325,22 @@ impl MprVolume {
         }
 
         out
+    }
+
+    fn plane_len(&self, plane: MprPlane) -> usize {
+        self.native_plane_len(self.native_plane(plane))
+    }
+
+    fn plane_dimensions(&self, plane: MprPlane) -> (usize, usize) {
+        self.native_plane_dimensions(self.native_plane(plane))
+    }
+
+    fn physical_size(&self, plane: MprPlane) -> Vec2 {
+        self.native_physical_size(self.native_plane(plane))
+    }
+
+    fn extract_plane(&self, plane: MprPlane, index: usize) -> Vec<f32> {
+        self.extract_native_plane(self.native_plane(plane), index)
     }
 }
 
@@ -343,13 +451,9 @@ impl LoadedImage {
             self.image_position_patient,
             self.image_orientation_patient,
         ) {
-            let row = [orientation[0], orientation[1], orientation[2]];
-            let col = [orientation[3], orientation[4], orientation[5]];
-            let normal = [
-                row[1] * col[2] - row[2] * col[1],
-                row[2] * col[0] - row[0] * col[2],
-                row[0] * col[1] - row[1] * col[0],
-            ];
+            let column = [orientation[0], orientation[1], orientation[2]];
+            let row = [orientation[3], orientation[4], orientation[5]];
+            let normal = cross(column, row);
             let normal_mag = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
             if normal_mag > 1e-6 {
                 return position[0] * normal[0] + position[1] * normal[1] + position[2] * normal[2];
@@ -1477,6 +1581,29 @@ mod tests {
             volume.extract_plane(MprPlane::Sagittal, 2),
             vec![3.0, 6.0, 9.0, 12.0]
         );
+    }
+
+    #[test]
+    fn mpr_planes_follow_patient_orientation_for_coronal_acquisition() {
+        let mut images = vec![
+            gray16_image("slice-2", 2, 2.0, [0.5, 1.5], 3, 2, &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]),
+            gray16_image("slice-1", 1, 0.0, [0.5, 1.5], 3, 2, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        ];
+        for image in &mut images {
+            image.image_orientation_patient = Some([1.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+        }
+
+        let volume = MprVolume::from_images(&images, &[0, 1]).expect("volume should build");
+
+        assert_eq!(volume.native_plane(MprPlane::Axial), MprPlane::Coronal);
+        assert_eq!(volume.native_plane(MprPlane::Coronal), MprPlane::Axial);
+        assert_eq!(volume.native_plane(MprPlane::Sagittal), MprPlane::Sagittal);
+        assert_eq!(volume.plane_dimensions(MprPlane::Axial), (3, 2));
+        assert_eq!(
+            volume.extract_plane(MprPlane::Axial, 1),
+            vec![4.0, 5.0, 6.0, 10.0, 11.0, 12.0]
+        );
+        assert_eq!(volume.plane_len(MprPlane::Coronal), 2);
     }
 
     #[test]
