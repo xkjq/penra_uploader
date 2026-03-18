@@ -6,6 +6,7 @@ use blake3;
 use std::collections::{HashMap, HashSet};
 use dicom_object::open_file;
 use dicom_object::Tag;
+use dicom_pixeldata::PixelDecoder;
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
 
@@ -249,18 +250,19 @@ fn make_client(token: Option<&str>) -> Result<Client, String> {
 fn calculate_hash(path: &Path) -> Option<String> {
     // Prefer hashing the PixelData element (7FE0,0010) if present
     if let Ok(obj) = open_file(path) {
-        if let Ok(elem) = obj.element(Tag(0x7FE0, 0x0010)) {
-            // Try a few ways to obtain raw bytes from the element/value.
-            // Different versions of the dicom crates expose different helpers,
-            // so attempt a couple of reasonably-supported approaches and
-            // fall back to hashing the whole file.
-            // 1) If the element exposes a raw value-to-bytes conversion
-            match elem.to_bytes() {
-                Ok(bytes) => return Some(blake3::hash(&bytes).to_hex().to_string()),
-                Err(_) => {}
-            }
+        // Preferred: hash decoded pixel bytes.
+        if let Ok(pixel_data) = obj.decode_pixel_data() {
+            let bytes = pixel_data.data();
+            return Some(blake3::hash(bytes).to_hex().to_string());
+        }
 
-            // 2) Try taking the element value as a string/byte slice representation
+        // Prefer the PixelData element bytes when present. Decoding helpers
+        // vary across `dicom-object` versions; use direct element access
+        // as a reliable fallback that works with the current dependency.
+        if let Ok(elem) = obj.element(Tag(0x7FE0, 0x0010)) {
+            if let Ok(bytes) = elem.to_bytes() {
+                return Some(blake3::hash(&bytes).to_hex().to_string());
+            }
             if let Ok(s) = elem.to_str() {
                 let b = s.as_bytes();
                 return Some(blake3::hash(b).to_hex().to_string());

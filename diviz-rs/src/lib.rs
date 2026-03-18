@@ -2,6 +2,9 @@ use eframe::egui;
 use egui::Vec2;
 use dicom_object::{open_file, Tag};
 use dicom_pixeldata::PixelDecoder;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
@@ -100,16 +103,23 @@ impl RawImage {
 struct LoadedImage {
     raw_image: RawImage,
     metadata: Vec<(String, String)>,
+    filename: String,
+    series_uid: String,
+    series_label: String,
+    instance_number: Option<i32>,
+    default_wc_ww: Option<(f32, f32)>,
+}
+
+struct SeriesGroup {
+    uid: String,
+    label: String,
+    image_indices: Vec<usize>,
 }
 
 /// Message sent from the background loading thread to the UI thread.
 enum LoadMsg {
-    /// One file decoded successfully. `wc_ww` is set for Gray16 images.
-    Image {
-        image: LoadedImage,
-        wc_ww: Option<(f32, f32)>,
-        filename: String,
-    },
+    /// One file decoded successfully.
+    Image(LoadedImage),
     /// A file failed to decode.
     Error(String),
 }
@@ -121,10 +131,80 @@ struct LoadingState {
     current_filename: String,
 }
 
+fn has_supported_dicom_extension(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            let e = ext.to_ascii_lowercase();
+            e == "dcm" || e == "dicom"
+        })
+        .unwrap_or(false)
+}
+
+fn has_dicom_preamble(path: &std::path::Path) -> bool {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+
+    let mut header = [0u8; 132];
+    if file.read_exact(&mut header).is_err() {
+        return false;
+    }
+
+    &header[128..132] == b"DICM"
+}
+
+fn is_supported_dicom_file(path: &std::path::Path) -> bool {
+    if has_supported_dicom_extension(path) {
+        return true;
+    }
+
+    // For extensionless files, check for DICOM preamble first, then fall back to parser probe
+    // to support valid DICOM files without a .dcm/.dicom suffix.
+    if path.extension().is_none() {
+        return has_dicom_preamble(path) || open_file(path).is_ok();
+    }
+
+    false
+}
+
+fn collect_dicom_files_recursively(inputs: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = inputs;
+
+    while let Some(path) = stack.pop() {
+        if path.is_file() {
+            if is_supported_dicom_file(&path) {
+                out.push(path);
+            }
+            continue;
+        }
+
+        if path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                for entry in entries.flatten() {
+                    stack.push(entry.path());
+                }
+            }
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Decode a single DICOM file into a `LoadedImage`. Runs on a worker thread.
-fn decode_single_file(path: &PathBuf) -> Result<(LoadedImage, Option<(f32, f32)>), String> {
+fn decode_single_file(path: &PathBuf) -> Result<LoadedImage, String> {
     let obj = open_file(path)
         .map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
 
     let mut metadata = Vec::new();
     for (tag, label) in METADATA_TAGS {
@@ -149,6 +229,20 @@ fn decode_single_file(path: &PathBuf) -> Result<(LoadedImage, Option<(f32, f32)>
         get_str(tag).and_then(|s| {
             s.split('\\').next().and_then(|v| v.trim().parse::<f32>().ok())
         })
+    };
+    let get_i32 = |tag: Tag| -> Option<i32> {
+        get_str(tag).and_then(|s| {
+            s.split('\\').next().and_then(|v| v.trim().parse::<i32>().ok())
+        })
+    };
+
+    let series_uid = get_str(Tag(0x0020, 0x000E)).unwrap_or_else(|| "NO_SERIES_UID".to_string());
+    let series_desc = get_str(Tag(0x0008, 0x103E)).unwrap_or_else(|| "(no description)".to_string());
+    let series_number = get_str(Tag(0x0020, 0x0011));
+    let instance_number = get_i32(Tag(0x0020, 0x0013));
+    let series_label = match series_number {
+        Some(n) if !n.is_empty() => format!("Series {} - {}", n, series_desc),
+        _ => format!("Series - {}", series_desc),
     };
 
     let rescale_intercept = get_f32(Tag(0x0028, 0x1052)).unwrap_or(0.0);
@@ -228,7 +322,7 @@ fn decode_single_file(path: &PathBuf) -> Result<(LoadedImage, Option<(f32, f32)>
         }
     };
 
-    let wc_ww = if let RawImage::Gray16(ref g) = raw_image {
+    let default_wc_ww = if let RawImage::Gray16(ref g) = raw_image {
         let (wc, ww) = if let (Some(wc), Some(ww)) = (wc_dicom, ww_dicom) {
             (wc, ww)
         } else {
@@ -241,12 +335,22 @@ fn decode_single_file(path: &PathBuf) -> Result<(LoadedImage, Option<(f32, f32)>
         None
     };
 
-    Ok((LoadedImage { raw_image, metadata }, wc_ww))
+    Ok(LoadedImage {
+        raw_image,
+        metadata,
+        filename,
+        series_uid,
+        series_label,
+        instance_number,
+        default_wc_ww,
+    })
 }
 
 struct DicomViewApp {
     pending_load: Option<Vec<PathBuf>>,
     images: Vec<LoadedImage>,
+    series_groups: Vec<SeriesGroup>,
+    current_series: usize,
     current_slice: usize,
     texture: Option<egui::TextureHandle>,
     zoom: f32,
@@ -266,6 +370,8 @@ impl DicomViewApp {
         Self {
             pending_load,
             images: Vec::new(),
+            series_groups: Vec::new(),
+            current_series: 0,
             current_slice: 0,
             texture: None,
             zoom: 1.0,
@@ -281,13 +387,22 @@ impl DicomViewApp {
     }
 
     fn load_files(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        let paths = collect_dicom_files_recursively(paths);
         self.error = None;
         self.images.clear();
+        self.series_groups.clear();
+        self.current_series = 0;
         self.texture = None;
         self.current_slice = 0;
         self.pan = Vec2::ZERO;
         self.zoom = 1.0;
         self.wl_dirty = false;
+
+        if paths.is_empty() {
+            self.error = Some("No DICOM files found (searched recursively, including extensionless files)".to_string());
+            self.loading = None;
+            return;
+        }
 
         let total = paths.len();
         let (tx, rx) = mpsc::channel::<LoadMsg>();
@@ -295,13 +410,8 @@ impl DicomViewApp {
 
         std::thread::spawn(move || {
             for path in paths {
-                let filename = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
                 let msg = match decode_single_file(&path) {
-                    Ok((image, wc_ww)) => LoadMsg::Image { image, wc_ww, filename },
+                    Ok(image) => LoadMsg::Image(image),
                     Err(e) => LoadMsg::Error(e),
                 };
                 let _ = tx.send(msg);
@@ -317,12 +427,69 @@ impl DicomViewApp {
         });
     }
 
+    fn active_series_len(&self) -> usize {
+        self.series_groups
+            .get(self.current_series)
+            .map(|g| g.image_indices.len())
+            .unwrap_or(0)
+    }
+
+    fn active_image(&self) -> Option<&LoadedImage> {
+        let group = self.series_groups.get(self.current_series)?;
+        let global_idx = *group.image_indices.get(self.current_slice)?;
+        self.images.get(global_idx)
+    }
+
+    fn apply_default_window_for_current_series(&mut self) {
+        if let Some(img) = self.active_image() {
+            if let Some((wc, ww)) = img.default_wc_ww {
+                self.window_center = wc;
+                self.window_width = ww;
+            }
+        }
+    }
+
+    fn rebuild_series_groups(&mut self) {
+        let mut grouped: HashMap<String, SeriesGroup> = HashMap::new();
+
+        for (idx, image) in self.images.iter().enumerate() {
+            let entry = grouped
+                .entry(image.series_uid.clone())
+                .or_insert_with(|| SeriesGroup {
+                    uid: image.series_uid.clone(),
+                    label: image.series_label.clone(),
+                    image_indices: Vec::new(),
+                });
+            entry.image_indices.push(idx);
+        }
+
+        let mut groups: Vec<SeriesGroup> = grouped.into_values().collect();
+
+        for group in &mut groups {
+            group.image_indices.sort_by(|a, b| {
+                let ia = &self.images[*a];
+                let ib = &self.images[*b];
+                ia.instance_number
+                    .cmp(&ib.instance_number)
+                    .then_with(|| ia.filename.cmp(&ib.filename))
+            });
+        }
+
+        groups.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.uid.cmp(&b.uid)));
+        self.series_groups = groups;
+        self.current_series = 0;
+        self.current_slice = 0;
+    }
+
     fn update_current_slice_view(&mut self, ctx: &egui::Context) {
-        if self.images.is_empty() {
+        if self.active_series_len() == 0 {
             self.texture = None;
             return;
         }
-        let img = &self.images[self.current_slice];
+        let Some(img) = self.active_image() else {
+            self.texture = None;
+            return;
+        };
         let (width, height) = img.raw_image.dimensions();
         let rgba = img.raw_image.to_rgba(self.window_center, self.window_width);
         let color_image =
@@ -348,16 +515,9 @@ impl eframe::App for DicomViewApp {
         if let Some(state) = &mut self.loading {
             loop {
                 match state.rx.try_recv() {
-                    Ok(LoadMsg::Image { image, wc_ww, filename }) => {
-                        // Set W/L from the first Gray16 image
-                        if self.images.is_empty() {
-                            if let Some((wc, ww)) = wc_ww {
-                                self.window_center = wc;
-                                self.window_width = ww;
-                            }
-                        }
+                    Ok(LoadMsg::Image(image)) => {
                         state.received += 1;
-                        state.current_filename = filename;
+                        state.current_filename = image.filename.clone();
                         self.images.push(image);
                     }
                     Ok(LoadMsg::Error(e)) => {
@@ -379,6 +539,8 @@ impl eframe::App for DicomViewApp {
         }
         if loading_complete {
             self.loading = None;
+            self.rebuild_series_groups();
+            self.apply_default_window_for_current_series();
             self.update_current_slice_view(ctx);
         }
 
@@ -409,7 +571,7 @@ impl eframe::App for DicomViewApp {
                 }
             }
             if i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::ArrowRight) {
-                if self.current_slice < self.images.len().saturating_sub(1) {
+                if self.current_slice < self.active_series_len().saturating_sub(1) {
                     self.current_slice += 1;
                     self.wl_dirty = true;
                 }
@@ -419,9 +581,10 @@ impl eframe::App for DicomViewApp {
         // ── Toolbar ───────────────────────────────────────────────────────────
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("📂 Open").clicked() {
+                if ui.button("📄 Open Files").clicked() {
                     if let Some(paths) = rfd::FileDialog::new()
                         .add_filter("DICOM", &["dcm", "DCM"])
+                        .add_filter("DICOM", &["dicom", "DICOM"])
                         .add_filter("All Files", &["*"])
                         .pick_files()
                     {
@@ -429,8 +592,43 @@ impl eframe::App for DicomViewApp {
                     }
                 }
 
+                if ui.button("📁 Open Folder").clicked() {
+                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                        self.pending_load = Some(vec![folder]);
+                    }
+                }
+
                 ui.separator();
                 ui.toggle_value(&mut self.show_metadata, "ℹ Metadata");
+
+                if !self.series_groups.is_empty() {
+                    ui.separator();
+                    ui.label("Series:");
+                    let selected_text = self
+                        .series_groups
+                        .get(self.current_series)
+                        .map(|g| g.label.as_str())
+                        .unwrap_or("(none)");
+                    egui::ComboBox::from_id_salt("series_selector")
+                        .selected_text(selected_text)
+                        .show_ui(ui, |ui| {
+                            let mut selected_series = self.current_series;
+                            for (idx, group) in self.series_groups.iter().enumerate() {
+                                ui.selectable_value(
+                                    &mut selected_series,
+                                    idx,
+                                    format!("{} ({} images)", group.label, group.image_indices.len()),
+                                );
+                            }
+                            if selected_series != self.current_series {
+                                self.current_series = selected_series;
+                                self.current_slice = 0;
+                                self.pan = Vec2::ZERO;
+                                self.apply_default_window_for_current_series();
+                                self.wl_dirty = true;
+                            }
+                        });
+                }
 
                 ui.separator();
                 if ui.button("Fit").clicked() {
@@ -446,10 +644,8 @@ impl eframe::App for DicomViewApp {
                 ui.label(format!("{:.0}%", self.zoom * 100.0));
 
                 // Window/Level controls (only for 16-bit grayscale)
-                if !self.images.is_empty() {
-                    let is_grayscale16 = self.images[self.current_slice]
-                        .raw_image
-                        .is_grayscale16();
+                if let Some(active_image) = self.active_image() {
+                    let is_grayscale16 = active_image.raw_image.is_grayscale16();
                     if is_grayscale16 {
                         ui.separator();
                         ui.label("WC:");
@@ -469,12 +665,13 @@ impl eframe::App for DicomViewApp {
                 }
 
                 // Slice navigation
-                if self.images.len() > 1 {
+                let active_len = self.active_series_len();
+                if active_len > 1 {
                     ui.separator();
-                    ui.label(format!("Slice: {}/{}", self.current_slice + 1, self.images.len()));
+                    ui.label(format!("Slice: {}/{}", self.current_slice + 1, active_len));
                     let mut slice_val = self.current_slice as i32;
                     let slider = ui.add(
-                        egui::Slider::new(&mut slice_val, 0..=(self.images.len() - 1) as i32)
+                        egui::Slider::new(&mut slice_val, 0..=(active_len - 1) as i32)
                             .show_value(false)
                     );
                     if slider.changed() {
@@ -486,8 +683,11 @@ impl eframe::App for DicomViewApp {
         });
 
         // ── Metadata side panel ───────────────────────────────────────────────
-        if self.show_metadata && !self.images.is_empty() {
-            let metadata = &self.images[self.current_slice].metadata;
+        if self.show_metadata && self.active_series_len() > 0 {
+            let Some(active_image) = self.active_image() else {
+                return;
+            };
+            let metadata = &active_image.metadata;
             if !metadata.is_empty() {
                 egui::SidePanel::right("metadata_panel")
                     .min_width(180.0)
@@ -544,7 +744,7 @@ impl eframe::App for DicomViewApp {
 
             if self.texture.is_none() {
                 ui.centered_and_justified(|ui| {
-                    ui.label("Open DICOM files or drag and drop them here");
+                    ui.label("Open DICOM files/folders or drag and drop them here");
                 });
                 return;
             }
@@ -575,12 +775,12 @@ impl eframe::App for DicomViewApp {
                 // - Single-image mode: scroll zooms.
                 let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
                 if response.hovered() && scroll_delta != 0.0 {
-                    if self.images.len() > 1 {
+                    if self.active_series_len() > 1 {
                         // Scroll to change slice
                         if scroll_delta > 0.0 && self.current_slice > 0 {
                             self.current_slice -= 1;
                             self.wl_dirty = true;
-                        } else if scroll_delta < 0.0 && self.current_slice < self.images.len() - 1 {
+                        } else if scroll_delta < 0.0 && self.current_slice < self.active_series_len() - 1 {
                             self.current_slice += 1;
                             self.wl_dirty = true;
                         }
@@ -600,13 +800,13 @@ impl eframe::App for DicomViewApp {
                     }
                 }
                 // Middle mouse button → scroll through slices (if multiple images)
-                else if response.hovered() && middle_down && self.images.len() > 1 {
+                else if response.hovered() && middle_down && self.active_series_len() > 1 {
                     let delta = response.drag_delta();
                     // Upward drag → previous slice, downward → next slice
                     if delta.y > 2.0 && self.current_slice > 0 {
                         self.current_slice -= 1;
                         self.wl_dirty = true;
-                    } else if delta.y < -2.0 && self.current_slice < self.images.len() - 1 {
+                    } else if delta.y < -2.0 && self.current_slice < self.active_series_len() - 1 {
                         self.current_slice += 1;
                         self.wl_dirty = true;
                     }
@@ -619,10 +819,8 @@ impl eframe::App for DicomViewApp {
                 // Horizontal drag adjusts Window Width; vertical drag adjusts Window Centre.
                 // Only meaningful for 16-bit grayscale; ignored otherwise.
                 else if response.dragged_by(egui::PointerButton::Secondary) && !left_down {
-                    if !self.images.is_empty() {
-                        let is_grayscale16 = self.images[self.current_slice]
-                            .raw_image
-                            .is_grayscale16();
+                    if let Some(active_image) = self.active_image() {
+                        let is_grayscale16 = active_image.raw_image.is_grayscale16();
                         if is_grayscale16 {
                             let delta = response.drag_delta();
                             // Scale factor: drag 1px ≈ 2 HU change (reasonable for CT).

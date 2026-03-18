@@ -23,7 +23,8 @@ dirs = "4.0"
 dicor_rs = { package = "dicor-rs", path = "../dicor-rs" }
 dicom_viewer = { path = "../dicom_viewer" }
 divue_rs = { package = "divue-rs", path = "../divue-rs" }
-dicom-object = "0.6"
+dicom-pixeldata = "0.9"
+dicom-object = "0.9"
 
 [dev-dependencies]
 tempfile = "3.6"
