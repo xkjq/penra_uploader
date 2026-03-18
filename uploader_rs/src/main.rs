@@ -182,6 +182,54 @@ impl AppState {
     fn anon_dir(&self) -> PathBuf {
         self.export_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon")
     }
+
+    // Handle an incoming message string (extracted from the UI update loop).
+    // Extracted so tests can exercise UI state transitions without running egui.
+    fn handle_message(&mut self, m: &str) {
+        if m == "done" {
+            self.last_msg = "Processing complete".to_string();
+            self.processing_step = None;
+            self.processing_progress = 0.0;
+        } else if m == "PROC:DONE" {
+            self.last_msg = "Processing complete".to_string();
+            self.processing_step = None;
+            self.processing_progress = 0.0;
+        } else if m == "scan_written" {
+            if let Ok(txt) = std::fs::read_to_string(".last_scan.json") {
+                if let Ok(v) = serde_json::from_str::<Vec<SeriesInfo>>(&txt) {
+                    self.ready_series = v;
+                    self.selected_series = vec![true; self.ready_series.len()];
+                    self.last_msg = "Ready-to-upload refreshed".to_string();
+                }
+            }
+        } else if m.starts_with("duplicates_cleared:") {
+            if let Some(n) = m.strip_prefix("duplicates_cleared:") {
+                if let Ok(num) = n.parse::<usize>() {
+                    self.last_msg = format!("Cleared {} duplicate files", num);
+                }
+            }
+        } else if m.starts_with("LOGIN_USER:") {
+            if let Some(name) = m.strip_prefix("LOGIN_USER:") {
+                self.logged_in_user = Some(name.to_string());
+                self.login_open = false;
+                self.last_msg = format!("Logged in as {}", name);
+            }
+        } else if m.starts_with("PROC:STEP:") {
+            if let Some(step) = m.strip_prefix("PROC:STEP:") {
+                self.processing_step = Some(step.to_string());
+                self.last_msg = step.to_string();
+            }
+        } else if m.starts_with("PROC:PROG:") {
+            if let Some(p) = m.strip_prefix("PROC:PROG:") {
+                if let Ok(v) = p.parse::<f32>() {
+                    self.processing_progress = v.clamp(0.0, 1.0);
+                }
+            }
+        } else {
+            self.processed.push(m.to_string());
+            self.last_msg = m.to_string();
+        }
+    }
 }
 
 impl eframe::App for AppState {
@@ -466,51 +514,7 @@ impl eframe::App for AppState {
             ui.separator();
             if let Some(rx) = &self.rx {
                 match rx.try_recv() {
-                    Ok(m) => {
-                        if m == "done" {
-                            self.last_msg = "Processing complete".to_string();
-                            self.processing_step = None;
-                            self.processing_progress = 0.0;
-                        } else if m == "PROC:DONE" {
-                            self.last_msg = "Processing complete".to_string();
-                            self.processing_step = None;
-                            self.processing_progress = 0.0;
-                        } else if m == "scan_written" {
-                            if let Ok(txt) = std::fs::read_to_string(".last_scan.json") {
-                                if let Ok(v) = serde_json::from_str::<Vec<SeriesInfo>>(&txt) {
-                                    self.ready_series = v;
-                                    self.selected_series = vec![true; self.ready_series.len()];
-                                    self.last_msg = "Ready-to-upload refreshed".to_string();
-                                }
-                            }
-                        } else if m.starts_with("duplicates_cleared:") {
-                            if let Some(n) = m.strip_prefix("duplicates_cleared:") {
-                                if let Ok(num) = n.parse::<usize>() {
-                                    self.last_msg = format!("Cleared {} duplicate files", num);
-                                }
-                            }
-                        } else if m.starts_with("LOGIN_USER:") {
-                            if let Some(name) = m.strip_prefix("LOGIN_USER:") {
-                                self.logged_in_user = Some(name.to_string());
-                                self.login_open = false;
-                                self.last_msg = format!("Logged in as {}", name);
-                            }
-                        } else if m.starts_with("PROC:STEP:") {
-                            if let Some(step) = m.strip_prefix("PROC:STEP:") {
-                                self.processing_step = Some(step.to_string());
-                                self.last_msg = step.to_string();
-                            }
-                        } else if m.starts_with("PROC:PROG:") {
-                            if let Some(p) = m.strip_prefix("PROC:PROG:") {
-                                if let Ok(v) = p.parse::<f32>() {
-                                    self.processing_progress = v.clamp(0.0, 1.0);
-                                }
-                            }
-                        } else {
-                            self.processed.push(m.clone());
-                            self.last_msg = m;
-                        }
-                    }
+                    Ok(m) => { self.handle_message(&m); }
                     Err(_) => {}
                 }
             }
@@ -561,19 +565,30 @@ impl eframe::App for AppState {
                                 thread::spawn(move || {
                                     match scan_for_upload(&anon_dir) {
                                         Ok(series) => {
-                                            let mut deleted = 0usize;
-                                            for s in &series {
-                                                for f in &s.files {
-                                                    if f.is_duplicate {
-                                                        if std::fs::remove_file(&f.path).is_ok() {
-                                                            upload::log_rpc(&format!("Deleted duplicate file: {}", f.path.display()));
-                                                            deleted += 1;
-                                                        } else {
-                                                            upload::log_rpc(&format!("Failed to delete duplicate file: {}", f.path.display()));
+                                                let mut deleted = 0usize;
+                                                let total_dup: usize = series.iter().map(|s| s.files.iter().filter(|f| f.is_duplicate).count()).sum();
+                                                if total_dup > 0 {
+                                                    let _ = tx.send("PROC:STEP:Removing duplicates".to_string());
+                                                    let _ = tx.send(format!("PROC:PROG:{}", 0.0));
+                                                }
+                                                let mut processed_dup = 0usize;
+                                                for s in &series {
+                                                    for f in &s.files {
+                                                        if f.is_duplicate {
+                                                            if std::fs::remove_file(&f.path).is_ok() {
+                                                                upload::log_rpc(&format!("Deleted duplicate file: {}", f.path.display()));
+                                                                deleted += 1;
+                                                            } else {
+                                                                upload::log_rpc(&format!("Failed to delete duplicate file: {}", f.path.display()));
+                                                            }
+                                                            processed_dup = processed_dup.saturating_add(1);
+                                                            if total_dup > 0 {
+                                                                let prog = (processed_dup as f32 / total_dup as f32).clamp(0.0, 1.0);
+                                                                let _ = tx.send(format!("PROC:PROG:{}", prog));
+                                                            }
                                                         }
                                                     }
                                                 }
-                                            }
                                             // after deletions, do a fresh scan so GUI reflects current anon dir
                                             match scan_for_upload(&anon_dir) {
                                                 Ok(new_series) => {
@@ -888,6 +903,12 @@ impl eframe::App for AppState {
                                 match scan_for_upload(&anon_dir) {
                                     Ok(series) => {
                                         let mut removed = 0usize;
+                                        let total_files: usize = series.iter().map(|s| s.files.len()).sum();
+                                        if total_files > 0 {
+                                            let _ = tx.send("PROC:STEP:Removing files".to_string());
+                                            let _ = tx.send(format!("PROC:PROG:{}", 0.0));
+                                        }
+                                        let mut processed_files = 0usize;
                                         for s in &series {
                                             for f in &s.files {
                                                 if std::fs::remove_file(&f.path).is_ok() {
@@ -895,6 +916,11 @@ impl eframe::App for AppState {
                                                     removed += 1;
                                                 } else {
                                                     upload::log_rpc(&format!("Failed to remove file: {}", f.path.display()));
+                                                }
+                                                processed_files = processed_files.saturating_add(1);
+                                                if total_files > 0 {
+                                                    let prog = (processed_files as f32 / total_files as f32).clamp(0.0, 1.0);
+                                                    let _ = tx.send(format!("PROC:PROG:{}", prog));
                                                 }
                                             }
                                         }

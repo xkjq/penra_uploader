@@ -49,6 +49,14 @@ impl MprPlane {
             MprPlane::Sagittal => "Sagittal",
         }
     }
+
+    fn patient_axes(self) -> (PatientAxis, PatientAxis, PatientAxis) {
+        match self {
+            MprPlane::Axial => (PatientAxis::X, PatientAxis::Y, PatientAxis::Z),
+            MprPlane::Coronal => (PatientAxis::X, PatientAxis::Z, PatientAxis::Y),
+            MprPlane::Sagittal => (PatientAxis::Y, PatientAxis::Z, PatientAxis::X),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,12 +66,20 @@ enum PatientAxis {
     Z,
 }
 
-impl MprPlane {
-    fn normal_axis(self) -> PatientAxis {
+impl PatientAxis {
+    fn index(self) -> usize {
         match self {
-            MprPlane::Axial => PatientAxis::Z,
-            MprPlane::Coronal => PatientAxis::Y,
-            MprPlane::Sagittal => PatientAxis::X,
+            PatientAxis::X => 0,
+            PatientAxis::Y => 1,
+            PatientAxis::Z => 2,
+        }
+    }
+
+    fn unit(self) -> [f32; 3] {
+        match self {
+            PatientAxis::X => [1.0, 0.0, 0.0],
+            PatientAxis::Y => [0.0, 1.0, 0.0],
+            PatientAxis::Z => [0.0, 0.0, 1.0],
         }
     }
 }
@@ -76,26 +92,44 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-fn dominant_patient_axis(direction: [f32; 3]) -> Option<PatientAxis> {
-    let magnitudes = [direction[0].abs(), direction[1].abs(), direction[2].abs()];
-    let mut best_index = 0usize;
-    let mut best_value = magnitudes[0];
-    for (idx, value) in magnitudes.iter().enumerate().skip(1) {
-        if *value > best_value {
-            best_index = idx;
-            best_value = *value;
-        }
-    }
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
 
-    if best_value < 0.75 {
-        return None;
-    }
+fn add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
 
-    Some(match best_index {
-        0 => PatientAxis::X,
-        1 => PatientAxis::Y,
-        _ => PatientAxis::Z,
-    })
+fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn scale(v: [f32; 3], factor: f32) -> [f32; 3] {
+    [v[0] * factor, v[1] * factor, v[2] * factor]
+}
+
+fn magnitude(v: [f32; 3]) -> f32 {
+    dot(v, v).sqrt()
+}
+
+fn normalize(v: [f32; 3]) -> Option<[f32; 3]> {
+    let mag = magnitude(v);
+    (mag > 1e-6).then_some(scale(v, 1.0 / mag))
+}
+
+fn axis_aligned_patient_point(
+    u_axis: PatientAxis,
+    v_axis: PatientAxis,
+    w_axis: PatientAxis,
+    u: f32,
+    v: f32,
+    w: f32,
+) -> [f32; 3] {
+    let mut point = [0.0; 3];
+    point[u_axis.index()] = u;
+    point[v_axis.index()] = v;
+    point[w_axis.index()] = w;
+    point
 }
 
 #[derive(Debug)]
@@ -108,9 +142,14 @@ struct MprVolume {
     col_spacing: f32,
     slice_spacing: f32,
     default_wc_ww: (f32, f32),
-    column_axis: PatientAxis,
-    row_axis: PatientAxis,
-    slice_axis: PatientAxis,
+    background_value: f32,
+    origin: [f32; 3],
+    column_dir: [f32; 3],
+    row_dir: [f32; 3],
+    slice_dir: [f32; 3],
+    patient_min: [f32; 3],
+    patient_max: [f32; 3],
+    patient_axis_spacing: [f32; 3],
 }
 
 impl MprVolume {
@@ -133,19 +172,25 @@ impl MprVolume {
         };
 
         let (width, height) = first.raw_image.dimensions();
-        let pixel_spacing = first.pixel_spacing.unwrap_or([1.0, 1.0]);
-        let (column_axis, row_axis, slice_axis) = first
+        let first_orientation = first
             .image_orientation_patient
-            .and_then(|orientation| {
-                let column = dominant_patient_axis([orientation[0], orientation[1], orientation[2]])?;
-                let row = dominant_patient_axis([orientation[3], orientation[4], orientation[5]])?;
-                let slice = dominant_patient_axis(cross(
-                    [orientation[0], orientation[1], orientation[2]],
-                    [orientation[3], orientation[4], orientation[5]],
-                ))?;
-                ((column != row) && (column != slice) && (row != slice)).then_some((column, row, slice))
-            })
-            .unwrap_or((PatientAxis::X, PatientAxis::Y, PatientAxis::Z));
+            .ok_or_else(|| "MPR requires ImageOrientationPatient for every slice".to_string())?;
+        let column_dir = normalize([
+            first_orientation[0],
+            first_orientation[1],
+            first_orientation[2],
+        ])
+        .ok_or_else(|| "Invalid ImageOrientationPatient row direction".to_string())?;
+        let row_dir = normalize([
+            first_orientation[3],
+            first_orientation[4],
+            first_orientation[5],
+        ])
+        .ok_or_else(|| "Invalid ImageOrientationPatient column direction".to_string())?;
+        if dot(column_dir, row_dir).abs() > 1e-3 {
+            return Err("MPR requires orthogonal ImageOrientationPatient vectors".to_string());
+        }
+        let pixel_spacing = first.pixel_spacing.unwrap_or([1.0, 1.0]);
         let fallback_spacing = first
             .spacing_between_slices
             .or(first.slice_thickness)
@@ -167,6 +212,7 @@ impl MprVolume {
         let mut min_val = f32::MAX;
         let mut max_val = f32::MIN;
         let mut positions = Vec::with_capacity(slices.len());
+        let mut patient_positions = Vec::with_capacity(slices.len());
 
         for slice in &slices {
             let (slice_width, slice_height) = slice.raw_image.dimensions();
@@ -182,21 +228,22 @@ impl MprVolume {
                 }
             }
 
-            if let Some(orientation) = slice.image_orientation_patient {
-                let slice_axes = (
-                    dominant_patient_axis([orientation[0], orientation[1], orientation[2]]),
-                    dominant_patient_axis([orientation[3], orientation[4], orientation[5]]),
-                    dominant_patient_axis(cross(
-                        [orientation[0], orientation[1], orientation[2]],
-                        [orientation[3], orientation[4], orientation[5]],
-                    )),
-                );
-                if slice_axes != (Some(column_axis), Some(row_axis), Some(slice_axis)) {
-                    return Err("MPR requires a series with consistent slice orientation".to_string());
-                }
+            let position = slice
+                .image_position_patient
+                .ok_or_else(|| "MPR requires ImagePositionPatient for every slice".to_string())?;
+            let orientation = slice
+                .image_orientation_patient
+                .ok_or_else(|| "MPR requires ImageOrientationPatient for every slice".to_string())?;
+            let slice_column = normalize([orientation[0], orientation[1], orientation[2]])
+                .ok_or_else(|| "Invalid ImageOrientationPatient row direction".to_string())?;
+            let slice_row = normalize([orientation[3], orientation[4], orientation[5]])
+                .ok_or_else(|| "Invalid ImageOrientationPatient column direction".to_string())?;
+            if dot(slice_column, column_dir) < 0.999 || dot(slice_row, row_dir) < 0.999 {
+                return Err("MPR requires a series with consistent slice orientation".to_string());
             }
 
             positions.push(slice.slice_position());
+            patient_positions.push(position);
 
             match &slice.raw_image {
                 RawImage::Gray8 { data, .. } => {
@@ -220,6 +267,16 @@ impl MprVolume {
             }
         }
 
+        let mut slice_dir = normalize(cross(column_dir, row_dir))
+            .ok_or_else(|| "Invalid slice normal derived from ImageOrientationPatient".to_string())?;
+        for pair in patient_positions.windows(2) {
+            let delta = sub(pair[1], pair[0]);
+            if let Some(normalized) = normalize(delta) {
+                slice_dir = normalized;
+                break;
+            }
+        }
+
         let slice_spacing = positions
             .windows(2)
             .filter_map(|pair| {
@@ -231,6 +288,67 @@ impl MprVolume {
             .unwrap_or(fallback_spacing);
 
         let default_wc_ww = ((min_val + max_val) / 2.0, (max_val - min_val).max(1.0));
+        let origin = patient_positions
+            .first()
+            .copied()
+            .ok_or_else(|| "No slice positions available for MPR".to_string())?;
+        let column_step = scale(column_dir, pixel_spacing[1].abs().max(0.001));
+        let row_step = scale(row_dir, pixel_spacing[0].abs().max(0.001));
+        let slice_step = scale(slice_dir, slice_spacing.abs().max(0.001));
+        let max_column = width.saturating_sub(1) as f32;
+        let max_row = height.saturating_sub(1) as f32;
+        let max_slice = slices.len().saturating_sub(1) as f32;
+        let corner_offsets = [
+            [0.0, 0.0, 0.0],
+            [max_column, 0.0, 0.0],
+            [0.0, max_row, 0.0],
+            [max_column, max_row, 0.0],
+            [0.0, 0.0, max_slice],
+            [max_column, 0.0, max_slice],
+            [0.0, max_row, max_slice],
+            [max_column, max_row, max_slice],
+        ];
+        let mut patient_min = [f32::MAX; 3];
+        let mut patient_max = [f32::MIN; 3];
+        for [column_idx, row_idx, slice_idx] in corner_offsets {
+            let point = add(
+                origin,
+                add(
+                    scale(column_step, column_idx),
+                    add(scale(row_step, row_idx), scale(slice_step, slice_idx)),
+                ),
+            );
+            for axis in 0..3 {
+                patient_min[axis] = patient_min[axis].min(point[axis]);
+                patient_max[axis] = patient_max[axis].max(point[axis]);
+            }
+        }
+        let axis_spacing = |axis: PatientAxis| {
+            let unit = axis.unit();
+            let candidates = [
+                pixel_spacing[1].abs().max(0.001) * dot(column_dir, unit).abs(),
+                pixel_spacing[0].abs().max(0.001) * dot(row_dir, unit).abs(),
+                slice_spacing.abs().max(0.001) * dot(slice_dir, unit).abs(),
+            ];
+            let best = candidates
+                .into_iter()
+                .filter(|value| *value > 0.125)
+                .fold(f32::MAX, f32::min);
+            if best.is_finite() {
+                best.max(0.125)
+            } else {
+                pixel_spacing[0]
+                    .abs()
+                    .min(pixel_spacing[1].abs())
+                    .min(slice_spacing.abs())
+                    .max(0.125)
+            }
+        };
+        let patient_axis_spacing = [
+            axis_spacing(PatientAxis::X),
+            axis_spacing(PatientAxis::Y),
+            axis_spacing(PatientAxis::Z),
+        ];
 
         Ok(Self {
             data: volume,
@@ -241,106 +359,114 @@ impl MprVolume {
             col_spacing: pixel_spacing[1].abs().max(0.001),
             slice_spacing: slice_spacing.abs().max(0.001),
             default_wc_ww,
-            column_axis,
-            row_axis,
-            slice_axis,
+            background_value: min_val,
+            origin,
+            column_dir,
+            row_dir,
+            slice_dir,
+            patient_min,
+            patient_max,
+            patient_axis_spacing,
         })
     }
 
-    fn native_plane(&self, plane: MprPlane) -> MprPlane {
-        let target = plane.normal_axis();
-        if self.slice_axis == target {
-            MprPlane::Axial
-        } else if self.row_axis == target {
-            MprPlane::Coronal
-        } else if self.column_axis == target {
-            MprPlane::Sagittal
-        } else {
-            plane
-        }
+    fn axis_extent(&self, axis: PatientAxis) -> f32 {
+        let idx = axis.index();
+        (self.patient_max[idx] - self.patient_min[idx]).max(0.0)
     }
 
-    fn native_plane_len(&self, plane: MprPlane) -> usize {
-        match plane {
-            MprPlane::Axial => self.depth,
-            MprPlane::Coronal => self.height,
-            MprPlane::Sagittal => self.width,
-        }
+    fn axis_spacing(&self, axis: PatientAxis) -> f32 {
+        self.patient_axis_spacing[axis.index()]
     }
 
-    fn native_plane_dimensions(&self, plane: MprPlane) -> (usize, usize) {
-        match plane {
-            MprPlane::Axial => (self.width, self.height),
-            MprPlane::Coronal => (self.width, self.depth),
-            MprPlane::Sagittal => (self.height, self.depth),
-        }
+    fn axis_samples(&self, axis: PatientAxis) -> usize {
+        ((self.axis_extent(axis) / self.axis_spacing(axis)).round() as usize)
+            .saturating_add(1)
+            .max(1)
     }
 
-    fn native_physical_size(&self, plane: MprPlane) -> Vec2 {
-        match plane {
-            MprPlane::Axial => egui::vec2(
-                self.width as f32 * self.col_spacing,
-                self.height as f32 * self.row_spacing,
-            ),
-            MprPlane::Coronal => egui::vec2(
-                self.width as f32 * self.col_spacing,
-                self.depth as f32 * self.slice_spacing,
-            ),
-            MprPlane::Sagittal => egui::vec2(
-                self.height as f32 * self.row_spacing,
-                self.depth as f32 * self.slice_spacing,
-            ),
-        }
+    fn axis_coordinate(&self, axis: PatientAxis, index: usize) -> f32 {
+        let idx = axis.index();
+        let coordinate = self.patient_min[idx] + index as f32 * self.axis_spacing(axis);
+        coordinate.min(self.patient_max[idx])
     }
 
-    fn extract_native_plane(&self, plane: MprPlane, index: usize) -> Vec<f32> {
-        let (plane_width, plane_height) = self.native_plane_dimensions(plane);
-        let mut out = vec![0.0; plane_width * plane_height];
-        let slice_len = self.width * self.height;
+    fn sample_trilinear(&self, patient_point: [f32; 3]) -> f32 {
+        let delta = sub(patient_point, self.origin);
+        let column = dot(delta, self.column_dir) / self.col_spacing;
+        let row = dot(delta, self.row_dir) / self.row_spacing;
+        let slice = dot(delta, self.slice_dir) / self.slice_spacing;
 
-        match plane {
-            MprPlane::Axial => {
-                let depth_idx = index.min(self.depth.saturating_sub(1));
-                let start = depth_idx * slice_len;
-                out.copy_from_slice(&self.data[start..start + slice_len]);
-            }
-            MprPlane::Coronal => {
-                let row_idx = index.min(self.height.saturating_sub(1));
-                for depth_idx in 0..self.depth {
-                    let src = depth_idx * slice_len + row_idx * self.width;
-                    let dst = depth_idx * self.width;
-                    out[dst..dst + self.width].copy_from_slice(&self.data[src..src + self.width]);
-                }
-            }
-            MprPlane::Sagittal => {
-                let col_idx = index.min(self.width.saturating_sub(1));
-                for depth_idx in 0..self.depth {
-                    let dst = depth_idx * self.height;
-                    let src = depth_idx * slice_len;
-                    for row_idx in 0..self.height {
-                        out[dst + row_idx] = self.data[src + row_idx * self.width + col_idx];
-                    }
-                }
+        if column < 0.0
+            || row < 0.0
+            || slice < 0.0
+            || column > self.width.saturating_sub(1) as f32
+            || row > self.height.saturating_sub(1) as f32
+            || slice > self.depth.saturating_sub(1) as f32
+        {
+            return self.background_value;
+        }
+
+        let c0 = column.floor() as usize;
+        let r0 = row.floor() as usize;
+        let s0 = slice.floor() as usize;
+        let c1 = (c0 + 1).min(self.width.saturating_sub(1));
+        let r1 = (r0 + 1).min(self.height.saturating_sub(1));
+        let s1 = (s0 + 1).min(self.depth.saturating_sub(1));
+        let dc = column - c0 as f32;
+        let dr = row - r0 as f32;
+        let ds = slice - s0 as f32;
+        let idx = |c: usize, r: usize, s: usize| s * self.width * self.height + r * self.width + c;
+
+        let c00 = self.data[idx(c0, r0, s0)] * (1.0 - dc) + self.data[idx(c1, r0, s0)] * dc;
+        let c01 = self.data[idx(c0, r0, s1)] * (1.0 - dc) + self.data[idx(c1, r0, s1)] * dc;
+        let c10 = self.data[idx(c0, r1, s0)] * (1.0 - dc) + self.data[idx(c1, r1, s0)] * dc;
+        let c11 = self.data[idx(c0, r1, s1)] * (1.0 - dc) + self.data[idx(c1, r1, s1)] * dc;
+        let c0v = c00 * (1.0 - dr) + c10 * dr;
+        let c1v = c01 * (1.0 - dr) + c11 * dr;
+        c0v * (1.0 - ds) + c1v * ds
+    }
+
+    fn plane_len(&self, plane: MprPlane) -> usize {
+        let (_, _, w_axis) = plane.patient_axes();
+        self.axis_samples(w_axis)
+    }
+
+    fn plane_dimensions(&self, plane: MprPlane) -> (usize, usize) {
+        let (u_axis, v_axis, _) = plane.patient_axes();
+        (self.axis_samples(u_axis), self.axis_samples(v_axis))
+    }
+
+    fn physical_size(&self, plane: MprPlane) -> Vec2 {
+        let (u_axis, v_axis, _) = plane.patient_axes();
+        egui::vec2(self.axis_extent(u_axis), self.axis_extent(v_axis))
+    }
+
+    fn extract_plane(&self, plane: MprPlane, index: usize) -> Vec<f32> {
+        let (u_axis, v_axis, w_axis) = plane.patient_axes();
+        let width = self.axis_samples(u_axis);
+        let height = self.axis_samples(v_axis);
+        let slice_index = index.min(self.axis_samples(w_axis).saturating_sub(1));
+        let w_coord = self.axis_coordinate(w_axis, slice_index);
+        let mut out = vec![self.background_value; width * height];
+
+        for row_idx in 0..height {
+            let v_coord = self.axis_coordinate(v_axis, row_idx);
+            for col_idx in 0..width {
+                let u_coord = self.axis_coordinate(u_axis, col_idx);
+                let patient_point = axis_aligned_patient_point(
+                    u_axis,
+                    v_axis,
+                    w_axis,
+                    u_coord,
+                    v_coord,
+                    w_coord,
+                );
+                out[row_idx * width + col_idx] = self.sample_trilinear(patient_point);
             }
         }
 
         out
-    }
-
-    fn plane_len(&self, plane: MprPlane) -> usize {
-        self.native_plane_len(self.native_plane(plane))
-    }
-
-    fn plane_dimensions(&self, plane: MprPlane) -> (usize, usize) {
-        self.native_plane_dimensions(self.native_plane(plane))
-    }
-
-    fn physical_size(&self, plane: MprPlane) -> Vec2 {
-        self.native_physical_size(self.native_plane(plane))
-    }
-
-    fn extract_plane(&self, plane: MprPlane, index: usize) -> Vec<f32> {
-        self.extract_native_plane(self.native_plane(plane), index)
     }
 }
 
@@ -724,7 +850,8 @@ struct DicomViewApp {
     images: Vec<LoadedImage>,
     series_groups: Vec<SeriesGroup>,
     current_series: usize,
-    current_slice: usize,
+    current_stack_slice: usize,
+    current_axial_slice: usize,
     current_coronal_slice: usize,
     current_sagittal_slice: usize,
     view_mode: ViewMode,
@@ -752,7 +879,8 @@ impl DicomViewApp {
             images: Vec::new(),
             series_groups: Vec::new(),
             current_series: 0,
-            current_slice: 0,
+            current_stack_slice: 0,
+            current_axial_slice: 0,
             current_coronal_slice: 0,
             current_sagittal_slice: 0,
             view_mode: ViewMode::Stack,
@@ -781,7 +909,8 @@ impl DicomViewApp {
         self.current_series = 0;
         self.texture = None;
         self.displayed_physical_size = None;
-        self.current_slice = 0;
+        self.current_stack_slice = 0;
+        self.current_axial_slice = 0;
         self.current_coronal_slice = 0;
         self.current_sagittal_slice = 0;
         self.view_mode = ViewMode::Stack;
@@ -830,7 +959,7 @@ impl DicomViewApp {
 
     fn active_image(&self) -> Option<&LoadedImage> {
         let group = self.series_groups.get(self.current_series)?;
-        let global_idx = *group.image_indices.get(self.current_slice)?;
+        let global_idx = *group.image_indices.get(self.current_stack_slice)?;
         self.images.get(global_idx)
     }
 
@@ -848,7 +977,7 @@ impl DicomViewApp {
 
     fn current_mpr_slice(&self) -> usize {
         match self.mpr_plane {
-            MprPlane::Axial => self.current_slice,
+            MprPlane::Axial => self.current_axial_slice,
             MprPlane::Coronal => self.current_coronal_slice,
             MprPlane::Sagittal => self.current_sagittal_slice,
         }
@@ -856,7 +985,7 @@ impl DicomViewApp {
 
     fn set_current_mpr_slice(&mut self, index: usize) {
         match self.mpr_plane {
-            MprPlane::Axial => self.current_slice = index,
+            MprPlane::Axial => self.current_axial_slice = index,
             MprPlane::Coronal => self.current_coronal_slice = index,
             MprPlane::Sagittal => self.current_sagittal_slice = index,
         }
@@ -922,7 +1051,8 @@ impl DicomViewApp {
         groups.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.uid.cmp(&b.uid)));
         self.series_groups = groups;
         self.current_series = 0;
-        self.current_slice = 0;
+        self.current_stack_slice = 0;
+        self.current_axial_slice = 0;
         self.current_coronal_slice = 0;
         self.current_sagittal_slice = 0;
         self.refresh_mpr_volume();
@@ -938,10 +1068,14 @@ impl DicomViewApp {
 
         match MprVolume::from_images(&self.images, &group.image_indices) {
             Ok(volume) => {
-                let coronal_max = volume.height.saturating_sub(1);
-                let sagittal_max = volume.width.saturating_sub(1);
-                let axial_max = volume.depth.saturating_sub(1);
-                self.current_slice = self.current_slice.min(axial_max);
+                let axial_max = volume.plane_len(MprPlane::Axial).saturating_sub(1);
+                let coronal_max = volume.plane_len(MprPlane::Coronal).saturating_sub(1);
+                let sagittal_max = volume.plane_len(MprPlane::Sagittal).saturating_sub(1);
+                self.current_axial_slice = if self.current_axial_slice > axial_max {
+                    axial_max / 2
+                } else {
+                    self.current_axial_slice
+                };
                 self.current_coronal_slice = if self.current_coronal_slice > coronal_max {
                     coronal_max / 2
                 } else {
@@ -952,6 +1086,9 @@ impl DicomViewApp {
                 } else {
                     self.current_sagittal_slice
                 };
+                if self.current_axial_slice == 0 {
+                    self.current_axial_slice = axial_max / 2;
+                }
                 if self.current_coronal_slice == 0 {
                     self.current_coronal_slice = coronal_max / 2;
                 }
@@ -1087,12 +1224,12 @@ impl eframe::App for DicomViewApp {
         ctx.input(|i| {
             if i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowLeft) {
                 let current = match self.view_mode {
-                    ViewMode::Stack => self.current_slice,
+                    ViewMode::Stack => self.current_stack_slice,
                     ViewMode::Mpr => self.current_mpr_slice(),
                 };
                 if current > 0 {
                     match self.view_mode {
-                        ViewMode::Stack => self.current_slice -= 1,
+                        ViewMode::Stack => self.current_stack_slice -= 1,
                         ViewMode::Mpr => self.set_current_mpr_slice(current - 1),
                     }
                     self.wl_dirty = true;
@@ -1101,12 +1238,12 @@ impl eframe::App for DicomViewApp {
             if i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::ArrowRight) {
                 let len = self.current_view_slice_len();
                 let current = match self.view_mode {
-                    ViewMode::Stack => self.current_slice,
+                    ViewMode::Stack => self.current_stack_slice,
                     ViewMode::Mpr => self.current_mpr_slice(),
                 };
                 if current < len.saturating_sub(1) {
                     match self.view_mode {
-                        ViewMode::Stack => self.current_slice += 1,
+                        ViewMode::Stack => self.current_stack_slice += 1,
                         ViewMode::Mpr => self.set_current_mpr_slice(current + 1),
                     }
                     self.wl_dirty = true;
@@ -1158,7 +1295,8 @@ impl eframe::App for DicomViewApp {
                             }
                             if selected_series != self.current_series {
                                 self.current_series = selected_series;
-                                self.current_slice = 0;
+                                self.current_stack_slice = 0;
+                                self.current_axial_slice = 0;
                                 self.current_coronal_slice = 0;
                                 self.current_sagittal_slice = 0;
                                 self.pan = Vec2::ZERO;
@@ -1247,7 +1385,7 @@ impl eframe::App for DicomViewApp {
                 if active_len > 1 {
                     ui.separator();
                     let current_index = match self.view_mode {
-                        ViewMode::Stack => self.current_slice,
+                        ViewMode::Stack => self.current_stack_slice,
                         ViewMode::Mpr => self.current_mpr_slice(),
                     };
                     let label = match self.view_mode {
@@ -1262,7 +1400,7 @@ impl eframe::App for DicomViewApp {
                     );
                     if slider.changed() {
                         match self.view_mode {
-                            ViewMode::Stack => self.current_slice = slice_val as usize,
+                            ViewMode::Stack => self.current_stack_slice = slice_val as usize,
                             ViewMode::Mpr => self.set_current_mpr_slice(slice_val as usize),
                         }
                         self.wl_dirty = true;
@@ -1381,18 +1519,18 @@ impl eframe::App for DicomViewApp {
                     if self.current_view_slice_len() > 1 {
                         // Scroll to change slice
                         let current = match self.view_mode {
-                            ViewMode::Stack => self.current_slice,
+                            ViewMode::Stack => self.current_stack_slice,
                             ViewMode::Mpr => self.current_mpr_slice(),
                         };
                         if scroll_delta > 0.0 && current > 0 {
                             match self.view_mode {
-                                ViewMode::Stack => self.current_slice -= 1,
+                                ViewMode::Stack => self.current_stack_slice -= 1,
                                 ViewMode::Mpr => self.set_current_mpr_slice(current - 1),
                             }
                             self.wl_dirty = true;
                         } else if scroll_delta < 0.0 && current < self.current_view_slice_len() - 1 {
                             match self.view_mode {
-                                ViewMode::Stack => self.current_slice += 1,
+                                ViewMode::Stack => self.current_stack_slice += 1,
                                 ViewMode::Mpr => self.set_current_mpr_slice(current + 1),
                             }
                             self.wl_dirty = true;
@@ -1416,19 +1554,19 @@ impl eframe::App for DicomViewApp {
                 else if response.hovered() && middle_down && self.current_view_slice_len() > 1 {
                     let delta = response.drag_delta();
                     let current = match self.view_mode {
-                        ViewMode::Stack => self.current_slice,
+                        ViewMode::Stack => self.current_stack_slice,
                         ViewMode::Mpr => self.current_mpr_slice(),
                     };
                     // Upward drag → previous slice, downward → next slice
                     if delta.y > 2.0 && current > 0 {
                         match self.view_mode {
-                            ViewMode::Stack => self.current_slice -= 1,
+                            ViewMode::Stack => self.current_stack_slice -= 1,
                             ViewMode::Mpr => self.set_current_mpr_slice(current - 1),
                         }
                         self.wl_dirty = true;
                     } else if delta.y < -2.0 && current < self.current_view_slice_len() - 1 {
                         match self.view_mode {
-                            ViewMode::Stack => self.current_slice += 1,
+                            ViewMode::Stack => self.current_stack_slice += 1,
                             ViewMode::Mpr => self.set_current_mpr_slice(current + 1),
                         }
                         self.wl_dirty = true;
@@ -1531,7 +1669,7 @@ mod tests {
     fn gray16_image(
         filename: &str,
         instance_number: i32,
-        position_z: f32,
+        patient_position: [f32; 3],
         pixel_spacing: [f32; 2],
         width: usize,
         height: usize,
@@ -1552,7 +1690,7 @@ mod tests {
             pixel_spacing: Some(pixel_spacing),
             slice_thickness: Some(2.0),
             spacing_between_slices: Some(2.0),
-            image_position_patient: Some([0.0, 0.0, position_z]),
+            image_position_patient: Some(patient_position),
             image_orientation_patient: Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
         }
     }
@@ -1560,8 +1698,8 @@ mod tests {
     #[test]
     fn mpr_volume_sorts_slices_and_extracts_planes() {
         let images = vec![
-            gray16_image("slice-2", 2, 2.0, [0.5, 1.5], 3, 2, &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]),
-            gray16_image("slice-1", 1, 0.0, [0.5, 1.5], 3, 2, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            gray16_image("slice-2", 2, [0.0, 0.0, 2.0], [0.5, 1.5], 3, 2, &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]),
+            gray16_image("slice-1", 1, [0.0, 0.0, 0.0], [0.5, 1.5], 3, 2, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
         ];
 
         let volume = MprVolume::from_images(&images, &[0, 1]).expect("volume should build");
@@ -1586,8 +1724,8 @@ mod tests {
     #[test]
     fn mpr_planes_follow_patient_orientation_for_coronal_acquisition() {
         let mut images = vec![
-            gray16_image("slice-2", 2, 2.0, [0.5, 1.5], 3, 2, &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]),
-            gray16_image("slice-1", 1, 0.0, [0.5, 1.5], 3, 2, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            gray16_image("slice-2", 2, [0.0, -2.0, 0.0], [0.5, 1.5], 3, 2, &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]),
+            gray16_image("slice-1", 1, [0.0, 0.0, 0.0], [0.5, 1.5], 3, 2, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
         ];
         for image in &mut images {
             image.image_orientation_patient = Some([1.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
@@ -1595,15 +1733,35 @@ mod tests {
 
         let volume = MprVolume::from_images(&images, &[0, 1]).expect("volume should build");
 
-        assert_eq!(volume.native_plane(MprPlane::Axial), MprPlane::Coronal);
-        assert_eq!(volume.native_plane(MprPlane::Coronal), MprPlane::Axial);
-        assert_eq!(volume.native_plane(MprPlane::Sagittal), MprPlane::Sagittal);
         assert_eq!(volume.plane_dimensions(MprPlane::Axial), (3, 2));
         assert_eq!(
             volume.extract_plane(MprPlane::Axial, 1),
-            vec![4.0, 5.0, 6.0, 10.0, 11.0, 12.0]
+            vec![10.0, 11.0, 12.0, 4.0, 5.0, 6.0]
         );
         assert_eq!(volume.plane_len(MprPlane::Coronal), 2);
+    }
+
+    #[test]
+    fn mpr_resamples_oblique_series_in_patient_space() {
+        let mut images = vec![
+            gray16_image("slice-2", 2, [0.0, 0.0, 2.0], [1.0, 1.0], 2, 2, &[5.0, 6.0, 7.0, 8.0]),
+            gray16_image("slice-1", 1, [0.0, 0.0, 0.0], [1.0, 1.0], 2, 2, &[1.0, 2.0, 3.0, 4.0]),
+        ];
+        let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+        for image in &mut images {
+            image.image_orientation_patient = Some([inv_sqrt2, inv_sqrt2, 0.0, 0.0, 0.0, 1.0]);
+        }
+        images[0].image_position_patient = Some([-inv_sqrt2 * 2.0, inv_sqrt2 * 2.0, 0.0]);
+        images[1].image_position_patient = Some([0.0, 0.0, 0.0]);
+
+        let volume = MprVolume::from_images(&images, &[0, 1]).expect("oblique volume should build");
+
+        assert!(volume.plane_len(MprPlane::Sagittal) >= 2);
+        assert!(volume.plane_dimensions(MprPlane::Axial).0 >= 2);
+        assert!(volume.plane_dimensions(MprPlane::Axial).1 >= 2);
+        let axial = volume.extract_plane(MprPlane::Axial, 0);
+        assert!(axial.iter().any(|value| (*value - 1.0).abs() < 1e-3));
+        assert!(axial.iter().copied().fold(f32::MIN, f32::max) > 1.5);
     }
 
     #[test]
