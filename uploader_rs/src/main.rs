@@ -538,6 +538,9 @@ impl eframe::App for AppState {
                                 if ui.add(egui::Button::new("Upload anonymized files").fill(egui::Color32::from_rgb(0,150,60))).clicked() {
                                 let anon_dir = self.anon_dir();
                                 let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
+                                // show immediate progress indicator before scanning
+                                let _ = tx.send("PROC:STEP:Uploading anonymized files".to_string());
+                                let _ = tx.send(format!("PROC:PROG:{}", 0.0));
                                 thread::spawn(move || {
                                     match upload_anon_dir(&anon_dir, None, Some(tx.clone())) {
                                         Ok(res) => {
@@ -899,6 +902,9 @@ impl eframe::App for AppState {
                         if ui.add(egui::Button::new("Yes, remove all").fill(egui::Color32::from_rgb(180,20,20))).clicked() {
                             let anon_dir = self.anon_dir();
                             let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
+                            // immediately set UI state so progress bar appears before scan
+                            let _ = tx.send("PROC:STEP:Removing files".to_string());
+                            let _ = tx.send(format!("PROC:PROG:{}", 0.0));
                             thread::spawn(move || {
                                 match scan_for_upload(&anon_dir) {
                                     Ok(series) => {
