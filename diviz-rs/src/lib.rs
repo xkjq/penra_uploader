@@ -28,6 +28,230 @@ struct Gray16 {
     height: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Stack,
+    Mpr,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MprPlane {
+    Axial,
+    Coronal,
+    Sagittal,
+}
+
+impl MprPlane {
+    fn label(self) -> &'static str {
+        match self {
+            MprPlane::Axial => "Axial",
+            MprPlane::Coronal => "Coronal",
+            MprPlane::Sagittal => "Sagittal",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MprVolume {
+    data: Vec<f32>,
+    width: usize,
+    height: usize,
+    depth: usize,
+    row_spacing: f32,
+    col_spacing: f32,
+    slice_spacing: f32,
+    default_wc_ww: (f32, f32),
+}
+
+impl MprVolume {
+    fn from_images(images: &[LoadedImage], indices: &[usize]) -> Result<Self, String> {
+        if indices.len() < 2 {
+            return Err("MPR requires at least 2 slices in the selected series".to_string());
+        }
+
+        let mut slices: Vec<&LoadedImage> = indices
+            .iter()
+            .filter_map(|idx| images.get(*idx))
+            .collect();
+
+        if slices.len() < 2 {
+            return Err("MPR requires at least 2 readable slices in the selected series".to_string());
+        }
+
+        let Some(first) = slices.first() else {
+            return Err("No slices available for MPR".to_string());
+        };
+
+        let (width, height) = first.raw_image.dimensions();
+        let pixel_spacing = first.pixel_spacing.unwrap_or([1.0, 1.0]);
+        let fallback_spacing = first
+            .spacing_between_slices
+            .or(first.slice_thickness)
+            .unwrap_or(1.0)
+            .abs()
+            .max(0.001);
+
+        slices.sort_by(|a, b| {
+            let pos_a = a.slice_position();
+            let pos_b = b.slice_position();
+            pos_a
+                .partial_cmp(&pos_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.instance_number.cmp(&b.instance_number))
+                .then_with(|| a.filename.cmp(&b.filename))
+        });
+
+        let mut volume = Vec::with_capacity(width * height * slices.len());
+        let mut min_val = f32::MAX;
+        let mut max_val = f32::MIN;
+        let mut positions = Vec::with_capacity(slices.len());
+
+        for slice in &slices {
+            let (slice_width, slice_height) = slice.raw_image.dimensions();
+            if slice_width != width || slice_height != height {
+                return Err("MPR requires a series where every slice has identical dimensions".to_string());
+            }
+
+            if let Some(spacing) = slice.pixel_spacing {
+                let same_spacing = (spacing[0] - pixel_spacing[0]).abs() < 1e-3
+                    && (spacing[1] - pixel_spacing[1]).abs() < 1e-3;
+                if !same_spacing {
+                    return Err("MPR requires consistent pixel spacing across the series".to_string());
+                }
+            }
+
+            positions.push(slice.slice_position());
+
+            match &slice.raw_image {
+                RawImage::Gray8 { data, .. } => {
+                    for &value in data {
+                        let value = value as f32;
+                        min_val = min_val.min(value);
+                        max_val = max_val.max(value);
+                        volume.push(value);
+                    }
+                }
+                RawImage::Gray16(gray) => {
+                    for &value in &gray.data {
+                        min_val = min_val.min(value);
+                        max_val = max_val.max(value);
+                        volume.push(value);
+                    }
+                }
+                RawImage::Rgb8 { .. } => {
+                    return Err("MPR is only available for grayscale series".to_string());
+                }
+            }
+        }
+
+        let slice_spacing = positions
+            .windows(2)
+            .filter_map(|pair| {
+                let delta = (pair[1] - pair[0]).abs();
+                (delta > 1e-3).then_some(delta)
+            })
+            .reduce(|acc, value| acc + value)
+            .map(|sum| sum / (positions.windows(2).filter(|pair| (pair[1] - pair[0]).abs() > 1e-3).count() as f32))
+            .unwrap_or(fallback_spacing);
+
+        let default_wc_ww = ((min_val + max_val) / 2.0, (max_val - min_val).max(1.0));
+
+        Ok(Self {
+            data: volume,
+            width,
+            height,
+            depth: slices.len(),
+            row_spacing: pixel_spacing[0].abs().max(0.001),
+            col_spacing: pixel_spacing[1].abs().max(0.001),
+            slice_spacing: slice_spacing.abs().max(0.001),
+            default_wc_ww,
+        })
+    }
+
+    fn plane_len(&self, plane: MprPlane) -> usize {
+        match plane {
+            MprPlane::Axial => self.depth,
+            MprPlane::Coronal => self.height,
+            MprPlane::Sagittal => self.width,
+        }
+    }
+
+    fn plane_dimensions(&self, plane: MprPlane) -> (usize, usize) {
+        match plane {
+            MprPlane::Axial => (self.width, self.height),
+            MprPlane::Coronal => (self.width, self.depth),
+            MprPlane::Sagittal => (self.height, self.depth),
+        }
+    }
+
+    fn physical_size(&self, plane: MprPlane) -> Vec2 {
+        match plane {
+            MprPlane::Axial => egui::vec2(
+                self.width as f32 * self.col_spacing,
+                self.height as f32 * self.row_spacing,
+            ),
+            MprPlane::Coronal => egui::vec2(
+                self.width as f32 * self.col_spacing,
+                self.depth as f32 * self.slice_spacing,
+            ),
+            MprPlane::Sagittal => egui::vec2(
+                self.height as f32 * self.row_spacing,
+                self.depth as f32 * self.slice_spacing,
+            ),
+        }
+    }
+
+    fn extract_plane(&self, plane: MprPlane, index: usize) -> Vec<f32> {
+        let (plane_width, plane_height) = self.plane_dimensions(plane);
+        let mut out = vec![0.0; plane_width * plane_height];
+        let slice_len = self.width * self.height;
+
+        match plane {
+            MprPlane::Axial => {
+                let depth_idx = index.min(self.depth.saturating_sub(1));
+                let start = depth_idx * slice_len;
+                out.copy_from_slice(&self.data[start..start + slice_len]);
+            }
+            MprPlane::Coronal => {
+                let row_idx = index.min(self.height.saturating_sub(1));
+                for depth_idx in 0..self.depth {
+                    let src = depth_idx * slice_len + row_idx * self.width;
+                    let dst = depth_idx * self.width;
+                    out[dst..dst + self.width].copy_from_slice(&self.data[src..src + self.width]);
+                }
+            }
+            MprPlane::Sagittal => {
+                let col_idx = index.min(self.width.saturating_sub(1));
+                for depth_idx in 0..self.depth {
+                    let dst = depth_idx * self.height;
+                    let src = depth_idx * slice_len;
+                    for row_idx in 0..self.height {
+                        out[dst + row_idx] = self.data[src + row_idx * self.width + col_idx];
+                    }
+                }
+            }
+        }
+
+        out
+    }
+}
+
+fn scalar_to_rgba(data: &[f32], wc: f32, ww: f32) -> Vec<u8> {
+    let mut rgba = vec![0u8; data.len() * 4];
+    let lo = wc - ww / 2.0;
+    let hi = wc + ww / 2.0;
+    let denom = (hi - lo).max(f32::EPSILON);
+    for (i, &value) in data.iter().enumerate() {
+        let norm = ((value - lo) / denom).clamp(0.0, 1.0);
+        let byte = (norm * 255.0) as u8;
+        rgba[i * 4] = byte;
+        rgba[i * 4 + 1] = byte;
+        rgba[i * 4 + 2] = byte;
+        rgba[i * 4 + 3] = 255;
+    }
+    rgba
+}
+
 enum RawImage {
     Gray8 {
         data: Vec<u8>,
@@ -69,21 +293,7 @@ impl RawImage {
                 }
                 rgba
             }
-            RawImage::Gray16(g) => {
-                let n = g.width * g.height;
-                let mut rgba = vec![0u8; n * 4];
-                let lo = wc - ww / 2.0;
-                let hi = wc + ww / 2.0;
-                for (i, &v) in g.data.iter().enumerate() {
-                    let norm = ((v - lo) / (hi - lo)).clamp(0.0, 1.0);
-                    let byte = (norm * 255.0) as u8;
-                    rgba[i * 4] = byte;
-                    rgba[i * 4 + 1] = byte;
-                    rgba[i * 4 + 2] = byte;
-                    rgba[i * 4 + 3] = 255;
-                }
-                rgba
-            }
+            RawImage::Gray16(g) => scalar_to_rgba(&g.data, wc, ww),
             RawImage::Rgb8 { data, width, height } => {
                 let n = width * height;
                 let mut rgba = vec![0u8; n * 4];
@@ -108,6 +318,46 @@ struct LoadedImage {
     series_label: String,
     instance_number: Option<i32>,
     default_wc_ww: Option<(f32, f32)>,
+    pixel_spacing: Option<[f32; 2]>,
+    slice_thickness: Option<f32>,
+    spacing_between_slices: Option<f32>,
+    image_position_patient: Option<[f32; 3]>,
+    image_orientation_patient: Option<[f32; 6]>,
+}
+
+impl LoadedImage {
+    fn physical_size(&self) -> Vec2 {
+        let (width, height) = self.raw_image.dimensions();
+        if let Some([row_spacing, col_spacing]) = self.pixel_spacing {
+            egui::vec2(
+                width as f32 * col_spacing.abs().max(0.001),
+                height as f32 * row_spacing.abs().max(0.001),
+            )
+        } else {
+            egui::vec2(width as f32, height as f32)
+        }
+    }
+
+    fn slice_position(&self) -> f32 {
+        if let (Some(position), Some(orientation)) = (
+            self.image_position_patient,
+            self.image_orientation_patient,
+        ) {
+            let row = [orientation[0], orientation[1], orientation[2]];
+            let col = [orientation[3], orientation[4], orientation[5]];
+            let normal = [
+                row[1] * col[2] - row[2] * col[1],
+                row[2] * col[0] - row[0] * col[2],
+                row[0] * col[1] - row[1] * col[0],
+            ];
+            let normal_mag = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+            if normal_mag > 1e-6 {
+                return position[0] * normal[0] + position[1] * normal[1] + position[2] * normal[2];
+            }
+        }
+
+        self.instance_number.map(|value| value as f32).unwrap_or(0.0)
+    }
 }
 
 struct SeriesGroup {
@@ -235,6 +485,13 @@ fn decode_single_file(path: &PathBuf) -> Result<LoadedImage, String> {
             s.split('\\').next().and_then(|v| v.trim().parse::<i32>().ok())
         })
     };
+    let get_multi_f32 = |tag: Tag, expected: usize| -> Option<Vec<f32>> {
+        let values = get_str(tag)?
+            .split('\\')
+            .filter_map(|value| value.trim().parse::<f32>().ok())
+            .collect::<Vec<_>>();
+        (values.len() >= expected).then_some(values)
+    };
 
     let series_uid = get_str(Tag(0x0020, 0x000E)).unwrap_or_else(|| "NO_SERIES_UID".to_string());
     let series_desc = get_str(Tag(0x0008, 0x103E)).unwrap_or_else(|| "(no description)".to_string());
@@ -249,6 +506,13 @@ fn decode_single_file(path: &PathBuf) -> Result<LoadedImage, String> {
     let rescale_slope = get_f32(Tag(0x0028, 0x1053)).unwrap_or(1.0);
     let wc_dicom = get_f32(Tag(0x0028, 0x1050));
     let ww_dicom = get_f32(Tag(0x0028, 0x1051));
+    let pixel_spacing = get_multi_f32(Tag(0x0028, 0x0030), 2).map(|values| [values[0], values[1]]);
+    let slice_thickness = get_f32(Tag(0x0018, 0x0050));
+    let spacing_between_slices = get_f32(Tag(0x0018, 0x0088));
+    let image_position_patient = get_multi_f32(Tag(0x0020, 0x0032), 3)
+        .map(|values| [values[0], values[1], values[2]]);
+    let image_orientation_patient = get_multi_f32(Tag(0x0020, 0x0037), 6)
+        .map(|values| [values[0], values[1], values[2], values[3], values[4], values[5]]);
 
     let pixel_data = obj
         .decode_pixel_data()
@@ -343,6 +607,11 @@ fn decode_single_file(path: &PathBuf) -> Result<LoadedImage, String> {
         series_label,
         instance_number,
         default_wc_ww,
+        pixel_spacing,
+        slice_thickness,
+        spacing_between_slices,
+        image_position_patient,
+        image_orientation_patient,
     })
 }
 
@@ -352,7 +621,14 @@ struct DicomViewApp {
     series_groups: Vec<SeriesGroup>,
     current_series: usize,
     current_slice: usize,
+    current_coronal_slice: usize,
+    current_sagittal_slice: usize,
+    view_mode: ViewMode,
+    mpr_plane: MprPlane,
+    mpr_volume: Option<MprVolume>,
+    mpr_error: Option<String>,
     texture: Option<egui::TextureHandle>,
+    displayed_physical_size: Option<Vec2>,
     zoom: f32,
     pan: Vec2,
     error: Option<String>,
@@ -373,7 +649,14 @@ impl DicomViewApp {
             series_groups: Vec::new(),
             current_series: 0,
             current_slice: 0,
+            current_coronal_slice: 0,
+            current_sagittal_slice: 0,
+            view_mode: ViewMode::Stack,
+            mpr_plane: MprPlane::Axial,
+            mpr_volume: None,
+            mpr_error: None,
             texture: None,
+            displayed_physical_size: None,
             zoom: 1.0,
             pan: Vec2::ZERO,
             error: None,
@@ -393,7 +676,14 @@ impl DicomViewApp {
         self.series_groups.clear();
         self.current_series = 0;
         self.texture = None;
+        self.displayed_physical_size = None;
         self.current_slice = 0;
+        self.current_coronal_slice = 0;
+        self.current_sagittal_slice = 0;
+        self.view_mode = ViewMode::Stack;
+        self.mpr_plane = MprPlane::Axial;
+        self.mpr_volume = None;
+        self.mpr_error = None;
         self.pan = Vec2::ZERO;
         self.zoom = 1.0;
         self.wl_dirty = false;
@@ -440,11 +730,61 @@ impl DicomViewApp {
         self.images.get(global_idx)
     }
 
+    fn metadata_image(&self) -> Option<&LoadedImage> {
+        self.active_image().or_else(|| {
+            let group = self.series_groups.get(self.current_series)?;
+            let first = *group.image_indices.first()?;
+            self.images.get(first)
+        })
+    }
+
+    fn mpr_available(&self) -> bool {
+        self.mpr_volume.is_some()
+    }
+
+    fn current_mpr_slice(&self) -> usize {
+        match self.mpr_plane {
+            MprPlane::Axial => self.current_slice,
+            MprPlane::Coronal => self.current_coronal_slice,
+            MprPlane::Sagittal => self.current_sagittal_slice,
+        }
+    }
+
+    fn set_current_mpr_slice(&mut self, index: usize) {
+        match self.mpr_plane {
+            MprPlane::Axial => self.current_slice = index,
+            MprPlane::Coronal => self.current_coronal_slice = index,
+            MprPlane::Sagittal => self.current_sagittal_slice = index,
+        }
+    }
+
+    fn current_view_slice_len(&self) -> usize {
+        match self.view_mode {
+            ViewMode::Stack => self.active_series_len(),
+            ViewMode::Mpr => self
+                .mpr_volume
+                .as_ref()
+                .map(|volume| volume.plane_len(self.mpr_plane))
+                .unwrap_or(0),
+        }
+    }
+
     fn apply_default_window_for_current_series(&mut self) {
-        if let Some(img) = self.active_image() {
-            if let Some((wc, ww)) = img.default_wc_ww {
-                self.window_center = wc;
-                self.window_width = ww;
+        match self.view_mode {
+            ViewMode::Stack => {
+                if let Some(img) = self.active_image() {
+                    if let Some((wc, ww)) = img.default_wc_ww {
+                        self.window_center = wc;
+                        self.window_width = ww;
+                    }
+                }
+            }
+            ViewMode::Mpr => {
+                if let Some(volume) = &self.mpr_volume {
+                    let (wc, ww) = volume.default_wc_ww;
+                    self.window_center = wc;
+                    self.window_width = ww;
+                }
             }
         }
     }
@@ -479,26 +819,103 @@ impl DicomViewApp {
         self.series_groups = groups;
         self.current_series = 0;
         self.current_slice = 0;
+        self.current_coronal_slice = 0;
+        self.current_sagittal_slice = 0;
+        self.refresh_mpr_volume();
+    }
+
+    fn refresh_mpr_volume(&mut self) {
+        self.mpr_volume = None;
+        self.mpr_error = None;
+
+        let Some(group) = self.series_groups.get(self.current_series) else {
+            return;
+        };
+
+        match MprVolume::from_images(&self.images, &group.image_indices) {
+            Ok(volume) => {
+                let coronal_max = volume.height.saturating_sub(1);
+                let sagittal_max = volume.width.saturating_sub(1);
+                let axial_max = volume.depth.saturating_sub(1);
+                self.current_slice = self.current_slice.min(axial_max);
+                self.current_coronal_slice = if self.current_coronal_slice > coronal_max {
+                    coronal_max / 2
+                } else {
+                    self.current_coronal_slice
+                };
+                self.current_sagittal_slice = if self.current_sagittal_slice > sagittal_max {
+                    sagittal_max / 2
+                } else {
+                    self.current_sagittal_slice
+                };
+                if self.current_coronal_slice == 0 {
+                    self.current_coronal_slice = coronal_max / 2;
+                }
+                if self.current_sagittal_slice == 0 {
+                    self.current_sagittal_slice = sagittal_max / 2;
+                }
+                self.mpr_volume = Some(volume);
+            }
+            Err(err) => {
+                self.mpr_error = Some(err);
+                if self.view_mode == ViewMode::Mpr {
+                    self.view_mode = ViewMode::Stack;
+                }
+            }
+        }
     }
 
     fn update_current_slice_view(&mut self, ctx: &egui::Context) {
-        if self.active_series_len() == 0 {
-            self.texture = None;
-            return;
+        self.texture = None;
+        self.displayed_physical_size = None;
+
+        match self.view_mode {
+            ViewMode::Stack => {
+                if self.active_series_len() == 0 {
+                    self.wl_dirty = false;
+                    return;
+                }
+                let Some((width, height, rgba, physical_size)) = self.active_image().map(|img| {
+                    let (width, height) = img.raw_image.dimensions();
+                    (
+                        width,
+                        height,
+                        img.raw_image.to_rgba(self.window_center, self.window_width),
+                        img.physical_size(),
+                    )
+                }) else {
+                    self.wl_dirty = false;
+                    return;
+                };
+                let color_image =
+                    egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
+                self.texture = Some(ctx.load_texture(
+                    "dicom_image",
+                    color_image,
+                    egui::TextureOptions::LINEAR,
+                ));
+                self.displayed_physical_size = Some(physical_size);
+            }
+            ViewMode::Mpr => {
+                let Some(volume) = &self.mpr_volume else {
+                    self.wl_dirty = false;
+                    return;
+                };
+                let plane_index = self.current_mpr_slice();
+                let pixels = volume.extract_plane(self.mpr_plane, plane_index);
+                let (width, height) = volume.plane_dimensions(self.mpr_plane);
+                let rgba = scalar_to_rgba(&pixels, self.window_center, self.window_width);
+                let color_image =
+                    egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
+                self.texture = Some(ctx.load_texture(
+                    "dicom_image",
+                    color_image,
+                    egui::TextureOptions::LINEAR,
+                ));
+                self.displayed_physical_size = Some(volume.physical_size(self.mpr_plane));
+            }
         }
-        let Some(img) = self.active_image() else {
-            self.texture = None;
-            return;
-        };
-        let (width, height) = img.raw_image.dimensions();
-        let rgba = img.raw_image.to_rgba(self.window_center, self.window_width);
-        let color_image =
-            egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
-        self.texture = Some(ctx.load_texture(
-            "dicom_image",
-            color_image,
-            egui::TextureOptions::LINEAR,
-        ));
+
         self.wl_dirty = false;
     }
 }
@@ -565,14 +982,29 @@ impl eframe::App for DicomViewApp {
         // Keyboard navigation: arrow keys
         ctx.input(|i| {
             if i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowLeft) {
-                if self.current_slice > 0 {
-                    self.current_slice -= 1;
+                let current = match self.view_mode {
+                    ViewMode::Stack => self.current_slice,
+                    ViewMode::Mpr => self.current_mpr_slice(),
+                };
+                if current > 0 {
+                    match self.view_mode {
+                        ViewMode::Stack => self.current_slice -= 1,
+                        ViewMode::Mpr => self.set_current_mpr_slice(current - 1),
+                    }
                     self.wl_dirty = true;
                 }
             }
             if i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::ArrowRight) {
-                if self.current_slice < self.active_series_len().saturating_sub(1) {
-                    self.current_slice += 1;
+                let len = self.current_view_slice_len();
+                let current = match self.view_mode {
+                    ViewMode::Stack => self.current_slice,
+                    ViewMode::Mpr => self.current_mpr_slice(),
+                };
+                if current < len.saturating_sub(1) {
+                    match self.view_mode {
+                        ViewMode::Stack => self.current_slice += 1,
+                        ViewMode::Mpr => self.set_current_mpr_slice(current + 1),
+                    }
                     self.wl_dirty = true;
                 }
             }
@@ -623,11 +1055,49 @@ impl eframe::App for DicomViewApp {
                             if selected_series != self.current_series {
                                 self.current_series = selected_series;
                                 self.current_slice = 0;
+                                self.current_coronal_slice = 0;
+                                self.current_sagittal_slice = 0;
                                 self.pan = Vec2::ZERO;
+                                self.refresh_mpr_volume();
                                 self.apply_default_window_for_current_series();
                                 self.wl_dirty = true;
                             }
                         });
+
+                    ui.separator();
+                    ui.label("View:");
+                    let previous_view_mode = self.view_mode;
+                    ui.selectable_value(&mut self.view_mode, ViewMode::Stack, "Stack");
+                    ui.add_enabled_ui(self.mpr_available(), |ui| {
+                        ui.selectable_value(&mut self.view_mode, ViewMode::Mpr, "MPR");
+                    });
+                    if !self.mpr_available() {
+                        let reason = self
+                            .mpr_error
+                            .as_deref()
+                            .unwrap_or("MPR unavailable for this series");
+                        ui.label(egui::RichText::new(reason).small().weak());
+                    }
+
+                    if self.view_mode == ViewMode::Mpr && previous_view_mode != ViewMode::Mpr {
+                        self.apply_default_window_for_current_series();
+                        self.wl_dirty = true;
+                    } else if self.view_mode == ViewMode::Stack && previous_view_mode != ViewMode::Stack {
+                        self.apply_default_window_for_current_series();
+                        self.wl_dirty = true;
+                    }
+
+                    if self.view_mode == ViewMode::Mpr {
+                        ui.separator();
+                        ui.label("Plane:");
+                        let previous_plane = self.mpr_plane;
+                        ui.selectable_value(&mut self.mpr_plane, MprPlane::Axial, "Axial");
+                        ui.selectable_value(&mut self.mpr_plane, MprPlane::Coronal, "Coronal");
+                        ui.selectable_value(&mut self.mpr_plane, MprPlane::Sagittal, "Sagittal");
+                        if previous_plane != self.mpr_plane {
+                            self.wl_dirty = true;
+                        }
+                    }
                 }
 
                 ui.separator();
@@ -644,38 +1114,53 @@ impl eframe::App for DicomViewApp {
                 ui.label(format!("{:.0}%", self.zoom * 100.0));
 
                 // Window/Level controls (only for 16-bit grayscale)
-                if let Some(active_image) = self.active_image() {
-                    let is_grayscale16 = active_image.raw_image.is_grayscale16();
-                    if is_grayscale16 {
-                        ui.separator();
-                        ui.label("WC:");
-                        let wc_resp = ui.add(
-                            egui::DragValue::new(&mut self.window_center).speed(1.0),
-                        );
-                        ui.label("WW:");
-                        let ww_resp = ui.add(
-                            egui::DragValue::new(&mut self.window_width)
-                                .speed(1.0)
-                                .range(1.0..=f32::MAX),
-                        );
-                        if wc_resp.changed() || ww_resp.changed() {
-                            self.wl_dirty = true;
-                        }
+                let windowing_enabled = match self.view_mode {
+                    ViewMode::Stack => self
+                        .active_image()
+                        .map(|image| image.raw_image.is_grayscale16())
+                        .unwrap_or(false),
+                    ViewMode::Mpr => self.mpr_volume.is_some(),
+                };
+                if windowing_enabled {
+                    ui.separator();
+                    ui.label("WC:");
+                    let wc_resp = ui.add(
+                        egui::DragValue::new(&mut self.window_center).speed(1.0),
+                    );
+                    ui.label("WW:");
+                    let ww_resp = ui.add(
+                        egui::DragValue::new(&mut self.window_width)
+                            .speed(1.0)
+                            .range(1.0..=f32::MAX),
+                    );
+                    if wc_resp.changed() || ww_resp.changed() {
+                        self.wl_dirty = true;
                     }
                 }
 
                 // Slice navigation
-                let active_len = self.active_series_len();
+                let active_len = self.current_view_slice_len();
                 if active_len > 1 {
                     ui.separator();
-                    ui.label(format!("Slice: {}/{}", self.current_slice + 1, active_len));
-                    let mut slice_val = self.current_slice as i32;
+                    let current_index = match self.view_mode {
+                        ViewMode::Stack => self.current_slice,
+                        ViewMode::Mpr => self.current_mpr_slice(),
+                    };
+                    let label = match self.view_mode {
+                        ViewMode::Stack => "Slice".to_string(),
+                        ViewMode::Mpr => format!("{}", self.mpr_plane.label()),
+                    };
+                    ui.label(format!("{}: {}/{}", label, current_index + 1, active_len));
+                    let mut slice_val = current_index as i32;
                     let slider = ui.add(
                         egui::Slider::new(&mut slice_val, 0..=(active_len - 1) as i32)
                             .show_value(false)
                     );
                     if slider.changed() {
-                        self.current_slice = slice_val as usize;
+                        match self.view_mode {
+                            ViewMode::Stack => self.current_slice = slice_val as usize,
+                            ViewMode::Mpr => self.set_current_mpr_slice(slice_val as usize),
+                        }
                         self.wl_dirty = true;
                     }
                 }
@@ -684,7 +1169,7 @@ impl eframe::App for DicomViewApp {
 
         // ── Metadata side panel ───────────────────────────────────────────────
         if self.show_metadata && self.active_series_len() > 0 {
-            let Some(active_image) = self.active_image() else {
+            let Some(active_image) = self.metadata_image() else {
                 return;
             };
             let metadata = &active_image.metadata;
@@ -744,20 +1229,34 @@ impl eframe::App for DicomViewApp {
 
             if self.texture.is_none() {
                 ui.centered_and_justified(|ui| {
-                    ui.label("Open DICOM files/folders or drag and drop them here");
+                    if self.view_mode == ViewMode::Mpr {
+                        ui.label(
+                            self.mpr_error
+                                .as_deref()
+                                .unwrap_or("MPR is not available for the selected series"),
+                        );
+                    } else {
+                        ui.label("Open DICOM files/folders or drag and drop them here");
+                    }
                 });
                 return;
             }
 
-            if let Some(texture) = &self.texture {
+            if let Some(texture) = self.texture.clone() {
                 let rect = ui.available_rect_before_wrap();
                 let tex_size = texture.size();
                 let img_w = tex_size[0] as f32;
                 let img_h = tex_size[1] as f32;
+                let physical_size = self
+                    .displayed_physical_size
+                    .unwrap_or_else(|| egui::vec2(img_w, img_h));
 
                 // Scale to fit the panel at current zoom level
-                let fit = (rect.width() / img_w).min(rect.height() / img_h);
-                let display = egui::vec2(img_w * fit * self.zoom, img_h * fit * self.zoom);
+                let fit = (rect.width() / physical_size.x).min(rect.height() / physical_size.y);
+                let display = egui::vec2(
+                    physical_size.x * fit * self.zoom,
+                    physical_size.y * fit * self.zoom,
+                );
 
                 let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
@@ -775,13 +1274,23 @@ impl eframe::App for DicomViewApp {
                 // - Single-image mode: scroll zooms.
                 let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
                 if response.hovered() && scroll_delta != 0.0 {
-                    if self.active_series_len() > 1 {
+                    if self.current_view_slice_len() > 1 {
                         // Scroll to change slice
-                        if scroll_delta > 0.0 && self.current_slice > 0 {
-                            self.current_slice -= 1;
+                        let current = match self.view_mode {
+                            ViewMode::Stack => self.current_slice,
+                            ViewMode::Mpr => self.current_mpr_slice(),
+                        };
+                        if scroll_delta > 0.0 && current > 0 {
+                            match self.view_mode {
+                                ViewMode::Stack => self.current_slice -= 1,
+                                ViewMode::Mpr => self.set_current_mpr_slice(current - 1),
+                            }
                             self.wl_dirty = true;
-                        } else if scroll_delta < 0.0 && self.current_slice < self.active_series_len() - 1 {
-                            self.current_slice += 1;
+                        } else if scroll_delta < 0.0 && current < self.current_view_slice_len() - 1 {
+                            match self.view_mode {
+                                ViewMode::Stack => self.current_slice += 1,
+                                ViewMode::Mpr => self.set_current_mpr_slice(current + 1),
+                            }
                             self.wl_dirty = true;
                         }
                     } else {
@@ -800,14 +1309,24 @@ impl eframe::App for DicomViewApp {
                     }
                 }
                 // Middle mouse button → scroll through slices (if multiple images)
-                else if response.hovered() && middle_down && self.active_series_len() > 1 {
+                else if response.hovered() && middle_down && self.current_view_slice_len() > 1 {
                     let delta = response.drag_delta();
+                    let current = match self.view_mode {
+                        ViewMode::Stack => self.current_slice,
+                        ViewMode::Mpr => self.current_mpr_slice(),
+                    };
                     // Upward drag → previous slice, downward → next slice
-                    if delta.y > 2.0 && self.current_slice > 0 {
-                        self.current_slice -= 1;
+                    if delta.y > 2.0 && current > 0 {
+                        match self.view_mode {
+                            ViewMode::Stack => self.current_slice -= 1,
+                            ViewMode::Mpr => self.set_current_mpr_slice(current - 1),
+                        }
                         self.wl_dirty = true;
-                    } else if delta.y < -2.0 && self.current_slice < self.active_series_len() - 1 {
-                        self.current_slice += 1;
+                    } else if delta.y < -2.0 && current < self.current_view_slice_len() - 1 {
+                        match self.view_mode {
+                            ViewMode::Stack => self.current_slice += 1,
+                            ViewMode::Mpr => self.set_current_mpr_slice(current + 1),
+                        }
                         self.wl_dirty = true;
                     }
                 }
@@ -819,17 +1338,20 @@ impl eframe::App for DicomViewApp {
                 // Horizontal drag adjusts Window Width; vertical drag adjusts Window Centre.
                 // Only meaningful for 16-bit grayscale; ignored otherwise.
                 else if response.dragged_by(egui::PointerButton::Secondary) && !left_down {
-                    if let Some(active_image) = self.active_image() {
-                        let is_grayscale16 = active_image.raw_image.is_grayscale16();
-                        if is_grayscale16 {
-                            let delta = response.drag_delta();
-                            // Scale factor: drag 1px ≈ 2 HU change (reasonable for CT).
-                            let ww_scale = 2.0_f32;
-                            let wc_scale = 2.0_f32;
-                            self.window_width = (self.window_width + delta.x * ww_scale).max(1.0);
-                            self.window_center += -delta.y * wc_scale;
-                            self.wl_dirty = true;
-                        }
+                    let windowing_enabled = match self.view_mode {
+                        ViewMode::Stack => self
+                            .active_image()
+                            .map(|image| image.raw_image.is_grayscale16())
+                            .unwrap_or(false),
+                        ViewMode::Mpr => self.mpr_volume.is_some(),
+                    };
+                    if windowing_enabled {
+                        let delta = response.drag_delta();
+                        let ww_scale = 2.0_f32;
+                        let wc_scale = 2.0_f32;
+                        self.window_width = (self.window_width + delta.x * ww_scale).max(1.0);
+                        self.window_center += -delta.y * wc_scale;
+                        self.wl_dirty = true;
                     }
                 }
 
@@ -895,6 +1417,91 @@ impl eframe::App for DicomViewApp {
                     });
                 });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gray16_image(
+        filename: &str,
+        instance_number: i32,
+        position_z: f32,
+        pixel_spacing: [f32; 2],
+        width: usize,
+        height: usize,
+        data: &[f32],
+    ) -> LoadedImage {
+        LoadedImage {
+            raw_image: RawImage::Gray16(Gray16 {
+                data: data.to_vec(),
+                width,
+                height,
+            }),
+            metadata: Vec::new(),
+            filename: filename.to_string(),
+            series_uid: "series-1".to_string(),
+            series_label: "Series 1".to_string(),
+            instance_number: Some(instance_number),
+            default_wc_ww: Some((0.0, 1.0)),
+            pixel_spacing: Some(pixel_spacing),
+            slice_thickness: Some(2.0),
+            spacing_between_slices: Some(2.0),
+            image_position_patient: Some([0.0, 0.0, position_z]),
+            image_orientation_patient: Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+        }
+    }
+
+    #[test]
+    fn mpr_volume_sorts_slices_and_extracts_planes() {
+        let images = vec![
+            gray16_image("slice-2", 2, 2.0, [0.5, 1.5], 3, 2, &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]),
+            gray16_image("slice-1", 1, 0.0, [0.5, 1.5], 3, 2, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        ];
+
+        let volume = MprVolume::from_images(&images, &[0, 1]).expect("volume should build");
+
+        assert_eq!(volume.depth, 2);
+        assert_eq!(volume.default_wc_ww, (6.5, 11.0));
+        assert!((volume.slice_spacing - 2.0).abs() < 1e-6);
+        assert_eq!(
+            volume.extract_plane(MprPlane::Axial, 0),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
+        assert_eq!(
+            volume.extract_plane(MprPlane::Coronal, 1),
+            vec![4.0, 5.0, 6.0, 10.0, 11.0, 12.0]
+        );
+        assert_eq!(
+            volume.extract_plane(MprPlane::Sagittal, 2),
+            vec![3.0, 6.0, 9.0, 12.0]
+        );
+    }
+
+    #[test]
+    fn mpr_volume_rejects_rgb_series() {
+        let images = vec![LoadedImage {
+            raw_image: RawImage::Rgb8 {
+                data: vec![0, 0, 0, 255, 255, 255],
+                width: 1,
+                height: 2,
+            },
+            metadata: Vec::new(),
+            filename: "rgb".to_string(),
+            series_uid: "series-1".to_string(),
+            series_label: "Series 1".to_string(),
+            instance_number: Some(1),
+            default_wc_ww: None,
+            pixel_spacing: Some([1.0, 1.0]),
+            slice_thickness: Some(1.0),
+            spacing_between_slices: Some(1.0),
+            image_position_patient: Some([0.0, 0.0, 0.0]),
+            image_orientation_patient: Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+        }];
+
+        let err = MprVolume::from_images(&images, &[0]).expect_err("rgb series should fail");
+        assert!(err.contains("at least 2 slices") || err.contains("grayscale"));
     }
 }
 
