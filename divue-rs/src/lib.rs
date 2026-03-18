@@ -319,6 +319,13 @@ fn row_has_children(row_id: &str, rows: &[TreeRow]) -> bool {
         .any(|row| row.row_id != row_id && row_ancestors(&row.row_id).iter().any(|ancestor| ancestor == row_id))
 }
 
+fn expanded_keys_for_all_nodes(rows: &[TreeRow]) -> HashSet<String> {
+    rows.iter()
+        .filter(|row| row_has_children(&row.row_id, rows))
+        .map(|row| row.row_id.clone())
+        .collect()
+}
+
 /// Format a single tag segment with a human-readable name if possible.
 fn format_tag_segment(segment: &str) -> String {
     if segment.starts_with('[') {
@@ -695,6 +702,16 @@ impl DivueApp {
             keys.retain(|key| row_may_contain_identifiable_data(key, &self.comps));
         }
     let rows = build_tree_rows(&all_keys, &keys);
+
+    ui.horizontal(|ui| {
+        if ui.button("Expand All").clicked() {
+            self.expanded_keys = expanded_keys_for_all_nodes(&rows);
+        }
+        if ui.button("Collapse All").clicked() {
+            self.expanded_keys.clear();
+        }
+    });
+
     let effective_expanded = effective_expanded_keys(&rows, &self.expanded_keys, filtered);
     let visible = visible_rows(&rows, &effective_expanded);
 
@@ -839,6 +856,16 @@ impl eframe::App for MetaApp {
                 keys.retain(|key| row_may_contain_identifiable_data(key, &self.comps));
             }
             let rows = build_tree_rows(&all_keys, &keys);
+
+            ui.horizontal(|ui| {
+                if ui.button("Expand All").clicked() {
+                    self.expanded_keys = expanded_keys_for_all_nodes(&rows);
+                }
+                if ui.button("Collapse All").clicked() {
+                    self.expanded_keys.clear();
+                }
+            });
+
             let effective_expanded = effective_expanded_keys(&rows, &self.expanded_keys, filtered);
             let visible = visible_rows(&rows, &effective_expanded);
 
