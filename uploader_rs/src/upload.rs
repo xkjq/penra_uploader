@@ -276,95 +276,48 @@ fn calculate_hash(path: &Path) -> Option<String> {
 }
 
 pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>) -> Result<UploadResult, String> {
-    let files: Vec<PathBuf> = match std::fs::read_dir(anon_dir) {
-        Ok(r) => r.filter_map(|e| e.ok().map(|ent| ent.path())).collect(),
-        Err(e) => return Err(format!("read_dir failed: {}", e)),
+    // Use `scan_for_upload` to determine which files are considered ready-to-upload
+    // This ensures we reuse the same hashing and server precheck that `scan_for_upload` performed,
+    // avoiding inconsistencies between the UI and the uploader.
+    let series = match scan_for_upload(anon_dir) {
+        Ok(s) => s,
+        Err(e) => return Err(e),
     };
 
-    let mut client = make_client(load_api_token().as_deref())?;
-    let base = base_site_url();
-    let hash_check_url = format!("{}{}", base, "/api/atlas/check_image_hashes/");
-
-    // compute hashes
-    let mut path_to_hash = HashMap::new();
-    let mut hash_list = Vec::new();
-    for p in &files {
-        if p.extension().map(|e| e == "dcm").unwrap_or(false) {
-            if let Some(h) = calculate_hash(p) {
-                path_to_hash.insert(p.clone(), h.clone());
-                hash_list.push(h);
-            }
-        }
-    }
-
-    // precheck duplicates
-    let mut duplicate_hashes = HashSet::new();
-    let mut pre_duplicates: Vec<(String, String)> = Vec::new();
+    // Build file lists from series info returned by the scanner. Files already
+    // marked as duplicates by the scanner's precheck will be skipped here.
+    let mut files_to_upload: Vec<(PathBuf, String)> = Vec::new();
+    let mut pre_duplicate_file_list: Vec<(String, String)> = Vec::new();
     let mut pre_duplicate_series: HashSet<String> = HashSet::new();
 
-    if !hash_list.is_empty() {
-        let _ = std::fs::read_dir(&anon_dir); // keep usage
-        log_rpc(&format!("POST {} with {} hashes", hash_check_url, hash_list.len()));
-        let resp = client.post(&hash_check_url).json(&hash_list).send();
-        if let Ok(r) = resp {
-            let status = r.status();
-            if let Ok(body) = r.text() {
-                if let Some(pf) = save_body_to_file(&body) {
-                    log_rpc(&format!("Response {}: {} BODY_FILE:{}", hash_check_url, status, pf.display()));
-                } else {
-                    log_rpc(&format!("Response {}: {} body: (failed to save body)", hash_check_url, status));
-                }
-                if status.is_success() {
-                    if let Ok(map) = serde_json::from_str::<serde_json::Value>(&body) {
-                        if map.is_object() {
-                            if let Some(obj) = map.as_object() {
-                                for (hash_val, info) in obj.iter() {
-                                            if info.is_object() {
-                                                if let Some(id) = info.get("id") {
-                                                    if json_value_truthy(id) {
-                                                        duplicate_hashes.insert(hash_val.clone());
-                                                        if let Some(urlv) = info.get("url") {
-                                                            if let Some(urls) = urlv.as_str() {
-                                                                // ensure full URL includes base if server returned a relative path
-                                                                let full = if urls.starts_with("http") {
-                                                                    urls.to_string()
-                                                                } else if urls.starts_with('/') {
-                                                                    format!("{}{}", base.trim_end_matches('/'), urls)
-                                                                } else {
-                                                                    format!("{}/{}", base.trim_end_matches('/'), urls)
-                                                                };
-                                                                pre_duplicate_series.insert(full);
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                }
-                            }
-                        }
-                    }
-                }
+    for si in &series {
+        // collect duplicate series URLs for any series where at least one file is duplicate
+        let mut series_has_dup = false;
+        for f in &si.files {
+            if f.is_duplicate {
+                pre_duplicate_file_list.push((f.path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string(), f.hash.clone()));
+                series_has_dup = true;
             } else {
-                log_rpc(&format!("Response {}: {} (failed to read body)", hash_check_url, status));
+                files_to_upload.push((f.path.clone(), f.path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string()));
+            }
+        }
+        if series_has_dup {
+            for url in &si.duplicate_series_urls {
+                pre_duplicate_series.insert(url.clone());
             }
         }
     }
 
-    let files_after_precheck: Vec<PathBuf> = path_to_hash.iter().filter_map(|(p,h)| if duplicate_hashes.contains(h) { None } else { Some(p.clone()) }).collect();
-
-    // Prepare multipart and chunk
-    let mut files_to_upload: Vec<(PathBuf, String)> = Vec::new();
-    for p in &files_after_precheck {
-        if let Some(fname) = p.file_name().and_then(|s| s.to_str()) {
-            files_to_upload.push((p.clone(), fname.to_string()));
-        }
-    }
-
+    // At this point `series` already contains duplication information from `scan_for_upload`.
+    // Use the precomputed lists we assembled above (`files_to_upload`, `pre_duplicate_file_list`, `pre_duplicate_series`).
     let chunk_size = 10usize;
     let mut uploaded = Vec::new();
     let mut duplicates = Vec::new();
     let mut failed = Vec::new();
-    let mut duplicate_series = pre_duplicate_series;
+    let mut duplicate_series = pre_duplicate_series.clone();
+    // Prepare HTTP client and base URL for upload requests
+    let client = make_client(load_api_token().as_deref())?;
+    let base = base_site_url();
 
     let total_chunks = (files_to_upload.len() + chunk_size - 1) / chunk_size;
 

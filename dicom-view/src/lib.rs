@@ -570,11 +570,12 @@ impl eframe::App for DicomViewApp {
                     )
                 });
 
-                // Scroll wheel → zoom; Shift+Scroll or Alt+Scroll → slice navigation
+                // Scroll wheel behavior:
+                // - Stack mode (multiple images): scroll navigates slices.
+                // - Single-image mode: scroll zooms.
                 let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
                 if response.hovered() && scroll_delta != 0.0 {
-                    let shift_or_alt = ctx.input(|i| i.modifiers.shift || i.modifiers.alt);
-                    if shift_or_alt && self.images.len() > 1 {
+                    if self.images.len() > 1 {
                         // Scroll to change slice
                         if scroll_delta > 0.0 && self.current_slice > 0 {
                             self.current_slice -= 1;

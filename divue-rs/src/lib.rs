@@ -510,35 +510,35 @@ impl DivueApp {
             }
             ui.separator();
 
-            // Add files button
-            if ui.button("📁 Add Files...").clicked() {
-                if let Some(files) = rfd::FileDialog::new()
-                    .add_filter("DICOM files", &["dcm"])
-                    .add_filter("All files", &["*"])
-                    .pick_files()
-                {
-                    self.selected_files.extend(files);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("📁 Add Files...").clicked() {
+                    if let Some(files) = rfd::FileDialog::new()
+                        .add_filter("DICOM files", &["dcm"])
+                        .add_filter("All files", &["*"])
+                        .pick_files()
+                    {
+                        self.selected_files.extend(files);
+                    }
                 }
-            }
 
-            // Add folder button
-            if ui.button("📂 Add Folder...").clicked() {
-                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                    if let Ok(entries) = std::fs::read_dir(&folder) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.is_file()
-                                && path
-                                    .extension()
-                                    .map(|e| e.eq_ignore_ascii_case("dcm"))
-                                    .unwrap_or(false)
-                            {
-                                self.selected_files.push(path);
+                if ui.button("📂 Add Folder...").clicked() {
+                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                        if let Ok(entries) = std::fs::read_dir(&folder) {
+                            for entry in entries.flatten() {
+                                let path = entry.path();
+                                if path.is_file()
+                                    && path
+                                        .extension()
+                                        .map(|e| e.eq_ignore_ascii_case("dcm"))
+                                        .unwrap_or(false)
+                                {
+                                    self.selected_files.push(path);
+                                }
                             }
                         }
                     }
                 }
-            }
+            });
 
             ui.separator();
 
@@ -614,16 +614,16 @@ impl DivueApp {
 
             ui.separator();
 
-            // Compare button
-            if ui.button("🔍 Compare Metadata").clicked() {
-                self.load_files();
-                self.show_comparison = true;
-            }
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("🔍 Compare Metadata").clicked() {
+                    self.load_files();
+                    self.show_comparison = true;
+                }
 
-            // Clear button
-            if ui.button("🗑️ Clear All").clicked() {
-                self.selected_files.clear();
-            }
+                if ui.button("🗑️ Clear All").clicked() {
+                    self.selected_files.clear();
+                }
+            });
         } else {
             ui.heading("No files selected");
             ui.label("Add files above to get started");
@@ -649,19 +649,23 @@ impl DivueApp {
             return;
         }
 
-        ui.horizontal(|ui| {
-            ui.label("Filter (matches keys or values):");
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Filter:");
             ui.text_edit_singleline(&mut self.filter);
             if ui.button("Clear").clicked() {
                 self.filter.clear();
             }
-        });
-        ui.checkbox(&mut self.identifiable_only, "Only show rows likely to contain identifiable data")
+            ui.separator();
+            ui.checkbox(
+                &mut self.identifiable_only,
+                "Likely identifiable only",
+            )
             .on_hover_text("Heuristic filter based on DICOM tag names and suspicious values such as IDs, emails, or long digit strings.");
-        
-        if ui.button("📋 Extraction Diagnostics").clicked() {
-            self.show_diagnostics = !self.show_diagnostics;
-        }
+            ui.separator();
+            if ui.button("Diagnostics").clicked() {
+                self.show_diagnostics = !self.show_diagnostics;
+            }
+        });
 
         if self.show_diagnostics {
             egui::CollapsingHeader::new("Extraction Diagnostics")
@@ -703,7 +707,7 @@ impl DivueApp {
         }
     let rows = build_tree_rows(&all_keys, &keys);
 
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if ui.button("Expand All").clicked() {
             self.expanded_keys = expanded_keys_for_all_nodes(&rows);
         }
@@ -805,17 +809,21 @@ impl eframe::App for MetaApp {
                 return;
             }
 
-            ui.horizontal(|ui| {
-                ui.label("Filter (matches keys or values):");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Filter:");
                 ui.text_edit_singleline(&mut self.filter);
                 if ui.button("Clear").clicked() { self.filter.clear(); }
-            });
-            ui.checkbox(&mut self.identifiable_only, "Only show rows likely to contain identifiable data")
+                ui.separator();
+                ui.checkbox(
+                    &mut self.identifiable_only,
+                    "Likely identifiable only",
+                )
                 .on_hover_text("Heuristic filter based on DICOM tag names and suspicious values such as IDs, emails, or long digit strings.");
-            
-            if ui.button("📋 Extraction Diagnostics").clicked() {
-                self.show_diagnostics = !self.show_diagnostics;
-            }
+                ui.separator();
+                if ui.button("Diagnostics").clicked() {
+                    self.show_diagnostics = !self.show_diagnostics;
+                }
+            });
 
             if self.show_diagnostics {
                 egui::CollapsingHeader::new("Extraction Diagnostics")
@@ -857,7 +865,7 @@ impl eframe::App for MetaApp {
             }
             let rows = build_tree_rows(&all_keys, &keys);
 
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("Expand All").clicked() {
                     self.expanded_keys = expanded_keys_for_all_nodes(&rows);
                 }
