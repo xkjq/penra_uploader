@@ -281,7 +281,7 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
     // Use `scan_for_upload` to determine which files are considered ready-to-upload
     // This ensures we reuse the same hashing and server precheck that `scan_for_upload` performed,
     // avoiding inconsistencies between the UI and the uploader.
-    let series = match scan_for_upload(anon_dir) {
+    let series = match scan_for_upload(anon_dir, tx.clone()) {
         Ok(s) => s,
         Err(e) => return Err(e),
     };
@@ -442,7 +442,7 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
 }
 
 /// Scan an anonymised directory for files ready to upload, grouped by DICOM SeriesInstanceUID.
-pub fn scan_for_upload(anon_dir: &Path) -> Result<Vec<SeriesInfo>, String> {
+pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>) -> Result<Vec<SeriesInfo>, String> {
     let mut files: Vec<PathBuf> = Vec::new();
     let rd = std::fs::read_dir(anon_dir).map_err(|e| format!("read_dir failed: {}", e))?;
     for e in rd.flatten() {
@@ -470,21 +470,57 @@ pub fn scan_for_upload(anon_dir: &Path) -> Result<Vec<SeriesInfo>, String> {
         return Ok(Vec::new());
     }
 
-    // compute hashes and series mapping
+    // compute hashes and series mapping — open each file once and reuse the object
     let mut series_map: HashMap<String, Vec<(PathBuf, String)>> = HashMap::new();
     let mut hash_list: Vec<String> = Vec::new();
-    for p in &files {
-        let h_opt = calculate_hash(p);
-        let h = h_opt.clone().unwrap_or_else(|| "".to_string());
-        if h_opt.is_some() {
-            hash_list.push(h.clone());
+
+    let total_files = files.len();
+    if let Some(ref s) = tx {
+        let _ = s.send("PROC:STEP:Scanning files".to_string());
+        let _ = s.send(format!("PROC:PROG:{}", 0.0));
+    }
+
+    for (i, p) in files.iter().enumerate() {
+        // attempt to open as DICOM once
+        let mut series_uid = "NO_SERIES".to_string();
+        let mut h_opt: Option<String> = None;
+        if let Ok(obj) = open_file(p) {
+            // extract SeriesInstanceUID if present
+            if let Ok(elem) = obj.element(Tag(0x0020,0x000E)) {
+                if let Ok(sv) = elem.to_str() { series_uid = sv.to_string(); }
+            }
+
+            // Preferred: hash decoded pixel bytes.
+            if let Ok(pixel_data) = obj.decode_pixel_data() {
+                let bytes = pixel_data.data();
+                h_opt = Some(blake3::hash(bytes).to_hex().to_string());
+            } else if let Ok(elem) = obj.element(Tag(0x7FE0, 0x0010)) {
+                if let Ok(bytes) = elem.to_bytes() {
+                    h_opt = Some(blake3::hash(&bytes).to_hex().to_string());
+                } else if let Ok(s) = elem.to_str() {
+                    h_opt = Some(blake3::hash(s.as_bytes()).to_hex().to_string());
+                }
+            }
         }
-        // try read SeriesInstanceUID
-        let series_uid = match open_file(p) {
-            Ok(obj) => obj.element(Tag(0x0020,0x000E)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()).unwrap_or_else(|| "NO_SERIES".to_string()),
-            Err(_) => "NO_SERIES".to_string(),
-        };
+
+        // fallback: hash full file bytes if we don't have a pixel/hash yet
+        if h_opt.is_none() {
+            if let Ok(bytes) = std::fs::read(p) {
+                h_opt = Some(blake3::hash(&bytes).to_hex().to_string());
+            }
+        }
+
+        let h = h_opt.clone().unwrap_or_else(|| "".to_string());
+        if h_opt.is_some() { hash_list.push(h.clone()); }
         series_map.entry(series_uid).or_default().push((p.clone(), h));
+
+        // report incremental progress
+        if let Some(ref s) = tx {
+            if total_files > 0 {
+                let prog = ((i + 1) as f32 / total_files as f32).clamp(0.0, 1.0);
+                let _ = s.send(format!("PROC:PROG:{}", prog));
+            }
+        }
     }
 
     // precheck duplicates via server

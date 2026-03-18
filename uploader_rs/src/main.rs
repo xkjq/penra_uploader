@@ -340,7 +340,7 @@ impl eframe::App for AppState {
                             }
                         }
 
-                        match scan_for_upload(&anon_dir) {
+                        match scan_for_upload(&anon_dir, Some(tx.clone())) {
                             Ok(series) => {
                                 if let Ok(json) = serde_json::to_string(&series) {
                                     let _ = std::fs::write(".last_scan.json", json);
@@ -454,7 +454,7 @@ impl eframe::App for AppState {
                                     }
 
                                     // after processing, refresh ready-to-upload by scanning anon dir
-                                    match scan_for_upload(&anon_dir) {
+                                    match scan_for_upload(&anon_dir, Some(tx.clone())) {
                                         Ok(series) => {
                                             if let Ok(json) = serde_json::to_string(&series) {
                                                 let _ = std::fs::write(".last_scan.json", json);
@@ -494,7 +494,7 @@ impl eframe::App for AppState {
                         let anon_dir = self.anon_dir();
                     let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
                     thread::spawn(move || {
-                        match scan_for_upload(&anon_dir) {
+                        match scan_for_upload(&anon_dir, Some(tx.clone())) {
                             Ok(series) => {
                                 // write series summary to temp JSON for GUI to load
                                 if let Ok(json) = serde_json::to_string(&series) {
@@ -566,7 +566,7 @@ impl eframe::App for AppState {
                                 let anon_dir = self.anon_dir();
                                 let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
                                 thread::spawn(move || {
-                                    match scan_for_upload(&anon_dir) {
+                                    match scan_for_upload(&anon_dir, Some(tx.clone())) {
                                         Ok(series) => {
                                                 let mut deleted = 0usize;
                                                 let total_dup: usize = series.iter().map(|s| s.files.iter().filter(|f| f.is_duplicate).count()).sum();
@@ -593,7 +593,7 @@ impl eframe::App for AppState {
                                                     }
                                                 }
                                             // after deletions, do a fresh scan so GUI reflects current anon dir
-                                            match scan_for_upload(&anon_dir) {
+                                            match scan_for_upload(&anon_dir, Some(tx.clone())) {
                                                 Ok(new_series) => {
                                                     if let Ok(json2) = serde_json::to_string(&new_series) {
                                                         let _ = std::fs::write(".last_scan.json", json2);
@@ -906,7 +906,7 @@ impl eframe::App for AppState {
                             let _ = tx.send("PROC:STEP:Removing files".to_string());
                             let _ = tx.send(format!("PROC:PROG:{}", 0.0));
                             thread::spawn(move || {
-                                match scan_for_upload(&anon_dir) {
+                                match scan_for_upload(&anon_dir, Some(tx.clone())) {
                                     Ok(series) => {
                                         let mut removed = 0usize;
                                         let total_files: usize = series.iter().map(|s| s.files.len()).sum();
@@ -931,7 +931,7 @@ impl eframe::App for AppState {
                                             }
                                         }
                                         // after removals, refresh scan so GUI shows empty/updated state
-                                        match scan_for_upload(&anon_dir) {
+                                        match scan_for_upload(&anon_dir, Some(tx.clone())) {
                                             Ok(new_series) => {
                                                 if let Ok(json2) = serde_json::to_string(&new_series) {
                                                     let _ = std::fs::write(".last_scan.json", json2);
@@ -1109,7 +1109,7 @@ fn main() {
 
         // Initial scan for existing anonymised files to show ready-to-upload series
         let anon_dir = app.anon_dir();
-        match scan_for_upload(&anon_dir) {
+        match scan_for_upload(&anon_dir, Some(tx.clone())) {
             Ok(series) => {
                 app.ready_series = series;
                 app.selected_series = vec![true; app.ready_series.len()];
@@ -1218,7 +1218,7 @@ fn main() {
 
                                     // after processing, refresh ready-to-upload by scanning anon dir
                                     let _ = tx2.send("PROC:STEP:Refreshing ready-to-upload".to_string());
-                                    match scan_for_upload(&anon_dir2) {
+                                    match scan_for_upload(&anon_dir2, Some(tx2.clone())) {
                                         Ok(series) => {
                                             if let Ok(json) = serde_json::to_string(&series) {
                                                 let _ = std::fs::write(".last_scan.json", json);
