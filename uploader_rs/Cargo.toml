@@ -18,6 +18,8 @@ num-bigint = "0.4"
 hex = "0.4"
 serde_json = "1.0"
 dirs = "4.0"
+rayon = "1.7"
+num_cpus = "1.16"
 
 # local crates
 dicor_rs = { package = "dicor-rs", path = "../dicor-rs" }

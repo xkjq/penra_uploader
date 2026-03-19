@@ -10,6 +10,8 @@ use std::process::{Command, Stdio};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use rayon::prelude::*;
 use blake3;
 use std::fs;
 use rfd::FileDialog;
@@ -308,24 +310,28 @@ impl eframe::App for AppState {
                         let total = dcm_files.len();
                         if total > 0 {
                             let _ = tx.send("PROC:STEP:Anonymizing export files".to_string());
-                        }
-                        for (i, p) in dcm_files.into_iter().enumerate() {
-                            match anonymize_file(&p, &anon_dir, true, false, false, seed_clone.as_deref()) {
-                                Ok(out) => {
-                                    let _ = tx.send(format!("Anonymized: {}", out.display()));
-                                    if let Ok(bytes) = fs::read(&out) {
-                                        let hash = blake3::hash(&bytes);
-                                        let _ = tx.send(format!("Hash {}: {}", out.display(), hash.to_hex()));
+                            let processed_count = Arc::new(AtomicUsize::new(0));
+                            let total_copy = total; // capture for closure
+                            dcm_files.par_iter().for_each(|p| {
+                                let tx = tx.clone();
+                                let processed_count = processed_count.clone();
+                                let seed = seed_clone.clone();
+                                match anonymize_file(p, &anon_dir, true, false, false, seed.as_deref()) {
+                                    Ok(out) => {
+                                        let _ = tx.send(format!("Anonymized: {}", out.display()));
+                                        if let Ok(bytes) = fs::read(&out) {
+                                            let hash = blake3::hash(&bytes);
+                                            let _ = tx.send(format!("Hash {}: {}", out.display(), hash.to_hex()));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(format!("Anon failed {}: {}", p.display(), e));
                                     }
                                 }
-                                Err(e) => {
-                                    let _ = tx.send(format!("Anon failed {}: {}", p.display(), e));
-                                }
-                            }
-                            if total > 0 {
-                                let prog = (i + 1) as f32 / total as f32;
+                                let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
+                                let prog = done as f32 / (total_copy as f32);
                                 let _ = tx.send(format!("PROC:PROG:{}", prog));
-                            }
+                            });
                         }
 
                         if notify_flag {
@@ -421,20 +427,24 @@ impl eframe::App for AppState {
                                 // After files have been copied/moved, automatically process them
                                 if !copied_files.is_empty() {
                                     let anon_dir = export.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
-                                    for (i, p) in copied_files.iter().enumerate() {
-                                        // process only if ext_filter empty (accept all) or file extension matches
-                                        let should_process = if ext.is_empty() {
+                                    // Filter files to process (apply extension filter) and run anonymization in parallel
+                                    let to_process: Vec<PathBuf> = copied_files.into_iter().filter(|p| {
+                                        if ext.is_empty() {
                                             true
                                         } else {
                                             p.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case(&ext)).unwrap_or(false)
-                                        };
-                                        if should_process {
-                                            // report progress for import processing
-                                            let total = copied_files.len();
-                                            if total > 0 {
-                                                let _ = tx.send("PROC:STEP:Anonymizing imported files".to_string());
-                                            }
-                                            match anonymize_file(p, &anon_dir, true, false, false, seed_clone.as_deref()) {
+                                        }
+                                    }).collect();
+                                    let total = to_process.len();
+                                    if total > 0 {
+                                        let _ = tx.send("PROC:STEP:Anonymizing imported files".to_string());
+                                        let processed_count = Arc::new(AtomicUsize::new(0));
+                                        let total_copy = total;
+                                        to_process.par_iter().for_each(|p| {
+                                            let tx = tx.clone();
+                                            let processed_count = processed_count.clone();
+                                            let seed = seed_clone.clone();
+                                            match anonymize_file(p, &anon_dir, true, false, false, seed.as_deref()) {
                                                 Ok(out) => {
                                                     let _ = tx.send(format!("Anonymized: {}", out.display()));
                                                     if let Ok(bytes) = fs::read(&out) {
@@ -446,10 +456,20 @@ impl eframe::App for AppState {
                                                     let _ = tx.send(format!("Anon failed {}: {}", p.display(), e));
                                                 }
                                             }
-                                            if total > 0 {
-                                                let prog = (i + 1) as f32 / total as f32;
-                                                let _ = tx.send(format!("PROC:PROG:{}", prog));
+                                            let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
+                                            let prog = done as f32 / (total_copy as f32);
+                                            let _ = tx.send(format!("PROC:PROG:{}", prog));
+                                        });
+
+                                        // after processing, refresh ready-to-upload by scanning anon dir
+                                        match scan_for_upload(&anon_dir, Some(tx.clone())) {
+                                            Ok(series) => {
+                                                if let Ok(json) = serde_json::to_string(&series) {
+                                                    let _ = std::fs::write(".last_scan.json", json);
+                                                    let _ = tx.send("scan_written".to_string());
+                                                }
                                             }
+                                            Err(e) => { let _ = tx.send(format!("Post-import scan failed: {}", e)); }
                                         }
                                     }
 
@@ -1071,6 +1091,15 @@ impl eframe::App for AppState {
 }
 
 fn main() {
+    // Configure rayon threadpool for anonymization tasks. Read `ANON_THREADS` env var
+    // to override; otherwise default to (num_cpus - 1) or 1.
+    let threads = std::env::var("ANON_THREADS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or_else(|| {
+        let n = num_cpus::get();
+        if n > 1 { n.saturating_sub(1) } else { 1 }
+    });
+    if let Err(e) = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global() {
+        eprintln!("Failed to configure global rayon thread pool: {:?}", e);
+    }
     // if started with --meta-view, run the separate metadata viewer window and exit
     let args: Vec<String> = std::env::args().collect();
     if args.len() >= 2 && args[1] == "--meta-view" {
@@ -1195,15 +1224,27 @@ fn main() {
                                         let _ = tx2.send(format!("PROC:PROG:{}", frac));
                                     }
 
-                                    let _ = tx2.send("PROC:STEP:Anonymizing copied files".to_string());
-                                    for (i, p) in std::fs::read_dir(&proc_dir).unwrap_or_else(|_| std::fs::read_dir(&export_dir2).unwrap()).flatten().enumerate() {
-                                        let src = p.path();
-                                        if src.extension().map(|s| s.to_string_lossy().eq_ignore_ascii_case("dcm")).unwrap_or(false) {
-                                            match anonymize_file(&src, &anon_dir2, true, false, false, seed2.as_deref()) {
+                                    // Collect processing files and anonymize in parallel
+                                    let proc_paths: Vec<PathBuf> = std::fs::read_dir(&proc_dir).unwrap_or_else(|_| std::fs::read_dir(&export_dir2).unwrap()).flatten()
+                                        .map(|e| e.path())
+                                        .filter(|src| src.extension().map(|s| s.to_string_lossy().eq_ignore_ascii_case("dcm")).unwrap_or(false))
+                                        .collect();
+                                    let total_proc = proc_paths.len();
+                                    if total_proc == 0 {
+                                        let _ = tx2.send("PROC:STEP:No files to process".to_string());
+                                    } else {
+                                        let _ = tx2.send("PROC:STEP:Anonymizing copied files".to_string());
+                                        let processed_count = Arc::new(AtomicUsize::new(0));
+                                        let total_copy = total_proc;
+                                        proc_paths.par_iter().for_each(|src| {
+                                            let tx2 = tx2.clone();
+                                            let processed_count = processed_count.clone();
+                                            let seed = seed2.clone();
+                                            match anonymize_file(src, &anon_dir2, true, false, false, seed.as_deref()) {
                                                 Ok(out) => {
                                                     let _ = tx2.send(format!("Anonymized: {}", out.display()));
                                                     // remove the source file from processing dir when anonymization succeeded
-                                                    if std::fs::remove_file(&src).is_ok() {
+                                                    if std::fs::remove_file(src).is_ok() {
                                                         let _ = tx2.send(format!("Removed processed file: {}", src.display()));
                                                     }
                                                 }
@@ -1211,9 +1252,10 @@ fn main() {
                                                     let _ = tx2.send(format!("Anon failed {}: {}", src.display(), e));
                                                 }
                                             }
-                                        }
-                                        let frac = (i as f32 + 1.0) / (total as f32);
-                                        let _ = tx2.send(format!("PROC:PROG:{}", frac));
+                                            let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
+                                            let frac = done as f32 / (total_copy as f32);
+                                            let _ = tx2.send(format!("PROC:PROG:{}", frac));
+                                        });
                                     }
 
                                     // after processing, refresh ready-to-upload by scanning anon dir
