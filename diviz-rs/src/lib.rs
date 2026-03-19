@@ -1626,9 +1626,11 @@ impl eframe::App for DicomViewApp {
                 // Side mouse button drag (Mouse4) -> rotate image
                 else if response.hovered() && side1_down {
                     let delta = ctx.input(|i| i.pointer.delta());
-                    if delta.x != 0.0 {
+                    if delta.x != 0.0 || delta.y != 0.0 {
+                        // Use both axes so diagonal/vertical drag can rotate too.
+                        let rotation_delta = delta.x * 0.35 + delta.y * 0.35;
                         self.rotation_degrees =
-                            (self.rotation_degrees + delta.x * 0.35).rem_euclid(360.0);
+                            (self.rotation_degrees + rotation_delta).rem_euclid(360.0);
                     }
                 }
                 // Left-button drag → pan (only if right button is not pressed)
