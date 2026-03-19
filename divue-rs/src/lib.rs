@@ -974,7 +974,7 @@ impl DivueApp {
                         }
 
                         let mut tmp = self.full_text.clone();
-                        ui.add(egui::TextEdit::multiline(&mut tmp).desired_rows(12).lock_focus(true));
+                        ui.add_sized([ui.available_width(), 240.0], egui::TextEdit::multiline(&mut tmp).desired_rows(12).lock_focus(true));
                         self.full_text = tmp;
                         if ui.button("Copy to clipboard").clicked() {
                             // Clipboard API changed in newer egui; keep value visible for manual copy.
@@ -1111,7 +1111,7 @@ impl eframe::App for MetaApp {
                             }
 
                             let mut tmp = self.full_text.clone();
-                            ui.add(egui::TextEdit::multiline(&mut tmp).desired_rows(12));
+                            ui.add_sized([ui.available_width(), 240.0], egui::TextEdit::multiline(&mut tmp).desired_rows(12));
                             // reflect edits back into stored string so copy will use edited content
                             self.full_text = tmp;
                             if ui.button("Copy to clipboard").clicked() {

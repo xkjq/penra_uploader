@@ -1820,6 +1820,67 @@ impl eframe::App for DicomViewApp {
                 let center = rect.center() + self.pan;
                 let angle_rad = self.rotation_degrees.to_radians();
                 paint_rotated_texture(ui.painter(), texture.id(), center, display, angle_rad);
+                // Draw a vertical scroll indicator on the right side of the image panel
+                let total_slices = self.current_view_slice_len();
+                if total_slices > 1 {
+                    let current_idx = match self.view_mode {
+                        ViewMode::Stack => self.current_stack_slice,
+                        ViewMode::Mpr => self.current_mpr_slice(),
+                    } as usize;
+
+                    let track_width = 12.0_f32;
+                    let padding = 8.0_f32;
+                    let track_rect = egui::Rect::from_min_size(
+                        egui::pos2(rect.right() - padding - track_width, rect.top() + padding),
+                        egui::vec2(track_width, rect.height() - padding * 2.0),
+                    );
+
+                    // Draw track background
+                    ui.painter().rect_filled(
+                        track_rect,
+                        track_width * 0.5,
+                        egui::Color32::from_rgba_unmultiplied(60, 60, 60, 120),
+                    );
+
+                    // Compute thumb position and size (proportional)
+                    let thumb_h = (track_rect.height() / (total_slices as f32)).max(6.0);
+                    let available = track_rect.height() - thumb_h;
+                    let t = if total_slices > 1 {
+                        (current_idx as f32) / ((total_slices - 1) as f32)
+                    } else {
+                        0.0
+                    };
+                    let thumb_y = track_rect.top() + t * available;
+                    let thumb_rect = egui::Rect::from_min_size(
+                        egui::pos2(track_rect.left(), thumb_y),
+                        egui::vec2(track_rect.width(), thumb_h),
+                    );
+
+                    // Draw thumb
+                    ui.painter().rect_filled(
+                        thumb_rect,
+                        6.0,
+                        egui::Color32::from_rgb(200, 200, 200),
+                    );
+
+                    // Draw thin shadow/border by overlaying a semi-transparent dark rect slightly inset
+                    ui.painter().rect_filled(
+                        thumb_rect.shrink(0.5),
+                        6.0,
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 80),
+                    );
+
+                    // Draw slice count text above the thumb
+                    let label = format!("{}/{}", current_idx + 1, total_slices);
+                    let text_pos = egui::pos2(track_rect.left() - 6.0, thumb_rect.center().y - 8.0);
+                    ui.painter().text(
+                        text_pos,
+                        egui::Align2::RIGHT_CENTER,
+                        label,
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::WHITE,
+                    );
+                }
             }
         });
         // ── Loading progress modal ────────────────────────────────────────────
