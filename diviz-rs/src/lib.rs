@@ -900,6 +900,7 @@ struct DicomViewApp {
     displayed_physical_size: Option<Vec2>,
     zoom: f32,
     rotation_degrees: f32,
+    rotation_drag_last_pos: Option<egui::Pos2>,
     pan: Vec2,
     error: Option<String>,
     show_metadata: bool,
@@ -930,6 +931,7 @@ impl DicomViewApp {
             displayed_physical_size: None,
             zoom: 1.0,
             rotation_degrees: 0.0,
+            rotation_drag_last_pos: None,
             pan: Vec2::ZERO,
             error: None,
             show_metadata: true,
@@ -960,6 +962,7 @@ impl DicomViewApp {
         self.pan = Vec2::ZERO;
         self.zoom = 1.0;
         self.rotation_degrees = 0.0;
+        self.rotation_drag_last_pos = None;
         self.wl_dirty = false;
 
         if paths.is_empty() {
@@ -1387,6 +1390,7 @@ impl eframe::App for DicomViewApp {
                 if ui.button("Fit").clicked() {
                     self.zoom = 1.0;
                     self.rotation_degrees = 0.0;
+                    self.rotation_drag_last_pos = None;
                     self.pan = Vec2::ZERO;
                 }
                 if ui.button("+").clicked() {
@@ -1403,7 +1407,7 @@ impl eframe::App for DicomViewApp {
                     self.rotation_degrees = (self.rotation_degrees + 90.0).rem_euclid(360.0);
                 }
                 ui.label(format!("{:.0}°", self.rotation_degrees));
-                ui.small("(Mouse4 drag to rotate)");
+                ui.small("(Mouse4 drag around center)");
 
                 // Window/Level controls (only for 16-bit grayscale)
                 let windowing_enabled = match self.view_mode {
@@ -1566,6 +1570,11 @@ impl eframe::App for DicomViewApp {
                 // - Stack mode (multiple images): scroll navigates slices.
                 // - Single-image mode: scroll zooms.
                 let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
+
+                if !side1_down {
+                    self.rotation_drag_last_pos = None;
+                }
+
                 if response.hovered() && scroll_delta != 0.0 {
                     if self.current_view_slice_len() > 1 {
                         // Scroll to change slice
@@ -1625,12 +1634,35 @@ impl eframe::App for DicomViewApp {
                 }
                 // Side mouse button drag (Mouse4) -> rotate image
                 else if response.hovered() && side1_down {
-                    let delta = ctx.input(|i| i.pointer.delta());
-                    if delta.x != 0.0 || delta.y != 0.0 {
-                        // Use both axes so diagonal/vertical drag can rotate too.
-                        let rotation_delta = delta.x * 0.35 + delta.y * 0.35;
-                        self.rotation_degrees =
-                            (self.rotation_degrees + rotation_delta).rem_euclid(360.0);
+                    let image_center = rect.center() + self.pan;
+                    let pointer_pos = ctx.input(|i| i.pointer.interact_pos());
+                    if let Some(current_pos) = pointer_pos {
+                        if let Some(last_pos) = self.rotation_drag_last_pos {
+                            let last_vec = last_pos - image_center;
+                            let current_vec = current_pos - image_center;
+                            let last_len2 = last_vec.length_sq();
+                            let current_len2 = current_vec.length_sq();
+
+                            // Ignore jitter when pointer is too close to the center pivot.
+                            if last_len2 > 9.0 && current_len2 > 9.0 {
+                                let last_angle = last_vec.y.atan2(last_vec.x);
+                                let current_angle = current_vec.y.atan2(current_vec.x);
+                                let mut delta_angle = current_angle - last_angle;
+                                while delta_angle > std::f32::consts::PI {
+                                    delta_angle -= 2.0 * std::f32::consts::PI;
+                                }
+                                while delta_angle < -std::f32::consts::PI {
+                                    delta_angle += 2.0 * std::f32::consts::PI;
+                                }
+
+                                self.rotation_degrees =
+                                    (self.rotation_degrees + delta_angle.to_degrees())
+                                        .rem_euclid(360.0);
+                            }
+                        }
+                        self.rotation_drag_last_pos = Some(current_pos);
+                    } else {
+                        self.rotation_drag_last_pos = None;
                     }
                 }
                 // Left-button drag → pan (only if right button is not pressed)
@@ -1662,6 +1694,7 @@ impl eframe::App for DicomViewApp {
                 if response.double_clicked() {
                     self.zoom = 1.0;
                     self.rotation_degrees = 0.0;
+                    self.rotation_drag_last_pos = None;
                     self.pan = Vec2::ZERO;
                     self.apply_default_window_for_current_series();
                     self.wl_dirty = true;

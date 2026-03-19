@@ -418,10 +418,10 @@ fn render_metadata_table(
         .striped(true)
         .resizable(true)
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-        .column(Column::initial(300.0).at_least(140.0).resizable(true));
+        .column(Column::initial(220.0).at_least(80.0).resizable(true));
 
     for _ in comps {
-        table = table.column(Column::remainder().at_least(160.0).resizable(true));
+        table = table.column(Column::remainder().at_least(70.0).resizable(true));
     }
 
     table
@@ -451,12 +451,17 @@ fn render_metadata_table(
                         for v in vals {
                             table_row.col(|ui| {
                                 let full = v.unwrap_or_default();
-                                let display = truncate_string(&full, 120);
-                                let mut btn = egui::Button::new(display.clone());
-                                if !same {
-                                    btn = btn.fill(egui::Color32::from_rgb(255, 243, 205));
-                                }
-                                let resp = ui.add(btn).on_hover_text(full.clone());
+                                let display = truncate_string(&full, 80);
+                                let text = if same {
+                                    egui::RichText::new(display.clone())
+                                } else {
+                                    egui::RichText::new(display.clone())
+                                        .background_color(egui::Color32::from_rgb(255, 243, 205))
+                                };
+                                let label = egui::Label::new(text).truncate().sense(egui::Sense::click());
+                                let resp = ui
+                                    .add_sized([ui.available_width(), ui.spacing().interact_size.y], label)
+                                    .on_hover_text(full.clone());
                                 if resp.clicked() {
                                     *full_text = full.clone();
                                     *full_open = true;
