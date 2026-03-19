@@ -46,6 +46,7 @@ pub fn run_meta_viewer_with_mode(paths: Vec<String>, mode: MetadataReadMode) {
         full_text: String::new(),
         show_diagnostics: false,
         show_only_different: false,
+        last_pairs: Vec::new(),
     };
     let native_options = eframe::NativeOptions::default();
     eframe::run_native("DICOM Metadata Viewer", native_options, Box::new(|_cc| Ok(Box::new(app)))).ok();
@@ -268,6 +269,38 @@ fn build_diff_text(pairs: &[(String, String)]) -> String {
     }
 
     out
+}
+
+fn render_diff_preview(ui: &mut egui::Ui, pairs: &[(String, String)]) {
+    let values: Vec<String> = pairs.iter().map(|(_, v)| v.clone()).collect();
+    let (prefix_len, suffix_len) = common_prefix_suffix_len(&values);
+
+    for (name, v) in pairs {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("{}:", name)).strong());
+        });
+        ui.horizontal_wrapped(|ui| {
+            let chars: Vec<char> = v.chars().collect();
+            let len = chars.len();
+            if prefix_len + suffix_len >= len {
+                ui.label(v);
+            } else {
+                let prefix: String = chars[0..prefix_len].iter().collect();
+                let mid: String = chars[prefix_len..len - suffix_len].iter().collect();
+                let suffix: String = chars[len - suffix_len..len].iter().collect();
+
+                ui.label(prefix);
+                // opening brackets
+                ui.label("[[");
+                // colored mid
+                ui.label(egui::RichText::new(mid).background_color(egui::Color32::from_rgb(255, 200, 200)));
+                // closing brackets
+                ui.label("]]" );
+                ui.label(suffix);
+            }
+        });
+        ui.separator();
+    }
 }
 
 #[derive(Clone)]
@@ -503,6 +536,7 @@ fn render_metadata_table(
     expanded_keys: &mut HashSet<String>,
     full_text: &mut String,
     full_open: &mut bool,
+    last_pairs: &mut Vec<(String, String)>,
 ) {
     let mut table = TableBuilder::new(ui)
         .striped(true)
@@ -559,6 +593,8 @@ fn render_metadata_table(
                                     .add_sized([ui.available_width(), ui.spacing().interact_size.y], label)
                                     .on_hover_text(full.clone());
                                 if resp.clicked() {
+                                    last_pairs.clear();
+                                    last_pairs.extend(pairs.clone());
                                     if comps.len() > 1 {
                                         *full_text = build_diff_text(&pairs);
                                     } else {
@@ -597,6 +633,7 @@ struct DivueApp {
     full_text: String,
     show_diagnostics: bool,
     show_only_different: bool,
+    last_pairs: Vec<(String, String)>,
 }
 
 impl DivueApp {
@@ -614,6 +651,7 @@ impl DivueApp {
             full_text: String::new(),
             show_diagnostics: false,
             show_only_different: false,
+            last_pairs: Vec::new(),
         }
     }
 
@@ -653,6 +691,7 @@ impl DivueApp {
         self.full_open = false;
         self.full_text.clear();
         self.show_only_different = false;
+        self.last_pairs.clear();
     }
 }
 
@@ -913,17 +952,29 @@ impl DivueApp {
             &mut self.expanded_keys,
             &mut self.full_text,
             &mut self.full_open,
+            &mut self.last_pairs,
         );
 
         // Full-text window for selecting/copying long values
         if self.full_open {
             egui::Window::new("Field value")
+                .default_size([1000.0, 400.0])
+                .resizable(true)
                 .open(&mut self.full_open)
                 .show(ctx, |ui| {
                     ui.vertical(|ui| {
-                        ui.label("Value (select and copy):");
+                        if self.last_pairs.len() > 1 {
+                            ui.label("Preview (differences highlighted):");
+                            ui.separator();
+                            render_diff_preview(ui, &self.last_pairs);
+                            ui.separator();
+                            ui.label("Bracketed text for copy:");
+                        } else {
+                            ui.label("Value (select and copy):");
+                        }
+
                         let mut tmp = self.full_text.clone();
-                        ui.add(egui::TextEdit::multiline(&mut tmp).desired_rows(12));
+                        ui.add(egui::TextEdit::multiline(&mut tmp).desired_rows(12).lock_focus(true));
                         self.full_text = tmp;
                         if ui.button("Copy to clipboard").clicked() {
                             // Clipboard API changed in newer egui; keep value visible for manual copy.
@@ -944,6 +995,7 @@ struct MetaApp {
     full_text: String,
     show_diagnostics: bool,
     show_only_different: bool,
+    last_pairs: Vec<(String, String)>,
 }
 
 impl eframe::App for MetaApp {
@@ -1037,22 +1089,36 @@ impl eframe::App for MetaApp {
                 &mut self.expanded_keys,
                 &mut self.full_text,
                 &mut self.full_open,
+                &mut self.last_pairs,
             );
 
             // Full-text window for selecting/copying long values
             if self.full_open {
-                egui::Window::new("Field value").open(&mut self.full_open).show(ctx, |ui| {
-                    ui.vertical(|ui| {
-                        ui.label("Value (select and copy):");
-                        let mut tmp = self.full_text.clone();
-                        ui.add(egui::TextEdit::multiline(&mut tmp).desired_rows(12));
-                        // reflect edits back into stored string so copy will use edited content
-                        self.full_text = tmp;
-                        if ui.button("Copy to clipboard").clicked() {
-                            // Clipboard API changed in newer egui; keep value visible for manual copy.
-                        }
+                egui::Window::new("Field value")
+                    .default_size([1000.0, 400.0])
+                    .resizable(true)
+                    .open(&mut self.full_open)
+                    .show(ctx, |ui| {
+                        ui.vertical(|ui| {
+                            if self.last_pairs.len() > 1 {
+                                ui.label("Preview (differences highlighted):");
+                                ui.separator();
+                                render_diff_preview(ui, &self.last_pairs);
+                                ui.separator();
+                                ui.label("Bracketed text for copy:");
+                            } else {
+                                ui.label("Value (select and copy):");
+                            }
+
+                            let mut tmp = self.full_text.clone();
+                            ui.add(egui::TextEdit::multiline(&mut tmp).desired_rows(12));
+                            // reflect edits back into stored string so copy will use edited content
+                            self.full_text = tmp;
+                            if ui.button("Copy to clipboard").clicked() {
+                                // Clipboard API changed in newer egui; keep value visible for manual copy.
+                            }
+                        });
                     });
-                });
             }
         });
     }

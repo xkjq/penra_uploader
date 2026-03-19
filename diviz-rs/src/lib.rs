@@ -525,6 +525,56 @@ fn scalar_to_rgba(data: &[f32], wc: f32, ww: f32) -> Vec<u8> {
     rgba
 }
 
+fn make_thumbnail(raw: &RawImage, max_dim: usize, wc: f32, ww: f32) -> (usize, usize, Vec<u8>) {
+    let (w, h) = raw.dimensions();
+    let scale = if w == 0 || h == 0 {
+        1.0
+    } else {
+        (max_dim as f32 / (w.max(h) as f32)).min(1.0)
+    };
+    let tw = (w as f32 * scale).max(1.0) as usize;
+    let th = (h as f32 * scale).max(1.0) as usize;
+    let mut out = vec![0u8; tw * th * 4];
+
+    for ty in 0..th {
+        for tx in 0..tw {
+            let sx = ((tx as f32 + 0.5) / (tw as f32) * (w as f32)).floor().min((w - 1) as f32) as usize;
+            let sy = ((ty as f32 + 0.5) / (th as f32) * (h as f32)).floor().min((h - 1) as f32) as usize;
+            let dst_idx = (ty * tw + tx) * 4;
+            match raw {
+                RawImage::Gray8 { data, width, .. } => {
+                    let v = data[sy * width + sx];
+                    out[dst_idx] = v;
+                    out[dst_idx + 1] = v;
+                    out[dst_idx + 2] = v;
+                    out[dst_idx + 3] = 255;
+                }
+                RawImage::Gray16(g) => {
+                    let val = g.data[sy * g.width + sx];
+                    let lo = wc - ww / 2.0;
+                    let hi = wc + ww / 2.0;
+                    let norm = ((val - lo) / (hi - lo).max(f32::EPSILON)).clamp(0.0, 1.0);
+                    let byte = (norm * 255.0) as u8;
+                    out[dst_idx] = byte;
+                    out[dst_idx + 1] = byte;
+                    out[dst_idx + 2] = byte;
+                    out[dst_idx + 3] = 255;
+                }
+                RawImage::Rgb8 { data, width, .. } => {
+                    let base = (sy * width + sx) * 3;
+                    out[dst_idx] = data[base];
+                    out[dst_idx + 1] = data[base + 1];
+                    out[dst_idx + 2] = data[base + 2];
+                    out[dst_idx + 3] = 255;
+                }
+            }
+        }
+    }
+
+    (tw, th, out)
+}
+
+
 enum RawImage {
     Gray8 {
         data: Vec<u8>,
@@ -591,6 +641,8 @@ struct LoadedImage {
     series_label: String,
     instance_number: Option<i32>,
     default_wc_ww: Option<(f32, f32)>,
+    /// Small RGBA thumbnail (width, height, rgba bytes)
+    thumbnail: Option<(usize, usize, Vec<u8>)>,
     pixel_spacing: Option<[f32; 2]>,
     slice_thickness: Option<f32>,
     spacing_between_slices: Option<f32>,
@@ -868,6 +920,16 @@ fn decode_single_file(path: &PathBuf) -> Result<LoadedImage, String> {
         None
     };
 
+    // Create a small thumbnail for UI (use default window/level for 16-bit images if available)
+    let thumbnail = {
+        let (tw, th, rgba) = if let Some((wc, ww)) = default_wc_ww {
+            make_thumbnail(&raw_image, 64, wc, ww)
+        } else {
+            make_thumbnail(&raw_image, 64, 0.0, 1.0)
+        };
+        Some((tw, th, rgba))
+    };
+
     Ok(LoadedImage {
         raw_image,
         metadata,
@@ -876,6 +938,7 @@ fn decode_single_file(path: &PathBuf) -> Result<LoadedImage, String> {
         series_label,
         instance_number,
         default_wc_ww,
+        thumbnail,
         pixel_spacing,
         slice_thickness,
         spacing_between_slices,
@@ -898,6 +961,7 @@ struct DicomViewApp {
     mpr_volume: Option<MprVolume>,
     mpr_error: Option<String>,
     texture: Option<egui::TextureHandle>,
+    thumbnail_textures: HashMap<String, egui::TextureHandle>,
     displayed_physical_size: Option<Vec2>,
     zoom: f32,
     rotation_degrees: f32,
@@ -930,6 +994,7 @@ impl DicomViewApp {
             mpr_volume: None,
             mpr_error: None,
             texture: None,
+            thumbnail_textures: HashMap::new(),
             displayed_physical_size: None,
             zoom: 1.0,
             rotation_degrees: 0.0,
@@ -1220,24 +1285,32 @@ impl eframe::App for DicomViewApp {
         // ── Poll background loading thread ─────────────────────────────────
         let mut loading_complete = false;
         if let Some(state) = &mut self.loading {
-            loop {
-                match state.rx.try_recv() {
-                    Ok(LoadMsg::Image(image)) => {
-                        state.received += 1;
-                        state.current_filename = image.filename.clone();
-                        self.images.push(image);
-                    }
-                    Ok(LoadMsg::Error(e)) => {
-                        state.received += 1;
-                        self.error = Some(e);
-                    }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        loading_complete = true;
-                        break;
+                loop {
+                    match state.rx.try_recv() {
+                        Ok(LoadMsg::Image(image)) => {
+                            state.received += 1;
+                            state.current_filename = image.filename.clone();
+                            // Create thumbnail texture on UI thread if available
+                            if let Some((tw, th, ref rgba)) = image.thumbnail {
+                                let color_image = egui::ColorImage::from_rgba_unmultiplied([tw, th], rgba);
+                                // Use filename as cache key
+                                let key = image.filename.clone();
+                                let tex = ctx.load_texture(format!("thumb_{}", key), color_image, egui::TextureOptions::LINEAR);
+                                self.thumbnail_textures.insert(key.clone(), tex);
+                            }
+                            self.images.push(image);
+                        }
+                        Ok(LoadMsg::Error(e)) => {
+                            state.received += 1;
+                            self.error = Some(e);
+                        }
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            loading_complete = true;
+                            break;
+                        }
                     }
                 }
-            }
             if let Some(state) = &self.loading {
                 if state.received >= state.total {
                     loading_complete = true;
@@ -1336,11 +1409,30 @@ impl eframe::App for DicomViewApp {
                         .show_ui(ui, |ui| {
                             let mut selected_series = self.current_series;
                             for (idx, group) in self.series_groups.iter().enumerate() {
-                                ui.selectable_value(
-                                    &mut selected_series,
-                                    idx,
-                                    format!("{} ({} images)", group.label, group.image_indices.len()),
-                                );
+                                ui.horizontal(|ui| {
+                                    // Show thumbnail for the first image in the series if available
+                                    if let Some(first_idx) = group.image_indices.first() {
+                                        if let Some(img) = self.images.get(*first_idx) {
+                                            if let Some(tex) = self.thumbnail_textures.get(&img.filename) {
+                                                if ui
+                                                    .add(egui::Button::new(egui::Image::new((tex.id(), egui::vec2(64.0, 64.0)))))
+                                                    .clicked()
+                                                {
+                                                    selected_series = idx;
+                                                }
+                                            } else {
+                                                ui.allocate_ui(egui::Vec2::new(64.0, 64.0), |ui| {
+                                                    ui.label(egui::RichText::new(" "));
+                                                });
+                                            }
+                                        }
+                                    }
+                                    ui.selectable_value(
+                                        &mut selected_series,
+                                        idx,
+                                        format!("{} ({} images)", group.label, group.image_indices.len()),
+                                    );
+                                });
                             }
                             if selected_series != self.current_series {
                                 self.current_series = selected_series;
