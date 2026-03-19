@@ -693,6 +693,8 @@ struct ViewportState {
     zoom: f32,
     pan: Vec2,
     rotation_degrees: f32,
+    selected_series: usize,
+    view_mode: ViewMode,
 }
 
 impl Default for ViewportState {
@@ -702,6 +704,8 @@ impl Default for ViewportState {
             zoom: 1.0,
             pan: Vec2::ZERO,
             rotation_degrees: 0.0,
+            selected_series: 0,
+            view_mode: ViewMode::Stack,
         }
     }
 }
@@ -984,6 +988,8 @@ struct DicomViewApp {
     viewports: Vec<ViewportState>,
     active_viewport: usize,
     layout_cells: usize,
+    view_textures: Vec<Option<egui::TextureHandle>>,
+    view_displayed_physical_size: Vec<Option<Vec2>>,
     displayed_physical_size: Option<Vec2>,
     zoom: f32,
     rotation_degrees: f32,
@@ -1020,6 +1026,8 @@ impl DicomViewApp {
             viewports: vec![ViewportState::default()],
             active_viewport: 0,
             layout_cells: 1,
+            view_textures: vec![None],
+            view_displayed_physical_size: vec![None],
             displayed_physical_size: None,
             zoom: 1.0,
             rotation_degrees: 0.0,
@@ -1093,28 +1101,55 @@ impl DicomViewApp {
             vp.zoom = 1.0;
             vp.pan = Vec2::ZERO;
             vp.rotation_degrees = 0.0;
+            vp.selected_series = 0;
+            vp.view_mode = ViewMode::Stack;
         }
+        // reset per-viewport textures
+        self.view_textures.clear();
+        self.view_displayed_physical_size.clear();
+        self.view_textures.resize(self.viewports.len(), None);
+        self.view_displayed_physical_size.resize(self.viewports.len(), None);
     }
 
-    fn active_series_len(&self) -> usize {
+    fn series_len_for(&self, vp_idx: usize) -> usize {
+        let series_idx = self
+            .viewports
+            .get(vp_idx)
+            .map(|v| v.selected_series)
+            .unwrap_or(0);
         self.series_groups
-            .get(self.current_series)
+            .get(series_idx)
             .map(|g| g.image_indices.len())
             .unwrap_or(0)
     }
 
-    fn active_image(&self) -> Option<&LoadedImage> {
-        let group = self.series_groups.get(self.current_series)?;
-        let global_idx = *group.image_indices.get(self.current_stack_slice)?;
+    fn active_image_for(&self, vp_idx: usize) -> Option<&LoadedImage> {
+        let series_idx = self.viewports.get(vp_idx).map(|v| v.selected_series).unwrap_or(0);
+        let group = self.series_groups.get(series_idx)?;
+        let slice_idx = self.viewports.get(vp_idx).map(|v| v.current_stack_slice).unwrap_or(0);
+        let global_idx = *group.image_indices.get(slice_idx)?;
         self.images.get(global_idx)
     }
 
-    fn metadata_image(&self) -> Option<&LoadedImage> {
-        self.active_image().or_else(|| {
-            let group = self.series_groups.get(self.current_series)?;
+    fn metadata_image_for(&self, vp_idx: usize) -> Option<&LoadedImage> {
+        self.active_image_for(vp_idx).or_else(|| {
+            let series_idx = self.viewports.get(vp_idx).map(|v| v.selected_series).unwrap_or(0);
+            let group = self.series_groups.get(series_idx)?;
             let first = *group.image_indices.first()?;
             self.images.get(first)
         })
+    }
+
+    fn active_series_len(&self) -> usize {
+        self.series_len_for(self.active_viewport)
+    }
+
+    fn active_image(&self) -> Option<&LoadedImage> {
+        self.active_image_for(self.active_viewport)
+    }
+
+    fn metadata_image(&self) -> Option<&LoadedImage> {
+        self.metadata_image_for(self.active_viewport)
     }
 
     fn mpr_available(&self) -> bool {
@@ -1196,8 +1231,11 @@ impl DicomViewApp {
 
         groups.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.uid.cmp(&b.uid)));
         self.series_groups = groups;
-        self.current_series = 0;
-        self.current_stack_slice = 0;
+        // Reset per-viewport selected series and slices
+        for vp in &mut self.viewports {
+            vp.selected_series = 0;
+            vp.current_stack_slice = 0;
+        }
         self.current_axial_slice = 0;
         self.current_coronal_slice = 0;
         self.current_sagittal_slice = 0;
@@ -1253,53 +1291,46 @@ impl DicomViewApp {
     }
 
     fn update_current_slice_view(&mut self, ctx: &egui::Context) {
-        self.texture = None;
-        self.displayed_physical_size = None;
-
-        match self.view_mode {
-            ViewMode::Stack => {
-                if self.active_series_len() == 0 {
-                    self.wl_dirty = false;
-                    return;
+        // Rebuild textures for each viewport based on its selected series/slice or MPR
+        let vp_count = self.viewports.len();
+        for idx in 0..vp_count {
+            let vp = &self.viewports[idx];
+            if vp.view_mode == ViewMode::Stack {
+                let series_idx = vp.selected_series;
+                if let Some(group) = self.series_groups.get(series_idx) {
+                    if let Some(&global_idx) = group.image_indices.get(vp.current_stack_slice) {
+                        // prepare image pixels and physical size
+                        let (width, height, rgba, phys) = {
+                            let img = &self.images[global_idx];
+                            let (w, h) = img.raw_image.dimensions();
+                            let rgba = img.raw_image.to_rgba(self.window_center, self.window_width);
+                            let phys = img.physical_size();
+                            (w, h, rgba, phys)
+                        };
+                        let color_image = egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
+                        let tex = ctx.load_texture(format!("dicom_image_v{}", idx), color_image, egui::TextureOptions::LINEAR);
+                        self.view_textures[idx] = Some(tex);
+                        self.view_displayed_physical_size[idx] = Some(phys);
+                        continue;
+                    }
                 }
-                let Some((width, height, rgba, physical_size)) = self.active_image().map(|img| {
-                    let (width, height) = img.raw_image.dimensions();
-                    (
-                        width,
-                        height,
-                        img.raw_image.to_rgba(self.window_center, self.window_width),
-                        img.physical_size(),
-                    )
-                }) else {
-                    self.wl_dirty = false;
-                    return;
-                };
-                let color_image =
-                    egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
-                self.texture = Some(ctx.load_texture(
-                    "dicom_image",
-                    color_image,
-                    egui::TextureOptions::LINEAR,
-                ));
-                self.displayed_physical_size = Some(physical_size);
-            }
-            ViewMode::Mpr => {
-                let Some(volume) = &self.mpr_volume else {
-                    self.wl_dirty = false;
-                    return;
-                };
-                let plane_index = self.current_mpr_slice();
-                let pixels = volume.extract_plane(self.mpr_plane, plane_index);
-                let (width, height) = volume.plane_dimensions(self.mpr_plane);
-                let rgba = scalar_to_rgba(&pixels, self.window_center, self.window_width);
-                let color_image =
-                    egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
-                self.texture = Some(ctx.load_texture(
-                    "dicom_image",
-                    color_image,
-                    egui::TextureOptions::LINEAR,
-                ));
-                self.displayed_physical_size = Some(volume.physical_size(self.mpr_plane));
+                self.view_textures[idx] = None;
+                self.view_displayed_physical_size[idx] = None;
+            } else {
+                // MPR: build plane if available
+                if let Some(volume) = &self.mpr_volume {
+                    let plane_index = self.current_mpr_slice();
+                    let pixels = volume.extract_plane(self.mpr_plane, plane_index);
+                    let (width, height) = volume.plane_dimensions(self.mpr_plane);
+                    let rgba = scalar_to_rgba(&pixels, self.window_center, self.window_width);
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
+                    let tex = ctx.load_texture(format!("dicom_image_v{}", idx), color_image, egui::TextureOptions::LINEAR);
+                    self.view_textures[idx] = Some(tex);
+                    self.view_displayed_physical_size[idx] = Some(volume.physical_size(self.mpr_plane));
+                } else {
+                    self.view_textures[idx] = None;
+                    self.view_displayed_physical_size[idx] = None;
+                }
             }
         }
 
@@ -1447,15 +1478,16 @@ impl eframe::App for DicomViewApp {
                 if !self.series_groups.is_empty() {
                     ui.separator();
                     ui.label("Series:");
+                    let vp_sel = self.viewports.get(self.active_viewport).map(|v| v.selected_series).unwrap_or(0);
                     let selected_text = self
                         .series_groups
-                        .get(self.current_series)
+                        .get(vp_sel)
                         .map(|g| g.label.as_str())
                         .unwrap_or("(none)");
                     egui::ComboBox::from_id_salt("series_selector")
                         .selected_text(selected_text)
                         .show_ui(ui, |ui| {
-                            let mut selected_series = self.current_series;
+                            let mut selected_series = vp_sel;
                             for (idx, group) in self.series_groups.iter().enumerate() {
                                 ui.horizontal(|ui| {
                                     // Show thumbnail for the first image in the series if available
@@ -1482,9 +1514,11 @@ impl eframe::App for DicomViewApp {
                                     );
                                 });
                             }
-                            if selected_series != self.current_series {
-                                self.current_series = selected_series;
-                                self.current_stack_slice = 0;
+                            if selected_series != vp_sel {
+                                if let Some(vp) = self.viewports.get_mut(self.active_viewport) {
+                                    vp.selected_series = selected_series;
+                                    vp.current_stack_slice = 0;
+                                }
                                 self.current_axial_slice = 0;
                                 self.current_coronal_slice = 0;
                                 self.current_sagittal_slice = 0;
@@ -1580,17 +1614,12 @@ impl eframe::App for DicomViewApp {
                 }
 
                 // Slice navigation
-                let active_len = self.current_view_slice_len();
+                let active_len = self.series_len_for(self.active_viewport);
                 if active_len > 1 {
                     ui.separator();
-                    let current_index = match self.view_mode {
-                        ViewMode::Stack => self.current_stack_slice,
-                        ViewMode::Mpr => self.current_mpr_slice(),
-                    };
-                    let label = match self.view_mode {
-                        ViewMode::Stack => "Slice".to_string(),
-                        ViewMode::Mpr => format!("{}", self.mpr_plane.label()),
-                    };
+                    let vp = &mut self.viewports[self.active_viewport];
+                    let current_index = vp.current_stack_slice;
+                    let label = "Slice".to_string();
                     ui.label(format!("{}: {}/{}", label, current_index + 1, active_len));
                     let mut slice_val = current_index as i32;
                     let slider = ui.add(
@@ -1598,10 +1627,7 @@ impl eframe::App for DicomViewApp {
                             .show_value(false)
                     );
                     if slider.changed() {
-                        match self.view_mode {
-                            ViewMode::Stack => self.current_stack_slice = slice_val as usize,
-                            ViewMode::Mpr => self.set_current_mpr_slice(slice_val as usize),
-                        }
+                        vp.current_stack_slice = slice_val as usize;
                         self.wl_dirty = true;
                     }
                 }
@@ -1746,10 +1772,18 @@ impl eframe::App for DicomViewApp {
                         physical_size.y * fit * vp_zoom,
                     );
 
-                    paint_rotated_texture(ui.painter(), texture.id(), center, display, angle_rad);
+                    // choose texture for this viewport
+                    let tex_opt = self.view_textures.get(cell_idx).and_then(|o| o.clone());
+                    if let Some(texture) = tex_opt {
+                        paint_rotated_texture(ui.painter(), texture.id(), center, display, angle_rad);
+                    } else {
+                        // placeholder
+                        ui.painter().rect_filled(cell_rect, 4.0, egui::Color32::from_gray(24));
+                        ui.painter().text(cell_rect.center(), egui::Align2::CENTER_CENTER, "(empty)", egui::FontId::proportional(14.0), egui::Color32::GRAY);
+                    }
 
                     // If this is the active viewport, handle interactions (wheel, drag, slice stepping)
-                    if cell_idx == self.active_viewport {
+                        if cell_idx == self.active_viewport {
                         // reuse existing input handling logic for active viewport
                         let (left_down, right_down, middle_down, side1_down) = ctx.input(|i| {
                             (
@@ -1786,7 +1820,7 @@ impl eframe::App for DicomViewApp {
                                             break;
                                         }
                                     } else {
-                                        if self.viewports[cell_idx].current_stack_slice < self.current_view_slice_len() - 1 {
+                                        if self.viewports[cell_idx].current_stack_slice < self.series_len_for(cell_idx) - 1 {
                                             self.viewports[cell_idx].current_stack_slice += 1;
                                             self.wheel_slice_accumulator += WHEEL_SLICE_THRESHOLD;
                                             self.wl_dirty = true;

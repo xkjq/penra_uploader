@@ -519,7 +519,10 @@ fn render_key_cell(
             ui.add_space(24.0);
         }
 
-        ui.label(key_display).on_hover_text(key_hover);
+        let label = egui::Label::new(key_display).truncate();
+        let _resp = ui
+            .add_sized([ui.available_width(), ui.spacing().interact_size.y], label)
+            .on_hover_text(key_hover);
     });
 }
 
@@ -538,7 +541,7 @@ fn render_metadata_table(
         .striped(true)
         .resizable(true)
         .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-        .column(Column::initial(220.0).at_least(80.0).resizable(true));
+        .column(Column::initial(140.0).at_least(40.0).resizable(true));
 
     for _ in comps {
         table = table.column(Column::remainder().at_least(70.0).resizable(true));
