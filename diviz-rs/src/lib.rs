@@ -1601,6 +1601,8 @@ impl eframe::App for DicomViewApp {
                 if response.double_clicked() {
                     self.zoom = 1.0;
                     self.pan = Vec2::ZERO;
+                    self.apply_default_window_for_current_series();
+                    self.wl_dirty = true;
                 }
 
                 let center = rect.center() + self.pan;
