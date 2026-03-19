@@ -320,6 +320,14 @@ fn row_has_children(row_id: &str, rows: &[TreeRow]) -> bool {
         .any(|row| row.row_id != row_id && row_ancestors(&row.row_id).iter().any(|ancestor| ancestor == row_id))
 }
 
+fn descendant_row_ids(row_id: &str, rows: &[TreeRow]) -> Vec<String> {
+    let prefix = format!("{}/", row_id);
+    rows.iter()
+        .filter(|row| row.row_id.starts_with(&prefix))
+        .map(|row| row.row_id.clone())
+        .collect()
+}
+
 fn expanded_keys_for_all_nodes(rows: &[TreeRow]) -> HashSet<String> {
     rows.iter()
         .filter(|row| row_has_children(&row.row_id, rows))
@@ -389,11 +397,32 @@ fn render_key_cell(
         if has_children {
             let is_expanded = effective_expanded_keys.contains(row_id);
             let icon = if is_expanded { "▼" } else { "▶" };
-            if ui.small_button(icon).clicked() {
+            let toggle_resp = ui
+                .small_button(icon)
+                .on_hover_text("Left click: toggle this node\nRight click: toggle recursively");
+
+            if toggle_resp.clicked() {
                 if is_expanded {
                     expanded_keys.remove(row_id);
                 } else {
                     expanded_keys.insert(row_id.to_string());
+                }
+            }
+
+            if toggle_resp.secondary_clicked() {
+                let descendants = descendant_row_ids(row_id, rows);
+                if is_expanded {
+                    expanded_keys.remove(row_id);
+                    for desc in descendants {
+                        expanded_keys.remove(&desc);
+                    }
+                } else {
+                    expanded_keys.insert(row_id.to_string());
+                    for desc in descendants {
+                        if row_has_children(&desc, rows) {
+                            expanded_keys.insert(desc);
+                        }
+                    }
                 }
             }
         } else {
