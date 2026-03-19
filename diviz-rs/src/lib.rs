@@ -901,6 +901,7 @@ struct DicomViewApp {
     zoom: f32,
     rotation_degrees: f32,
     rotation_drag_last_pos: Option<egui::Pos2>,
+    wheel_slice_accumulator: f32,
     pan: Vec2,
     error: Option<String>,
     show_metadata: bool,
@@ -932,6 +933,7 @@ impl DicomViewApp {
             zoom: 1.0,
             rotation_degrees: 0.0,
             rotation_drag_last_pos: None,
+            wheel_slice_accumulator: 0.0,
             pan: Vec2::ZERO,
             error: None,
             show_metadata: true,
@@ -963,6 +965,7 @@ impl DicomViewApp {
         self.zoom = 1.0;
         self.rotation_degrees = 0.0;
         self.rotation_drag_last_pos = None;
+        self.wheel_slice_accumulator = 0.0;
         self.wl_dirty = false;
 
         if paths.is_empty() {
@@ -1570,30 +1573,50 @@ impl eframe::App for DicomViewApp {
                 // - Stack mode (multiple images): scroll navigates slices.
                 // - Single-image mode: scroll zooms.
                 let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
+                const WHEEL_SLICE_THRESHOLD: f32 = 48.0;
 
                 if !side1_down {
                     self.rotation_drag_last_pos = None;
                 }
 
+                if !response.hovered() {
+                    self.wheel_slice_accumulator = 0.0;
+                }
+
                 if response.hovered() && scroll_delta != 0.0 {
                     if self.current_view_slice_len() > 1 {
-                        // Scroll to change slice
-                        let current = match self.view_mode {
-                            ViewMode::Stack => self.current_stack_slice,
-                            ViewMode::Mpr => self.current_mpr_slice(),
-                        };
-                        if scroll_delta > 0.0 && current > 0 {
-                            match self.view_mode {
-                                ViewMode::Stack => self.current_stack_slice -= 1,
-                                ViewMode::Mpr => self.set_current_mpr_slice(current - 1),
+                        // Accumulate wheel input and step slices only after enough movement.
+                        self.wheel_slice_accumulator += scroll_delta;
+
+                        while self.wheel_slice_accumulator.abs() >= WHEEL_SLICE_THRESHOLD {
+                            let current = match self.view_mode {
+                                ViewMode::Stack => self.current_stack_slice,
+                                ViewMode::Mpr => self.current_mpr_slice(),
+                            };
+
+                            if self.wheel_slice_accumulator > 0.0 {
+                                if current > 0 {
+                                    match self.view_mode {
+                                        ViewMode::Stack => self.current_stack_slice -= 1,
+                                        ViewMode::Mpr => self.set_current_mpr_slice(current - 1),
+                                    }
+                                    self.wheel_slice_accumulator -= WHEEL_SLICE_THRESHOLD;
+                                    self.wl_dirty = true;
+                                } else {
+                                    self.wheel_slice_accumulator = 0.0;
+                                    break;
+                                }
+                            } else if current < self.current_view_slice_len() - 1 {
+                                match self.view_mode {
+                                    ViewMode::Stack => self.current_stack_slice += 1,
+                                    ViewMode::Mpr => self.set_current_mpr_slice(current + 1),
+                                }
+                                self.wheel_slice_accumulator += WHEEL_SLICE_THRESHOLD;
+                                self.wl_dirty = true;
+                            } else {
+                                self.wheel_slice_accumulator = 0.0;
+                                break;
                             }
-                            self.wl_dirty = true;
-                        } else if scroll_delta < 0.0 && current < self.current_view_slice_len() - 1 {
-                            match self.view_mode {
-                                ViewMode::Stack => self.current_stack_slice += 1,
-                                ViewMode::Mpr => self.set_current_mpr_slice(current + 1),
-                            }
-                            self.wl_dirty = true;
                         }
                     } else {
                         // Scroll to zoom

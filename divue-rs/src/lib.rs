@@ -45,6 +45,7 @@ pub fn run_meta_viewer_with_mode(paths: Vec<String>, mode: MetadataReadMode) {
         full_open: false,
         full_text: String::new(),
         show_diagnostics: false,
+        show_only_different: false,
     };
     let native_options = eframe::NativeOptions::default();
     eframe::run_native("DICOM Metadata Viewer", native_options, Box::new(|_cc| Ok(Box::new(app)))).ok();
@@ -525,6 +526,7 @@ struct DivueApp {
     full_open: bool,
     full_text: String,
     show_diagnostics: bool,
+    show_only_different: bool,
 }
 
 impl DivueApp {
@@ -541,6 +543,7 @@ impl DivueApp {
             full_open: false,
             full_text: String::new(),
             show_diagnostics: false,
+            show_only_different: false,
         }
     }
 
