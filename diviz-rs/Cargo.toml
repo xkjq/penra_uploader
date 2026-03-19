@@ -10,6 +10,7 @@ dicom-object = "0.9"
 dicom-core = "0.9"
 dicom-pixeldata = "0.9"
 rfd = "0.17"
+rayon = "1.7"
 
 [[bin]]
 name = "diviz-rs"

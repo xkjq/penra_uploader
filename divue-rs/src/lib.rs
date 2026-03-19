@@ -582,6 +582,7 @@ impl DivueApp {
         self.filter.clear();
         self.full_open = false;
         self.full_text.clear();
+        self.show_only_different = false;
     }
 }
 
@@ -771,6 +772,8 @@ impl DivueApp {
             )
             .on_hover_text("Heuristic filter based on DICOM tag names and suspicious values such as IDs, emails, or long digit strings.");
             ui.separator();
+            ui.checkbox(&mut self.show_only_different, "Show differences only").on_hover_text("Hide tags with identical values across all compared files.");
+            ui.separator();
             if ui.button("Diagnostics").clicked() {
                 self.show_diagnostics = !self.show_diagnostics;
             }
@@ -813,6 +816,9 @@ impl DivueApp {
         let mut keys = filter_keys(&all_keys, &self.comps, &self.filter);
         if self.identifiable_only {
             keys.retain(|key| row_may_contain_identifiable_data(key, &self.comps));
+        }
+        if self.show_only_different {
+            keys.retain(|key| !values_are_same(key, &self.comps));
         }
     let rows = build_tree_rows(&all_keys, &keys);
 
@@ -867,6 +873,7 @@ struct MetaApp {
     full_open: bool,
     full_text: String,
     show_diagnostics: bool,
+    show_only_different: bool,
 }
 
 impl eframe::App for MetaApp {
@@ -888,6 +895,8 @@ impl eframe::App for MetaApp {
                     "Likely identifiable only",
                 )
                 .on_hover_text("Heuristic filter based on DICOM tag names and suspicious values such as IDs, emails, or long digit strings.");
+                ui.separator();
+                ui.checkbox(&mut self.show_only_different, "Show differences only").on_hover_text("Hide tags with identical values across all compared files.");
                 ui.separator();
                 if ui.button("Diagnostics").clicked() {
                     self.show_diagnostics = !self.show_diagnostics;
@@ -931,6 +940,9 @@ impl eframe::App for MetaApp {
             let mut keys = filter_keys(&all_keys, &self.comps, &self.filter);
             if self.identifiable_only {
                 keys.retain(|key| row_may_contain_identifiable_data(key, &self.comps));
+            }
+            if self.show_only_different {
+                keys.retain(|key| !values_are_same(key, &self.comps));
             }
             let rows = build_tree_rows(&all_keys, &keys);
 

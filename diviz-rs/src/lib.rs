@@ -2,6 +2,7 @@ use eframe::egui;
 use egui::Vec2;
 use dicom_object::{open_file, Tag};
 use dicom_pixeldata::PixelDecoder;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
@@ -978,15 +979,16 @@ impl DicomViewApp {
         let (tx, rx) = mpsc::channel::<LoadMsg>();
         let ctx_clone = ctx.clone();
 
+        // Decode files in parallel using rayon; send results back to UI as they complete.
         std::thread::spawn(move || {
-            for path in paths {
+            paths.into_par_iter().for_each(|path| {
                 let msg = match decode_single_file(&path) {
                     Ok(image) => LoadMsg::Image(image),
                     Err(e) => LoadMsg::Error(e),
                 };
                 let _ = tx.send(msg);
                 ctx_clone.request_repaint();
-            }
+            });
         });
 
         self.loading = Some(LoadingState {
