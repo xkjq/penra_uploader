@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 eframe = "0.33"
 egui = "0.33"
+egui_extras = "0.33"
 dicom_viewer = { path = "../dicom_viewer" }
 dicom-core = "0.9"
 dicom-dictionary-std = "0.9"

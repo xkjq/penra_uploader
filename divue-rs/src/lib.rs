@@ -1,4 +1,5 @@
 use eframe::egui;
+use egui_extras::{Column, TableBuilder};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use dicom_viewer::{read_metadata_with_diagnostics, MetadataReadMode, ExtractionDiagnostics};
@@ -403,6 +404,77 @@ fn render_key_cell(
     });
 }
 
+fn render_metadata_table(
+    ui: &mut egui::Ui,
+    rows: &[TreeRow],
+    visible: &[&TreeRow],
+    effective_expanded: &HashSet<String>,
+    comps: &[(String, HashMap<String, String>)],
+    expanded_keys: &mut HashSet<String>,
+    full_text: &mut String,
+    full_open: &mut bool,
+) {
+    let mut table = TableBuilder::new(ui)
+        .striped(true)
+        .resizable(true)
+        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+        .column(Column::initial(300.0).at_least(140.0).resizable(true));
+
+    for _ in comps {
+        table = table.column(Column::remainder().at_least(160.0).resizable(true));
+    }
+
+    table
+        .header(24.0, |mut header| {
+            header.col(|ui| {
+                ui.strong("Key");
+            });
+            for (name, _map) in comps {
+                header.col(|ui| {
+                    ui.strong(name);
+                });
+            }
+        })
+        .body(|mut body| {
+            for row in visible {
+                body.row(26.0, |mut table_row| {
+                    table_row.col(|ui| {
+                        render_key_cell(ui, &row.row_id, rows, effective_expanded, expanded_keys);
+                    });
+
+                    if let Some(value_key) = &row.value_key {
+                        let mut vals: Vec<Option<String>> = Vec::new();
+                        for (_name, map) in comps {
+                            vals.push(map.get(value_key).cloned());
+                        }
+                        let same = values_are_same(value_key, comps);
+                        for v in vals {
+                            table_row.col(|ui| {
+                                let full = v.unwrap_or_default();
+                                let display = truncate_string(&full, 120);
+                                let mut btn = egui::Button::new(display.clone());
+                                if !same {
+                                    btn = btn.fill(egui::Color32::from_rgb(255, 243, 205));
+                                }
+                                let resp = ui.add(btn).on_hover_text(full.clone());
+                                if resp.clicked() {
+                                    *full_text = full.clone();
+                                    *full_open = true;
+                                }
+                            });
+                        }
+                    } else {
+                        for _ in comps {
+                            table_row.col(|ui| {
+                                ui.label("");
+                            });
+                        }
+                    }
+                });
+            }
+        });
+}
+
 /// App state that manages both file selection and comparison views
 struct DivueApp {
     // File selection state
@@ -719,56 +791,16 @@ impl DivueApp {
     let effective_expanded = effective_expanded_keys(&rows, &self.expanded_keys, filtered);
     let visible = visible_rows(&rows, &effective_expanded);
 
-        // header row
-        egui::Grid::new("meta_header")
-            .num_columns(1 + self.comps.len())
-            .spacing([8.0, 4.0])
-            .show(ui, |ui| {
-                ui.label("Key");
-                for (name, _map) in &self.comps {
-                    ui.label(name);
-                }
-                ui.end_row();
-            });
-        ui.separator();
-
-        egui::ScrollArea::vertical()
-            .max_height(900.0)
-            .show(ui, |ui| {
-                egui::Grid::new("meta_rows")
-                    .num_columns(1 + self.comps.len())
-                    .spacing([8.0, 4.0])
-                    .show(ui, |ui| {
-                        for row in &visible {
-                            render_key_cell(ui, &row.row_id, &rows, &effective_expanded, &mut self.expanded_keys);
-                            if let Some(value_key) = &row.value_key {
-                                let mut vals: Vec<Option<String>> = Vec::new();
-                                for (_name, map) in &self.comps {
-                                    vals.push(map.get(value_key).cloned());
-                                }
-                                let same = values_are_same(value_key, &self.comps);
-                                for v in vals {
-                                    let full = v.unwrap_or_default();
-                                    let display = truncate_string(&full, 120);
-                                    let mut btn = egui::Button::new(display.clone());
-                                    if !same {
-                                        btn = btn.fill(egui::Color32::from_rgb(255, 243, 205));
-                                    }
-                                    let resp = ui.add(btn).on_hover_text(full.clone());
-                                    if resp.clicked() {
-                                        self.full_text = full.clone();
-                                        self.full_open = true;
-                                    }
-                                }
-                            } else {
-                                for _ in &self.comps {
-                                    ui.label("");
-                                }
-                            }
-                            ui.end_row();
-                        }
-                    });
-            });
+        render_metadata_table(
+            ui,
+            &rows,
+            &visible,
+            &effective_expanded,
+            &self.comps,
+            &mut self.expanded_keys,
+            &mut self.full_text,
+            &mut self.full_open,
+        );
 
         // Full-text window for selecting/copying long values
         if self.full_open {
@@ -877,48 +909,16 @@ impl eframe::App for MetaApp {
             let effective_expanded = effective_expanded_keys(&rows, &self.expanded_keys, filtered);
             let visible = visible_rows(&rows, &effective_expanded);
 
-            // header row
-            egui::Grid::new("meta_header").num_columns(1 + self.comps.len()).spacing([8.0, 4.0]).show(ui, |ui| {
-                ui.label("Key");
-                for (name, _map) in &self.comps {
-                    ui.label(name);
-                }
-                ui.end_row();
-            });
-            ui.separator();
-
-            egui::ScrollArea::vertical().max_height(900.0).show(ui, |ui| {
-                egui::Grid::new("meta_rows").num_columns(1 + self.comps.len()).spacing([8.0, 4.0]).show(ui, |ui| {
-                    for row in &visible {
-                        render_key_cell(ui, &row.row_id, &rows, &effective_expanded, &mut self.expanded_keys);
-                        if let Some(value_key) = &row.value_key {
-                            let mut vals: Vec<Option<String>> = Vec::new();
-                            for (_name, map) in &self.comps {
-                                vals.push(map.get(value_key).cloned());
-                            }
-                            let same = values_are_same(value_key, &self.comps);
-                            for v in vals {
-                                let full = v.unwrap_or_default();
-                                let display = truncate_string(&full, 120);
-                                let mut btn = egui::Button::new(display.clone());
-                                if !same {
-                                    btn = btn.fill(egui::Color32::from_rgb(255, 243, 205));
-                                }
-                                let resp = ui.add(btn).on_hover_text(full.clone());
-                                if resp.clicked() {
-                                    self.full_text = full.clone();
-                                    self.full_open = true;
-                                }
-                            }
-                        } else {
-                            for _ in &self.comps {
-                                ui.label("");
-                            }
-                        }
-                        ui.end_row();
-                    }
-                });
-            });
+            render_metadata_table(
+                ui,
+                &rows,
+                &visible,
+                &effective_expanded,
+                &self.comps,
+                &mut self.expanded_keys,
+                &mut self.full_text,
+                &mut self.full_open,
+            );
 
             // Full-text window for selecting/copying long values
             if self.full_open {

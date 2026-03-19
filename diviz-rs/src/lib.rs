@@ -117,6 +117,44 @@ fn normalize(v: [f32; 3]) -> Option<[f32; 3]> {
     (mag > 1e-6).then_some(scale(v, 1.0 / mag))
 }
 
+fn rotate_vec2(v: egui::Vec2, angle_rad: f32) -> egui::Vec2 {
+    let (sin_a, cos_a) = angle_rad.sin_cos();
+    egui::vec2(v.x * cos_a - v.y * sin_a, v.x * sin_a + v.y * cos_a)
+}
+
+fn paint_rotated_texture(
+    painter: &egui::Painter,
+    texture_id: egui::TextureId,
+    center: egui::Pos2,
+    size: egui::Vec2,
+    angle_rad: f32,
+) {
+    let half = size * 0.5;
+    let corners = [
+        egui::vec2(-half.x, -half.y),
+        egui::vec2(half.x, -half.y),
+        egui::vec2(half.x, half.y),
+        egui::vec2(-half.x, half.y),
+    ];
+    let uvs = [
+        egui::pos2(0.0, 0.0),
+        egui::pos2(1.0, 0.0),
+        egui::pos2(1.0, 1.0),
+        egui::pos2(0.0, 1.0),
+    ];
+
+    let mut mesh = egui::epaint::Mesh::with_texture(texture_id);
+    for (corner, uv) in corners.iter().zip(uvs.iter()) {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: center + rotate_vec2(*corner, angle_rad),
+            uv: *uv,
+            color: egui::Color32::WHITE,
+        });
+    }
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
 fn axis_aligned_patient_point(
     u_axis: PatientAxis,
     v_axis: PatientAxis,
@@ -861,6 +899,7 @@ struct DicomViewApp {
     texture: Option<egui::TextureHandle>,
     displayed_physical_size: Option<Vec2>,
     zoom: f32,
+    rotation_degrees: f32,
     pan: Vec2,
     error: Option<String>,
     show_metadata: bool,
@@ -890,6 +929,7 @@ impl DicomViewApp {
             texture: None,
             displayed_physical_size: None,
             zoom: 1.0,
+            rotation_degrees: 0.0,
             pan: Vec2::ZERO,
             error: None,
             show_metadata: true,
@@ -919,6 +959,7 @@ impl DicomViewApp {
         self.mpr_error = None;
         self.pan = Vec2::ZERO;
         self.zoom = 1.0;
+        self.rotation_degrees = 0.0;
         self.wl_dirty = false;
 
         if paths.is_empty() {
@@ -1345,6 +1386,7 @@ impl eframe::App for DicomViewApp {
                 ui.separator();
                 if ui.button("Fit").clicked() {
                     self.zoom = 1.0;
+                    self.rotation_degrees = 0.0;
                     self.pan = Vec2::ZERO;
                 }
                 if ui.button("+").clicked() {
@@ -1354,6 +1396,14 @@ impl eframe::App for DicomViewApp {
                     self.zoom = (self.zoom / 1.25).max(0.05);
                 }
                 ui.label(format!("{:.0}%", self.zoom * 100.0));
+                if ui.button("⟲").on_hover_text("Rotate 90° counter-clockwise").clicked() {
+                    self.rotation_degrees = (self.rotation_degrees - 90.0).rem_euclid(360.0);
+                }
+                if ui.button("⟳").on_hover_text("Rotate 90° clockwise").clicked() {
+                    self.rotation_degrees = (self.rotation_degrees + 90.0).rem_euclid(360.0);
+                }
+                ui.label(format!("{:.0}°", self.rotation_degrees));
+                ui.small("(Mouse4 drag to rotate)");
 
                 // Window/Level controls (only for 16-bit grayscale)
                 let windowing_enabled = match self.view_mode {
@@ -1503,11 +1553,12 @@ impl eframe::App for DicomViewApp {
                 let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
                 // Check button states for multi-button combinations
-                let (left_down, right_down, middle_down) = ctx.input(|i| {
+                let (left_down, right_down, middle_down, side1_down) = ctx.input(|i| {
                     (
                         i.pointer.button_down(egui::PointerButton::Primary),
                         i.pointer.button_down(egui::PointerButton::Secondary),
                         i.pointer.button_down(egui::PointerButton::Middle),
+                        i.pointer.button_down(egui::PointerButton::Extra1),
                     )
                 });
 
@@ -1572,6 +1623,14 @@ impl eframe::App for DicomViewApp {
                         self.wl_dirty = true;
                     }
                 }
+                // Side mouse button drag (Mouse4) -> rotate image
+                else if response.hovered() && side1_down {
+                    let delta = ctx.input(|i| i.pointer.delta());
+                    if delta.x != 0.0 {
+                        self.rotation_degrees =
+                            (self.rotation_degrees + delta.x * 0.35).rem_euclid(360.0);
+                    }
+                }
                 // Left-button drag → pan (only if right button is not pressed)
                 else if response.dragged_by(egui::PointerButton::Primary) && !right_down {
                     self.pan += response.drag_delta();
@@ -1600,19 +1659,15 @@ impl eframe::App for DicomViewApp {
                 // Double-click → reset view
                 if response.double_clicked() {
                     self.zoom = 1.0;
+                    self.rotation_degrees = 0.0;
                     self.pan = Vec2::ZERO;
                     self.apply_default_window_for_current_series();
                     self.wl_dirty = true;
                 }
 
                 let center = rect.center() + self.pan;
-                let image_rect = egui::Rect::from_center_size(center, display);
-                ui.painter().image(
-                    texture.id(),
-                    image_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
+                let angle_rad = self.rotation_degrees.to_radians();
+                paint_rotated_texture(ui.painter(), texture.id(), center, display, angle_rad);
             }
         });
         // ── Loading progress modal ────────────────────────────────────────────
