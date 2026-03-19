@@ -210,6 +210,66 @@ pub fn truncate_string(s: &str, max_len: usize) -> String {
     }
 }
 
+fn common_prefix_suffix_len(strings: &[String]) -> (usize, usize) {
+    if strings.is_empty() {
+        return (0, 0);
+    }
+
+    let char_vecs: Vec<Vec<char>> = strings.iter().map(|s| s.chars().collect()).collect();
+    let min_len = char_vecs.iter().map(|v| v.len()).min().unwrap_or(0);
+
+    let mut prefix = 0usize;
+    for i in 0..min_len {
+        let c = char_vecs[0][i];
+        if char_vecs.iter().any(|v| v[i] != c) {
+            break;
+        }
+        prefix += 1;
+    }
+
+    let mut suffix = 0usize;
+    for i in 0..min_len - prefix {
+        let idx = min_len - 1 - i;
+        let c = char_vecs[0][idx];
+        if char_vecs.iter().any(|v| v[idx] != c) {
+            break;
+        }
+        suffix += 1;
+    }
+
+    (prefix, suffix)
+}
+
+fn build_diff_text(pairs: &[(String, String)]) -> String {
+    let values: Vec<String> = pairs.iter().map(|(_, v)| v.clone()).collect();
+    let (prefix_len, suffix_len) = common_prefix_suffix_len(&values);
+
+    let mut out = String::new();
+    out.push_str("(Differences highlighted between [[ and ]] where present)\n\n");
+    for (name, v) in pairs {
+        out.push_str(&format!("File: {}\n", name));
+        out.push_str("Value:\n");
+        let chars: Vec<char> = v.chars().collect();
+        let len = chars.len();
+        if prefix_len + suffix_len >= len {
+            out.push_str(v);
+        } else {
+            let prefix: String = chars[0..prefix_len].iter().collect();
+            let mid: String = chars[prefix_len..len - suffix_len].iter().collect();
+            let suffix: String = chars[len - suffix_len..len].iter().collect();
+            out.push_str(&prefix);
+            out.push_str("[[");
+            out.push_str(&mid);
+            out.push_str("]]",
+            );
+            out.push_str(&suffix);
+        }
+        out.push_str("\n\n");
+    }
+
+    out
+}
+
 #[derive(Clone)]
 struct TreeRow {
     row_id: String,
@@ -478,9 +538,15 @@ fn render_metadata_table(
                             vals.push(map.get(value_key).cloned());
                         }
                         let same = values_are_same(value_key, comps);
-                        for v in vals {
+                        // Build per-file pairs for diffing
+                        let pairs: Vec<(String, String)> = comps
+                            .iter()
+                            .map(|(name, map)| (name.clone(), map.get(value_key).cloned().unwrap_or_default()))
+                            .collect();
+
+                        for (_idx, (_name, _)) in comps.iter().enumerate() {
                             table_row.col(|ui| {
-                                let full = v.unwrap_or_default();
+                                let full = pairs[_idx].1.clone();
                                 let display = truncate_string(&full, 80);
                                 let text = if same {
                                     egui::RichText::new(display.clone())
@@ -493,7 +559,11 @@ fn render_metadata_table(
                                     .add_sized([ui.available_width(), ui.spacing().interact_size.y], label)
                                     .on_hover_text(full.clone());
                                 if resp.clicked() {
-                                    *full_text = full.clone();
+                                    if comps.len() > 1 {
+                                        *full_text = build_diff_text(&pairs);
+                                    } else {
+                                        *full_text = full.clone();
+                                    }
                                     *full_open = true;
                                 }
                             });
