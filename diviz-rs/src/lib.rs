@@ -687,6 +687,25 @@ struct SeriesGroup {
     image_indices: Vec<usize>,
 }
 
+#[derive(Clone)]
+struct ViewportState {
+    current_stack_slice: usize,
+    zoom: f32,
+    pan: Vec2,
+    rotation_degrees: f32,
+}
+
+impl Default for ViewportState {
+    fn default() -> Self {
+        Self {
+            current_stack_slice: 0,
+            zoom: 1.0,
+            pan: Vec2::ZERO,
+            rotation_degrees: 0.0,
+        }
+    }
+}
+
 /// Message sent from the background loading thread to the UI thread.
 enum LoadMsg {
     /// One file decoded successfully.
@@ -962,6 +981,9 @@ struct DicomViewApp {
     mpr_error: Option<String>,
     texture: Option<egui::TextureHandle>,
     thumbnail_textures: HashMap<String, egui::TextureHandle>,
+    viewports: Vec<ViewportState>,
+    active_viewport: usize,
+    layout_cells: usize,
     displayed_physical_size: Option<Vec2>,
     zoom: f32,
     rotation_degrees: f32,
@@ -995,6 +1017,9 @@ impl DicomViewApp {
             mpr_error: None,
             texture: None,
             thumbnail_textures: HashMap::new(),
+            viewports: vec![ViewportState::default()],
+            active_viewport: 0,
+            layout_cells: 1,
             displayed_physical_size: None,
             zoom: 1.0,
             rotation_degrees: 0.0,
@@ -1062,6 +1087,13 @@ impl DicomViewApp {
             received: 0,
             current_filename: String::new(),
         });
+        // Reset per-viewport slice indices when loading new data
+        for vp in &mut self.viewports {
+            vp.current_stack_slice = 0;
+            vp.zoom = 1.0;
+            vp.pan = Vec2::ZERO;
+            vp.rotation_degrees = 0.0;
+        }
     }
 
     fn active_series_len(&self) -> usize {
@@ -1376,6 +1408,22 @@ impl eframe::App for DicomViewApp {
         // ── Toolbar ───────────────────────────────────────────────────────────
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                        ui.label("Layout:");
+                        if ui.selectable_label(self.layout_cells == 1, "1").clicked() {
+                            self.layout_cells = 1;
+                            self.viewports.resize(1, ViewportState::default());
+                            self.active_viewport = 0;
+                        }
+                        if ui.selectable_label(self.layout_cells == 2, "2").clicked() {
+                            self.layout_cells = 2;
+                            self.viewports.resize(2, ViewportState::default());
+                            self.active_viewport = 0;
+                        }
+                        if ui.selectable_label(self.layout_cells == 4, "4").clicked() {
+                            self.layout_cells = 4;
+                            self.viewports.resize(4, ViewportState::default());
+                            self.active_viewport = 0;
+                        }
                 if ui.button("📄 Open Files").clicked() {
                     if let Some(paths) = rfd::FileDialog::new()
                         .add_filter("DICOM", &["dcm", "DCM"])
@@ -1651,236 +1699,185 @@ impl eframe::App for DicomViewApp {
                     physical_size.y * fit * self.zoom,
                 );
 
-                let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+                // We'll split the available rect into layout_cells and render each viewport.
+                let response_full = ui.allocate_rect(rect, egui::Sense::hover());
+                let cols = if self.layout_cells == 2 { 2 } else { (self.layout_cells as f32).sqrt() as usize };
+                let rows = (self.layout_cells + cols - 1) / cols;
+                let cell_w = rect.width() / (cols as f32);
+                let cell_h = rect.height() / (rows as f32);
 
-                // Check button states for multi-button combinations
-                let (left_down, right_down, middle_down, side1_down) = ctx.input(|i| {
-                    (
-                        i.pointer.button_down(egui::PointerButton::Primary),
-                        i.pointer.button_down(egui::PointerButton::Secondary),
-                        i.pointer.button_down(egui::PointerButton::Middle),
-                        i.pointer.button_down(egui::PointerButton::Extra1),
-                    )
-                });
+                for cell_idx in 0..self.layout_cells {
+                    let col = (cell_idx % cols) as f32;
+                    let row = (cell_idx / cols) as f32;
+                    let cell_rect = egui::Rect::from_min_size(
+                        egui::pos2(rect.left() + col * cell_w, rect.top() + row * cell_h),
+                        egui::vec2(cell_w, cell_h),
+                    );
 
-                // Scroll wheel behavior:
-                // - Stack mode (multiple images): scroll navigates slices.
-                // - Single-image mode: scroll zooms.
-                let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
-                const WHEEL_SLICE_THRESHOLD: f32 = 48.0;
+                    // allocate cell area so it receives input when hovered/clicked
+                    let sense = egui::Sense::click_and_drag();
+                    let response = ui.allocate_rect(cell_rect, sense);
 
-                if !side1_down {
-                    self.rotation_drag_last_pos = None;
-                }
+                    // If hovered, make this the active viewport
+                    if response.hovered() {
+                        self.active_viewport = cell_idx;
+                    }
 
-                if !response.hovered() {
-                    self.wheel_slice_accumulator = 0.0;
-                }
+                    // Determine which slice index to display for this viewport
+                    let slice_idx = if self.view_mode == ViewMode::Stack {
+                        self.viewports.get(cell_idx).map(|v| v.current_stack_slice).unwrap_or(0)
+                    } else {
+                        // MPR shares global slice index for now
+                        self.current_mpr_slice()
+                    };
 
-                if response.hovered() && scroll_delta != 0.0 {
-                    if self.current_view_slice_len() > 1 {
-                        // Accumulate wheel input and step slices only after enough movement.
-                        self.wheel_slice_accumulator += scroll_delta;
+                    // compute display size according to viewport state's zoom or global zoom for inactive viewports
+                    let vp_zoom = self.viewports.get(cell_idx).map(|v| v.zoom).unwrap_or(self.zoom);
+                    let vp_pan = self.viewports.get(cell_idx).map(|v| v.pan).unwrap_or(self.pan);
+                    let vp_rotation = self.viewports.get(cell_idx).map(|v| v.rotation_degrees).unwrap_or(self.rotation_degrees);
 
-                        while self.wheel_slice_accumulator.abs() >= WHEEL_SLICE_THRESHOLD {
-                            let current = match self.view_mode {
-                                ViewMode::Stack => self.current_stack_slice,
-                                ViewMode::Mpr => self.current_mpr_slice(),
-                            };
+                    // draw the texture centered in cell
+                    let center = cell_rect.center() + vp_pan;
+                    let angle_rad = vp_rotation.to_radians();
+                    // compute physical size scaled to fit the cell
+                    let fit = (cell_rect.width() / physical_size.x).min(cell_rect.height() / physical_size.y);
+                    let display = egui::vec2(
+                        physical_size.x * fit * vp_zoom,
+                        physical_size.y * fit * vp_zoom,
+                    );
 
-                            if self.wheel_slice_accumulator > 0.0 {
-                                if current > 0 {
-                                    match self.view_mode {
-                                        ViewMode::Stack => self.current_stack_slice -= 1,
-                                        ViewMode::Mpr => self.set_current_mpr_slice(current - 1),
+                    paint_rotated_texture(ui.painter(), texture.id(), center, display, angle_rad);
+
+                    // If this is the active viewport, handle interactions (wheel, drag, slice stepping)
+                    if cell_idx == self.active_viewport {
+                        // reuse existing input handling logic for active viewport
+                        let (left_down, right_down, middle_down, side1_down) = ctx.input(|i| {
+                            (
+                                i.pointer.button_down(egui::PointerButton::Primary),
+                                i.pointer.button_down(egui::PointerButton::Secondary),
+                                i.pointer.button_down(egui::PointerButton::Middle),
+                                i.pointer.button_down(egui::PointerButton::Extra1),
+                            )
+                        });
+
+                        let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
+                        const WHEEL_SLICE_THRESHOLD: f32 = 48.0;
+
+                        if !side1_down {
+                            self.rotation_drag_last_pos = None;
+                        }
+
+                        if !response.hovered() {
+                            self.wheel_slice_accumulator = 0.0;
+                        }
+
+                        if response.hovered() && scroll_delta != 0.0 {
+                            if self.current_view_slice_len() > 1 {
+                                self.wheel_slice_accumulator += scroll_delta;
+                                while self.wheel_slice_accumulator.abs() >= WHEEL_SLICE_THRESHOLD {
+                                    // modify viewport's slice index
+                                    if self.wheel_slice_accumulator > 0.0 {
+                                        if self.viewports[cell_idx].current_stack_slice > 0 {
+                                            self.viewports[cell_idx].current_stack_slice -= 1;
+                                            self.wheel_slice_accumulator -= WHEEL_SLICE_THRESHOLD;
+                                            self.wl_dirty = true;
+                                        } else {
+                                            self.wheel_slice_accumulator = 0.0;
+                                            break;
+                                        }
+                                    } else {
+                                        if self.viewports[cell_idx].current_stack_slice < self.current_view_slice_len() - 1 {
+                                            self.viewports[cell_idx].current_stack_slice += 1;
+                                            self.wheel_slice_accumulator += WHEEL_SLICE_THRESHOLD;
+                                            self.wl_dirty = true;
+                                        } else {
+                                            self.wheel_slice_accumulator = 0.0;
+                                            break;
+                                        }
                                     }
-                                    self.wheel_slice_accumulator -= WHEEL_SLICE_THRESHOLD;
-                                    self.wl_dirty = true;
-                                } else {
-                                    self.wheel_slice_accumulator = 0.0;
-                                    break;
                                 }
-                            } else if current < self.current_view_slice_len() - 1 {
-                                match self.view_mode {
-                                    ViewMode::Stack => self.current_stack_slice += 1,
-                                    ViewMode::Mpr => self.set_current_mpr_slice(current + 1),
-                                }
-                                self.wheel_slice_accumulator += WHEEL_SLICE_THRESHOLD;
-                                self.wl_dirty = true;
                             } else {
-                                self.wheel_slice_accumulator = 0.0;
-                                break;
+                                self.viewports[cell_idx].zoom = (self.viewports[cell_idx].zoom * (1.0 + scroll_delta * 0.004)).clamp(0.05, 20.0);
                             }
                         }
-                    } else {
-                        // Scroll to zoom
-                        self.zoom =
-                            (self.zoom * (1.0 + scroll_delta * 0.004)).clamp(0.05, 20.0);
-                    }
-                }
 
-                // Both left and right buttons → zoom
-                if response.hovered() && left_down && right_down {
-                    let delta = response.drag_delta();
-                    // Downward drag zooms in, upward zooms out
-                    if delta.y != 0.0 {
-                        self.zoom = (self.zoom * (1.0 + delta.y * 0.01)).clamp(0.05, 20.0);
-                    }
-                }
-                // Middle mouse button → scroll through slices (if multiple images)
-                else if response.hovered() && middle_down && self.current_view_slice_len() > 1 {
-                    let delta = response.drag_delta();
-                    let current = match self.view_mode {
-                        ViewMode::Stack => self.current_stack_slice,
-                        ViewMode::Mpr => self.current_mpr_slice(),
-                    };
-                    // Upward drag → previous slice, downward → next slice
-                    if delta.y > 2.0 && current > 0 {
-                        match self.view_mode {
-                            ViewMode::Stack => self.current_stack_slice -= 1,
-                            ViewMode::Mpr => self.set_current_mpr_slice(current - 1),
-                        }
-                        self.wl_dirty = true;
-                    } else if delta.y < -2.0 && current < self.current_view_slice_len() - 1 {
-                        match self.view_mode {
-                            ViewMode::Stack => self.current_stack_slice += 1,
-                            ViewMode::Mpr => self.set_current_mpr_slice(current + 1),
-                        }
-                        self.wl_dirty = true;
-                    }
-                }
-                // Side mouse button drag (Mouse4) -> rotate image
-                else if response.hovered() && side1_down {
-                    let image_center = rect.center() + self.pan;
-                    let pointer_pos = ctx.input(|i| i.pointer.interact_pos());
-                    if let Some(current_pos) = pointer_pos {
-                        if let Some(last_pos) = self.rotation_drag_last_pos {
-                            let last_vec = last_pos - image_center;
-                            let current_vec = current_pos - image_center;
-                            let last_len2 = last_vec.length_sq();
-                            let current_len2 = current_vec.length_sq();
-
-                            // Ignore jitter when pointer is too close to the center pivot.
-                            if last_len2 > 9.0 && current_len2 > 9.0 {
-                                let last_angle = last_vec.y.atan2(last_vec.x);
-                                let current_angle = current_vec.y.atan2(current_vec.x);
-                                let mut delta_angle = current_angle - last_angle;
-                                while delta_angle > std::f32::consts::PI {
-                                    delta_angle -= 2.0 * std::f32::consts::PI;
-                                }
-                                while delta_angle < -std::f32::consts::PI {
-                                    delta_angle += 2.0 * std::f32::consts::PI;
-                                }
-
-                                self.rotation_degrees =
-                                    (self.rotation_degrees + delta_angle.to_degrees())
-                                        .rem_euclid(360.0);
+                        // Middle drag -> slice navigation
+                        if response.hovered() && middle_down && self.current_view_slice_len() > 1 {
+                            let delta = response.drag_delta();
+                            if delta.y > 2.0 && self.viewports[cell_idx].current_stack_slice > 0 {
+                                self.viewports[cell_idx].current_stack_slice -= 1;
+                                self.wl_dirty = true;
+                            } else if delta.y < -2.0 && self.viewports[cell_idx].current_stack_slice < self.current_view_slice_len() - 1 {
+                                self.viewports[cell_idx].current_stack_slice += 1;
+                                self.wl_dirty = true;
                             }
                         }
-                        self.rotation_drag_last_pos = Some(current_pos);
-                    } else {
-                        self.rotation_drag_last_pos = None;
+
+                        // Side-button drag -> rotate
+                        else if response.hovered() && side1_down {
+                            let image_center = cell_rect.center() + self.viewports[cell_idx].pan;
+                            let pointer_pos = ctx.input(|i| i.pointer.interact_pos());
+                            if let Some(current_pos) = pointer_pos {
+                                if let Some(last_pos) = self.rotation_drag_last_pos {
+                                    let last_vec = last_pos - image_center;
+                                    let current_vec = current_pos - image_center;
+                                    let last_len2 = last_vec.length_sq();
+                                    let current_len2 = current_vec.length_sq();
+                                    if last_len2 > 9.0 && current_len2 > 9.0 {
+                                        let last_angle = last_vec.y.atan2(last_vec.x);
+                                        let current_angle = current_vec.y.atan2(current_vec.x);
+                                        let mut delta_angle = current_angle - last_angle;
+                                        while delta_angle > std::f32::consts::PI {
+                                            delta_angle -= 2.0 * std::f32::consts::PI;
+                                        }
+                                        while delta_angle < -std::f32::consts::PI {
+                                            delta_angle += 2.0 * std::f32::consts::PI;
+                                        }
+                                        self.viewports[cell_idx].rotation_degrees = (self.viewports[cell_idx].rotation_degrees + delta_angle.to_degrees()).rem_euclid(360.0);
+                                    }
+                                }
+                                self.rotation_drag_last_pos = Some(current_pos);
+                            } else {
+                                self.rotation_drag_last_pos = None;
+                            }
+                        }
+
+                        // Primary drag -> pan
+                        else if response.dragged_by(egui::PointerButton::Primary) && !right_down {
+                            self.viewports[cell_idx].pan += response.drag_delta();
+                        }
+
+                        // Secondary drag -> window/level (shared behavior)
+                        else if response.dragged_by(egui::PointerButton::Secondary) && !left_down {
+                            let windowing_enabled = match self.view_mode {
+                                ViewMode::Stack => self
+                                    .active_image()
+                                    .map(|image| image.raw_image.is_grayscale16())
+                                    .unwrap_or(false),
+                                ViewMode::Mpr => self.mpr_volume.is_some(),
+                            };
+                            if windowing_enabled {
+                                let delta = response.drag_delta();
+                                let ww_scale = 2.0_f32;
+                                let wc_scale = 2.0_f32;
+                                self.window_width = (self.window_width + delta.x * ww_scale).max(1.0);
+                                self.window_center += -delta.y * wc_scale;
+                                self.wl_dirty = true;
+                            }
+                        }
+
+                        // Double-click resets this viewport
+                        if response.double_clicked() {
+                            self.viewports[cell_idx].zoom = 1.0;
+                            self.viewports[cell_idx].rotation_degrees = 0.0;
+                            self.viewports[cell_idx].pan = Vec2::ZERO;
+                            self.apply_default_window_for_current_series();
+                            self.wl_dirty = true;
+                        }
                     }
                 }
-                // Left-button drag → pan (only if right button is not pressed)
-                else if response.dragged_by(egui::PointerButton::Primary) && !right_down {
-                    self.pan += response.drag_delta();
-                }
-                // Right-button drag → window / level (only if left button is not pressed)
-                // Horizontal drag adjusts Window Width; vertical drag adjusts Window Centre.
-                // Only meaningful for 16-bit grayscale; ignored otherwise.
-                else if response.dragged_by(egui::PointerButton::Secondary) && !left_down {
-                    let windowing_enabled = match self.view_mode {
-                        ViewMode::Stack => self
-                            .active_image()
-                            .map(|image| image.raw_image.is_grayscale16())
-                            .unwrap_or(false),
-                        ViewMode::Mpr => self.mpr_volume.is_some(),
-                    };
-                    if windowing_enabled {
-                        let delta = response.drag_delta();
-                        let ww_scale = 2.0_f32;
-                        let wc_scale = 2.0_f32;
-                        self.window_width = (self.window_width + delta.x * ww_scale).max(1.0);
-                        self.window_center += -delta.y * wc_scale;
-                        self.wl_dirty = true;
-                    }
-                }
 
-                // Double-click → reset view
-                if response.double_clicked() {
-                    self.zoom = 1.0;
-                    self.rotation_degrees = 0.0;
-                    self.rotation_drag_last_pos = None;
-                    self.pan = Vec2::ZERO;
-                    self.apply_default_window_for_current_series();
-                    self.wl_dirty = true;
-                }
-
-                let center = rect.center() + self.pan;
-                let angle_rad = self.rotation_degrees.to_radians();
-                paint_rotated_texture(ui.painter(), texture.id(), center, display, angle_rad);
-                // Draw a vertical scroll indicator on the right side of the image panel
-                let total_slices = self.current_view_slice_len();
-                if total_slices > 1 {
-                    let current_idx = match self.view_mode {
-                        ViewMode::Stack => self.current_stack_slice,
-                        ViewMode::Mpr => self.current_mpr_slice(),
-                    } as usize;
-
-                    let track_width = 12.0_f32;
-                    let padding = 8.0_f32;
-                    let track_rect = egui::Rect::from_min_size(
-                        egui::pos2(rect.right() - padding - track_width, rect.top() + padding),
-                        egui::vec2(track_width, rect.height() - padding * 2.0),
-                    );
-
-                    // Draw track background
-                    ui.painter().rect_filled(
-                        track_rect,
-                        track_width * 0.5,
-                        egui::Color32::from_rgba_unmultiplied(60, 60, 60, 120),
-                    );
-
-                    // Compute thumb position and size (proportional)
-                    let thumb_h = (track_rect.height() / (total_slices as f32)).max(6.0);
-                    let available = track_rect.height() - thumb_h;
-                    let t = if total_slices > 1 {
-                        (current_idx as f32) / ((total_slices - 1) as f32)
-                    } else {
-                        0.0
-                    };
-                    let thumb_y = track_rect.top() + t * available;
-                    let thumb_rect = egui::Rect::from_min_size(
-                        egui::pos2(track_rect.left(), thumb_y),
-                        egui::vec2(track_rect.width(), thumb_h),
-                    );
-
-                    // Draw thumb
-                    ui.painter().rect_filled(
-                        thumb_rect,
-                        6.0,
-                        egui::Color32::from_rgb(200, 200, 200),
-                    );
-
-                    // Draw thin shadow/border by overlaying a semi-transparent dark rect slightly inset
-                    ui.painter().rect_filled(
-                        thumb_rect.shrink(0.5),
-                        6.0,
-                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 80),
-                    );
-
-                    // Draw slice count text above the thumb
-                    let label = format!("{}/{}", current_idx + 1, total_slices);
-                    let text_pos = egui::pos2(track_rect.left() - 6.0, thumb_rect.center().y - 8.0);
-                    ui.painter().text(
-                        text_pos,
-                        egui::Align2::RIGHT_CENTER,
-                        label,
-                        egui::FontId::proportional(12.0),
-                        egui::Color32::WHITE,
-                    );
-                }
+                // end multi-viewport rendering
             }
         });
         // ── Loading progress modal ────────────────────────────────────────────

@@ -290,12 +290,8 @@ fn render_diff_preview(ui: &mut egui::Ui, pairs: &[(String, String)]) {
                 let suffix: String = chars[len - suffix_len..len].iter().collect();
 
                 ui.label(prefix);
-                // opening brackets
-                ui.label("[[");
-                // colored mid
+                // colored mid (no brackets in preview)
                 ui.label(egui::RichText::new(mid).background_color(egui::Color32::from_rgb(255, 200, 200)));
-                // closing brackets
-                ui.label("]]" );
                 ui.label(suffix);
             }
         });
