@@ -36,6 +36,22 @@ fn shift_date_by_study(study_uid: &str, seed: Option<&str>) -> i64 {
     offset
 }
 
+fn minute_offset_by_study(study_uid: &str, seed: Option<&str>) -> i64 {
+    let key = match seed {
+        Some(s) if !s.is_empty() => format!("{}:{}", s, study_uid),
+        _ => study_uid.to_string(),
+    };
+    let h = blake3::hash(key.as_bytes());
+    let v = u64::from_le_bytes({
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&h.as_bytes()[..8]);
+        b
+    });
+    // produce a signed offset roughly centered around zero in range [-720,719]
+    let raw = (v % 1440) as i64;
+    raw - 720
+}
+
 fn process_inmem_top<D: dicom_core::DataDictionary + Clone>(
     ds: &mut dicom_object::InMemDicomObject<D>,
     study_uid: &str,
@@ -145,7 +161,7 @@ fn process_inmem_top<D: dicom_core::DataDictionary + Clone>(
                     }
                 }
                 if let Some(tm) = parsed {
-                    let minutes = (shift_date_by_study(study_uid, seed) % 1440) as i64;
+                    let minutes = minute_offset_by_study(study_uid, seed);
                     let shifted_time = tm + Duration::minutes(minutes);
                     let secs = shifted_time.num_seconds_from_midnight();
                     let new = NaiveTime::from_num_seconds_from_midnight_opt(secs, 0).map(|t| t.format("%H%M%S").to_string()).unwrap_or_else(|| s.to_string());
@@ -501,7 +517,7 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, pr
                                         }
                                     }
                                     if let Some(tm) = parsed {
-                                        let minutes = (shift_days % 1440) as i64;
+                                        let minutes = minute_offset_by_study(&study_uid, seed);
                                         let shifted_time = tm + Duration::minutes(minutes);
                                         let secs = shifted_time.num_seconds_from_midnight();
                                         let new = NaiveTime::from_num_seconds_from_midnight_opt(secs, 0).map(|t| t.format("%H%M%S").to_string()).unwrap_or_else(|| s.to_string());

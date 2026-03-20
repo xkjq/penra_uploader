@@ -13,6 +13,9 @@ dicom-dictionary-std = "0.9"
 rfd = "0.17"
 dicor_rs = { package = "dicor-rs", path = "../dicor-rs" }
 
+# clipboard helper for copy-on-right-click
+copypasta = "0.8"
+
 [[bin]]
 name = "divue"
 path = "src/main.rs"

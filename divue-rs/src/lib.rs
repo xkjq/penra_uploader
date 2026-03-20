@@ -2,13 +2,13 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::path::Path;
 use std::fs;
 use dicor_rs;
 use dicom_viewer::{read_metadata_with_diagnostics, MetadataReadMode, ExtractionDiagnostics};
 use dicom_core::Tag;
 use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry};
 use dicom_dictionary_std::StandardDataDictionary;
+use copypasta::{ClipboardContext, ClipboardProvider};
 
 pub fn run_meta_viewer(paths: Vec<String>) {
     run_meta_viewer_with_mode(paths, MetadataReadMode::InDepth);
@@ -480,6 +480,11 @@ fn render_key_cell(
     rows: &[TreeRow],
     effective_expanded_keys: &HashSet<String>,
     expanded_keys: &mut HashSet<String>,
+    full_text: &mut String,
+    full_open: &mut bool,
+    last_pairs: &mut Vec<(String, String)>,
+    context_menu_open: &mut bool,
+    context_menu_text: &mut Option<String>,
 ) {
     let (depth, key_display, key_hover) = get_key_display(row_id);
     let has_children = row_has_children(row_id, rows);
@@ -522,10 +527,16 @@ fn render_key_cell(
             ui.add_space(24.0);
         }
 
-        let label = egui::Label::new(key_display).truncate();
-        let _resp = ui
+        let label = egui::Label::new(key_display).truncate().sense(egui::Sense::click());
+        let resp = ui
             .add_sized([ui.available_width(), ui.spacing().interact_size.y], label)
             .on_hover_text(key_hover);
+
+        if resp.secondary_clicked() {
+            // Right-clicking the key opens a popup menu with 'Copy'
+            *context_menu_open = true;
+            *context_menu_text = Some(row_id.to_string());
+        }
     });
 }
 
@@ -539,6 +550,8 @@ fn render_metadata_table(
     full_text: &mut String,
     full_open: &mut bool,
     last_pairs: &mut Vec<(String, String)>,
+    context_menu_open: &mut bool,
+    context_menu_text: &mut Option<String>,
 ) {
     let mut table = TableBuilder::new(ui)
         .striped(true)
@@ -565,7 +578,18 @@ fn render_metadata_table(
             for row in visible {
                 body.row(26.0, |mut table_row| {
                     table_row.col(|ui| {
-                        render_key_cell(ui, &row.row_id, rows, effective_expanded, expanded_keys);
+                        render_key_cell(
+                            ui,
+                            &row.row_id,
+                            rows,
+                            effective_expanded,
+                            expanded_keys,
+                            full_text,
+                            full_open,
+                            last_pairs,
+                            &mut self.context_menu_open,
+                            &mut self.context_menu_text,
+                        );
                     });
 
                     if let Some(value_key) = &row.value_key {
@@ -604,6 +628,11 @@ fn render_metadata_table(
                                     }
                                     *full_open = true;
                                 }
+                                if resp.secondary_clicked() {
+                                    // Right-clicking a value opens a popup menu with 'Copy'
+                                    self.context_menu_open = true;
+                                    self.context_menu_text = Some(full.clone());
+                                }
                             });
                         }
                     } else {
@@ -633,6 +662,8 @@ struct DivueApp {
     identifiable_only: bool,
     full_open: bool,
     full_text: String,
+    context_menu_open: bool,
+    context_menu_text: Option<String>,
     show_diagnostics: bool,
     show_only_different: bool,
     last_pairs: Vec<(String, String)>,
@@ -651,6 +682,8 @@ impl DivueApp {
             identifiable_only: false,
             full_open: false,
             full_text: String::new(),
+            context_menu_open: false,
+            context_menu_text: None,
             show_diagnostics: false,
             show_only_different: false,
             last_pairs: Vec::new(),
@@ -985,6 +1018,8 @@ impl DivueApp {
             &mut self.full_text,
             &mut self.full_open,
             &mut self.last_pairs,
+            &mut self.context_menu_open,
+            &mut self.context_menu_text,
         );
 
         // Full-text window for selecting/copying long values
@@ -1013,6 +1048,37 @@ impl DivueApp {
                         }
                     });
                 });
+        }
+
+        // Render context popup menu if requested
+        if self.context_menu_open {
+            if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                egui::Area::new("context_menu_area")
+                    .fixed_pos(pos)
+                    .show(ctx, |ui| {
+                        ui.frame(|ui| {
+                            ui.vertical(|ui| {
+                                if ui.button("Copy").clicked() {
+                                    if let Some(txt) = &self.context_menu_text {
+                                        if let Ok(mut clipboard) = ClipboardContext::new() {
+                                            let _ = clipboard.set_contents(txt.clone());
+                                        }
+                                    }
+                                    self.context_menu_open = false;
+                                    self.context_menu_text = None;
+                                }
+                                if ui.button("Close").clicked() {
+                                    self.context_menu_open = false;
+                                    self.context_menu_text = None;
+                                }
+                            });
+                        });
+                    });
+            } else {
+                // If we can't determine pointer pos, just close the menu
+                self.context_menu_open = false;
+                self.context_menu_text = None;
+            }
         }
     }
 }
