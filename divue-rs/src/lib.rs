@@ -47,6 +47,8 @@ pub fn run_meta_viewer_with_mode(paths: Vec<String>, mode: MetadataReadMode) {
         identifiable_only: false,
         full_open: false,
         full_text: String::new(),
+        context_menu_open: false,
+        context_menu_text: None,
         show_diagnostics: false,
         show_only_different: false,
         last_pairs: Vec::new(),
@@ -587,8 +589,8 @@ fn render_metadata_table(
                             full_text,
                             full_open,
                             last_pairs,
-                            &mut self.context_menu_open,
-                            &mut self.context_menu_text,
+                            context_menu_open,
+                            context_menu_text,
                         );
                     });
 
@@ -630,8 +632,8 @@ fn render_metadata_table(
                                 }
                                 if resp.secondary_clicked() {
                                     // Right-clicking a value opens a popup menu with 'Copy'
-                                    self.context_menu_open = true;
-                                    self.context_menu_text = Some(full.clone());
+                                    *context_menu_open = true;
+                                    *context_menu_text = Some(full.clone());
                                 }
                             });
                         }
@@ -1053,10 +1055,10 @@ impl DivueApp {
         // Render context popup menu if requested
         if self.context_menu_open {
             if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
-                egui::Area::new("context_menu_area")
+                egui::Area::new("context_menu_area".into())
                     .fixed_pos(pos)
                     .show(ctx, |ui| {
-                        ui.frame(|ui| {
+                        egui::Frame::popup(&ui.style()).show(ui, |ui| {
                             ui.vertical(|ui| {
                                 if ui.button("Copy").clicked() {
                                     if let Some(txt) = &self.context_menu_text {
@@ -1091,6 +1093,8 @@ struct MetaApp {
     identifiable_only: bool,
     full_open: bool,
     full_text: String,
+    context_menu_open: bool,
+    context_menu_text: Option<String>,
     show_diagnostics: bool,
     show_only_different: bool,
     last_pairs: Vec<(String, String)>,
@@ -1188,6 +1192,8 @@ impl eframe::App for MetaApp {
                 &mut self.full_text,
                 &mut self.full_open,
                 &mut self.last_pairs,
+                &mut self.context_menu_open,
+                &mut self.context_menu_text,
             );
 
             // Full-text window for selecting/copying long values
