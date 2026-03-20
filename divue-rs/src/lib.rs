@@ -2,6 +2,9 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::path::Path;
+use std::fs;
+use dicor_rs;
 use dicom_viewer::{read_metadata_with_diagnostics, MetadataReadMode, ExtractionDiagnostics};
 use dicom_core::Tag;
 use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry};
@@ -842,6 +845,36 @@ impl DivueApp {
                     self.selected_files.clear();
                 }
             });
+
+            // If exactly one file is selected, offer quick anonymize -> compare workflow
+            if self.selected_files.len() == 1 {
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("🛡️ Anonymize & Compare").clicked() {
+                        let input = self.selected_files[0].clone();
+                        let parent = input.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::env::temp_dir());
+                        let outdir = parent.join("anon_for_viewer");
+                        if let Err(e) = fs::create_dir_all(&outdir) {
+                            self.full_text = format!("Failed to create output dir: {}", e);
+                            self.full_open = true;
+                        } else {
+                            match dicor_rs::anonymize_file(&input, &outdir, false, false, true, None) {
+                                Ok(anon_path) => {
+                                    self.selected_files.clear();
+                                    self.selected_files.push(input.clone());
+                                    self.selected_files.push(anon_path.clone());
+                                    self.load_files();
+                                    self.show_comparison = true;
+                                }
+                                Err(e) => {
+                                    self.full_text = format!("Anonymization failed: {}", e);
+                                    self.full_open = true;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
         } else {
             ui.heading("No files selected");
             ui.label("Add files above to get started");

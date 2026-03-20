@@ -11,6 +11,7 @@ dicom_viewer = { path = "../dicom_viewer" }
 dicom-core = "0.9"
 dicom-dictionary-std = "0.9"
 rfd = "0.17"
+dicor_rs = { package = "dicor-rs", path = "../dicor-rs" }
 
 [[bin]]
 name = "divue"

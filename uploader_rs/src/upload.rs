@@ -9,6 +9,10 @@ use dicom_object::Tag;
 use dicom_pixeldata::PixelDecoder;
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender as MpscSender;
+
+static SCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -627,6 +631,45 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
     }
 
     Ok(out)
+}
+
+/// Request a background scan. Coalesces concurrent requests so only one scan runs at a time.
+pub fn request_scan(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>) -> Result<(), String> {
+    if SCAN_RUNNING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        let anon_dir = anon_dir.to_path_buf();
+        // spawn background thread to perform the scan and write .last_scan.json
+        std::thread::spawn(move || {
+            if let Some(ref s) = tx {
+                let _ = s.send("PROC:STEP:Scanning files".to_string());
+                let _ = s.send(format!("PROC:PROG:{}", 0.0));
+            }
+            match scan_for_upload(&anon_dir, tx.clone()) {
+                Ok(series) => {
+                    if let Ok(json) = serde_json::to_string(&series) {
+                        let _ = std::fs::write(".last_scan.json", json);
+                        if let Some(ref s) = tx {
+                            let _ = s.send("scan_written".to_string());
+                        }
+                    } else if let Some(ref s) = tx {
+                        let _ = s.send("scan_serialize_failed".to_string());
+                    }
+                }
+                Err(e) => {
+                    if let Some(ref s) = tx {
+                        let _ = s.send(format!("Scan failed: {}", e));
+                    }
+                }
+            }
+            SCAN_RUNNING.store(false, Ordering::SeqCst);
+        });
+        Ok(())
+    } else {
+        // a scan is already running; indicate queued/ignored
+        if let Some(ref s) = tx {
+            let _ = s.send("scan_queued".to_string());
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@ use eframe::{egui, NativeOptions};
 use egui::CentralPanel;
 use dicor_rs::anonymize_file;
 mod upload;
-use upload::{upload_anon_dir, UploadResult, scan_for_upload, SeriesInfo, FileEntry};
+use upload::{upload_anon_dir, UploadResult, scan_for_upload, request_scan, SeriesInfo, FileEntry};
 use dicom_viewer::{read_metadata, read_metadata_all};
 use divue_rs::run_meta_viewer;
 use std::collections::{HashMap, HashSet};
@@ -346,14 +346,8 @@ impl eframe::App for AppState {
                             }
                         }
 
-                        match scan_for_upload(&anon_dir, Some(tx.clone())) {
-                            Ok(series) => {
-                                if let Ok(json) = serde_json::to_string(&series) {
-                                    let _ = std::fs::write(".last_scan.json", json);
-                                    let _ = tx.send("scan_written".to_string());
-                                }
-                            }
-                            Err(e) => { let _ = tx.send(format!("Post-process scan failed: {}", e)); }
+                        if let Err(e) = request_scan(&anon_dir, Some(tx.clone())) {
+                            let _ = tx.send(format!("Post-process scan failed: {}", e));
                         }
 
                         let _ = tx.send("done".to_string());
@@ -462,27 +456,12 @@ impl eframe::App for AppState {
                                         });
 
                                         // after processing, refresh ready-to-upload by scanning anon dir
-                                        match scan_for_upload(&anon_dir, Some(tx.clone())) {
-                                            Ok(series) => {
-                                                if let Ok(json) = serde_json::to_string(&series) {
-                                                    let _ = std::fs::write(".last_scan.json", json);
-                                                    let _ = tx.send("scan_written".to_string());
-                                                }
-                                            }
-                                            Err(e) => { let _ = tx.send(format!("Post-import scan failed: {}", e)); }
+                                        if let Err(e) = request_scan(&anon_dir, Some(tx.clone())) {
+                                            let _ = tx.send(format!("Post-import scan failed: {}", e));
                                         }
                                     }
 
-                                    // after processing, refresh ready-to-upload by scanning anon dir
-                                    match scan_for_upload(&anon_dir, Some(tx.clone())) {
-                                        Ok(series) => {
-                                            if let Ok(json) = serde_json::to_string(&series) {
-                                                let _ = std::fs::write(".last_scan.json", json);
-                                                let _ = tx.send("scan_written".to_string());
-                                            }
-                                        }
-                                        Err(e) => { let _ = tx.send(format!("Post-import scan failed: {}", e)); }
-                                    }
+                                    // (scan requested above)
                                 }
                             }
 
@@ -514,17 +493,8 @@ impl eframe::App for AppState {
                         let anon_dir = self.anon_dir();
                     let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
                     thread::spawn(move || {
-                        match scan_for_upload(&anon_dir, Some(tx.clone())) {
-                            Ok(series) => {
-                                // write series summary to temp JSON for GUI to load
-                                if let Ok(json) = serde_json::to_string(&series) {
-                                    let _ = std::fs::write(".last_scan.json", json);
-                                    let _ = tx.send("scan_written".to_string());
-                                } else {
-                                    let _ = tx.send("scan_serialize_failed".to_string());
-                                }
-                            }
-                            Err(e) => { let _ = tx.send(format!("Scan failed: {}", e)); }
+                        if let Err(e) = request_scan(&anon_dir, Some(tx.clone())) {
+                            let _ = tx.send(format!("Scan failed: {}", e));
                         }
                         let _ = tx.send("done".to_string());
                     });
@@ -612,15 +582,37 @@ impl eframe::App for AppState {
                                                         }
                                                     }
                                                 }
-                                            // after deletions, do a fresh scan so GUI reflects current anon dir
-                                            match scan_for_upload(&anon_dir, Some(tx.clone())) {
-                                                Ok(new_series) => {
-                                                    if let Ok(json2) = serde_json::to_string(&new_series) {
-                                                        let _ = std::fs::write(".last_scan.json", json2);
-                                                        let _ = tx.send("scan_written".to_string());
+                                            // update the GUI state using the `series` we already computed
+                                            let mut new_series: Vec<SeriesInfo> = Vec::new();
+                                            for s in &series {
+                                                let mut files: Vec<FileEntry> = Vec::new();
+                                                let mut total_bytes: u64 = 0;
+                                                for f in &s.files {
+                                                    if !f.is_duplicate {
+                                                        if let Ok(md) = std::fs::metadata(&f.path) {
+                                                            total_bytes = total_bytes.saturating_add(md.len());
+                                                        }
+                                                        files.push(FileEntry { path: f.path.clone(), hash: f.hash.clone(), is_duplicate: false });
                                                     }
                                                 }
-                                                Err(e) => { let _ = tx.send(format!("Post-clear scan failed: {}", e)); }
+                                                new_series.push(SeriesInfo {
+                                                    series_uid: s.series_uid.clone(),
+                                                    files,
+                                                    duplicate_series_urls: s.duplicate_series_urls.clone(),
+                                                    patient_name: s.patient_name.clone(),
+                                                    examination: s.examination.clone(),
+                                                    patient_id: s.patient_id.clone(),
+                                                    study_date: s.study_date.clone(),
+                                                    modality: s.modality.clone(),
+                                                    series_description: s.series_description.clone(),
+                                                    series_number: s.series_number.clone(),
+                                                    file_count: 0, // not critical for GUI here
+                                                    total_bytes,
+                                                });
+                                            }
+                                            if let Ok(json2) = serde_json::to_string(&new_series) {
+                                                let _ = std::fs::write(".last_scan.json", json2);
+                                                let _ = tx.send("scan_written".to_string());
                                             }
                                             let _ = tx.send(format!("duplicates_cleared:{}", deleted));
                                         }
@@ -950,15 +942,10 @@ impl eframe::App for AppState {
                                                 }
                                             }
                                         }
-                                        // after removals, refresh scan so GUI shows empty/updated state
-                                        match scan_for_upload(&anon_dir, Some(tx.clone())) {
-                                            Ok(new_series) => {
-                                                if let Ok(json2) = serde_json::to_string(&new_series) {
-                                                    let _ = std::fs::write(".last_scan.json", json2);
-                                                    let _ = tx.send("scan_written".to_string());
-                                                }
-                                            }
-                                            Err(e) => { let _ = tx.send(format!("Post-remove scan failed: {}", e)); }
+                                        // after removals, write an empty scan result (directory should now be empty)
+                                        if let Ok(json2) = serde_json::to_string(&Vec::<SeriesInfo>::new()) {
+                                            let _ = std::fs::write(".last_scan.json", json2);
+                                            let _ = tx.send("scan_written".to_string());
                                         }
                                         let _ = tx.send(format!("removed_all:{}", removed));
                                     }
@@ -1260,14 +1247,8 @@ fn main() {
 
                                     // after processing, refresh ready-to-upload by scanning anon dir
                                     let _ = tx2.send("PROC:STEP:Refreshing ready-to-upload".to_string());
-                                    match scan_for_upload(&anon_dir2, Some(tx2.clone())) {
-                                        Ok(series) => {
-                                            if let Ok(json) = serde_json::to_string(&series) {
-                                                let _ = std::fs::write(".last_scan.json", json);
-                                                let _ = tx2.send("scan_written".to_string());
-                                            }
-                                        }
-                                        Err(e) => { let _ = tx2.send(format!("Post-process scan failed: {}", e)); }
+                                    if let Err(e) = request_scan(&anon_dir2, Some(tx2.clone())) {
+                                        let _ = tx2.send(format!("Post-process scan failed: {}", e));
                                     }
 
                                     // attempt to remove the processing directory if it's now empty
