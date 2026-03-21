@@ -37,3 +37,6 @@ target/
 test_dicoms/
 
 uploader_rs/.last_scan.json
+
+diforge-rs/lib/
+diforge-rs/models/

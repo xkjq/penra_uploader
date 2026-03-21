@@ -6,3 +6,13 @@ edition = "2021"
 [dependencies]
 eframe = "0.33.3"
 rfd = "0.17.2"
+cpal = "0.15"
+crossbeam-channel = "0.5"
+anyhow = "1.0"
+# Optional Vosk bindings; enable with `--features vosk` when available
+vosk = { version = "0.3", optional = true }
+serde_json = "1.0"
+
+[features]
+default = []
+vosk = ["dep:vosk"]
