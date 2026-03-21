@@ -89,35 +89,25 @@ mod vosk_impl {
             // spawn a thread to own the audio stream and recognizer
             thread::spawn(move || {
                 // try to load model
-                // Emit CPAL/host/device diagnostics to help debug ALSA poll errors.
-                let host = cpal::default_host();
-                let _ = tx.send("[dbg] cpal default host obtained".to_string());
-                match host.default_input_device() {
-                    Some(d) => match d.name() {
-                        Ok(n) => { let _ = tx.send(format!("[dbg] default input device: {}", n)); }
-                        Err(e) => { let _ = tx.send(format!("[dbg] default input device name error: {}", e)); }
-                    },
-                    None => { let _ = tx.send("[dbg] no default input device (cpal)".to_string()); }
-                }
+                // Emit CPAL host/device diagnostics and prefer Pulse (PipeWire) over ALSA.
+                let mut host_order: Vec<cpal::HostId> = cpal::available_hosts().into_iter().collect();
+                // reorder to prefer Pulse then Alsa if present
+                host_order.sort_by_key(|h| match h {
+                    cpal::HostId::Pulse => 0,
+                    cpal::HostId::Alsa => 1,
+                    _ => 2,
+                });
 
-                match host.input_devices() {
-                    Ok(devs) => {
-                        for (i, dev) in devs.enumerate() {
-                            let name = dev.name().unwrap_or_else(|_| "<unknown>".to_string());
-                            let _ = tx.send(format!("[dbg] device {}: {}", i, name));
-                        }
+                let mut hosts: Vec<cpal::Host> = Vec::new();
+                for hid in host_order.iter() {
+                    if let Ok(h) = cpal::host_from_id(*hid) {
+                        let _ = tx.send(format!("[dbg] available host: {:?}", hid));
+                        hosts.push(h);
                     }
-                    Err(e) => { let _ = tx.send(format!("[dbg] input_devices error: {:?}", e)); }
                 }
 
-                match host.default_input_device() {
-                    Some(dev) => match dev.default_input_config() {
-                        Ok(cfg) => {
-                            let _ = tx.send(format!("[dbg] default_input_config: channels={} sample_rate={} sample_format={}", cfg.channels(), cfg.sample_rate().0, cfg.sample_format()));
-                        }
-                        Err(e) => { let _ = tx.send(format!("[dbg] default_input_config error: {}", e)); }
-                    },
-                    None => { let _ = tx.send("[dbg] no default input device (cpal)".to_string()); }
+                if hosts.is_empty() {
+                    let _ = tx.send("[dbg] no CPAL hosts available".to_string());
                 }
 
                 let model = match Model::new(&model_path) {
@@ -128,42 +118,34 @@ mod vosk_impl {
                     }
                 };
 
-                // create host and default input device/config
-                let host = cpal::default_host();
-                let device = match host.default_input_device() {
-                    Some(d) => d,
-                    None => {
-                        let _ = tx.send("no input device available".to_string());
-                        return;
+                // For each host (preferred order), try default device then other input devices.
+
+                for host in hosts.into_iter() {
+                    let _ = tx.send("[dbg] trying host".to_string());
+
+                    // collect candidate devices (default first)
+                    let mut candidates: Vec<cpal::Device> = Vec::new();
+                    if let Some(d) = host.default_input_device() {
+                        candidates.push(d);
                     }
-                };
-
-                // Try default device first, then iterate other input devices until one works.
-                let mut final_stream: Option<cpal::Stream> = None;
-
-                // collect candidate devices (default first)
-                let mut candidates: Vec<cpal::Device> = Vec::new();
-                if let Some(d) = host.default_input_device() {
-                    candidates.push(d);
-                }
-                if let Ok(devs) = host.input_devices() {
-                    for d in devs {
-                        // avoid duplicates by name
-                        let name = d.name().unwrap_or_else(|_| "<unknown>".to_string());
-                        if !candidates.iter().any(|cd| cd.name().map(|n| n==name).unwrap_or(false)) {
-                            candidates.push(d);
+                    if let Ok(devs) = host.input_devices() {
+                        for d in devs {
+                            // avoid duplicates by name
+                            let name = d.name().unwrap_or_else(|_| "<unknown>".to_string());
+                            if !candidates.iter().any(|cd| cd.name().map(|n| n==name).unwrap_or(false)) {
+                                candidates.push(d);
+                            }
                         }
                     }
-                }
 
-                for dev in candidates.into_iter() {
-                    let dev_name = dev.name().unwrap_or_else(|_| "<unknown>".to_string());
-                    let _ = tx.send(format!("[dbg] trying device: {}", dev_name));
+                    for dev in candidates.into_iter() {
+                        let dev_name = dev.name().unwrap_or_else(|_| "<unknown>".to_string());
+                        let _ = tx.send(format!("[dbg] trying device: {}", dev_name));
 
-                    let cfg = match dev.default_input_config() {
-                        Ok(c) => c,
-                        Err(e) => { let _ = tx.send(format!("[dbg] device {} config error: {}", dev_name, e)); continue; }
-                    };
+                        let cfg = match dev.default_input_config() {
+                            Ok(c) => c,
+                            Err(e) => { let _ = tx.send(format!("[dbg] device {} config error: {}", dev_name, e)); continue; }
+                        };
 
                     let sample_rate = cfg.sample_rate().0 as f32;
 

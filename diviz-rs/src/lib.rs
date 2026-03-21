@@ -697,6 +697,7 @@ struct ViewportState {
     view_mode: ViewMode,
     mpr_plane: MprPlane,
     displayed_physical_size: Option<Vec2>,
+    scale_by_physical: bool,
     window_center: f32,
     window_width: f32,
     wl_dirty: bool,
@@ -717,6 +718,7 @@ impl Default for ViewportState {
             view_mode: ViewMode::Stack,
             mpr_plane: MprPlane::Axial,
             displayed_physical_size: None,
+            scale_by_physical: true,
             window_center: 0.0,
             window_width: 1.0,
             wl_dirty: false,
@@ -1560,6 +1562,7 @@ impl eframe::App for DicomViewApp {
                         if previous_plane != self.vp().mpr_plane {
                             self.vp_mut().wl_dirty = true;
                         }
+                        ui.checkbox(&mut self.viewports[self.active_viewport].scale_by_physical, "Scale by physical spacing");
                     }
                 }
 
@@ -1734,8 +1737,16 @@ impl eframe::App for DicomViewApp {
                                 let img_h = tex_size[1] as f32;
                                 let vp = &self.viewports[idx];
                                 let physical_size = vp.displayed_physical_size.unwrap_or_else(|| egui::vec2(img_w, img_h));
-                                let fit = (cell_w / physical_size.x).min(cell_h / physical_size.y);
-                                let display = egui::vec2(physical_size.x * fit * vp.zoom, physical_size.y * fit * vp.zoom);
+                                // Choose scaling mode according to per-viewport flag
+                                let display = if vp.view_mode == ViewMode::Mpr && !vp.scale_by_physical {
+                                    // Pixel-based scaling
+                                    let fit = (cell_w / img_w).min(cell_h / img_h);
+                                    egui::vec2(img_w * fit * vp.zoom, img_h * fit * vp.zoom)
+                                } else {
+                                    // Physical-size based scaling
+                                    let fit = (cell_w / physical_size.x).min(cell_h / physical_size.y);
+                                    egui::vec2(physical_size.x * fit * vp.zoom, physical_size.y * fit * vp.zoom)
+                                };
                                 let center = cell_rect.center() + vp.pan;
                                 let angle_rad = vp.rotation_degrees.to_radians();
                                 let painter = ui.painter();
@@ -2043,12 +2054,16 @@ impl eframe::App for DicomViewApp {
                 let img_h = tex_size[1] as f32;
                     let physical_size = self.vp().displayed_physical_size.unwrap_or_else(|| egui::vec2(img_w, img_h));
 
-                    // Scale to fit the panel at current zoom level (per-viewport zoom)
-                    let fit = (rect.width() / physical_size.x).min(rect.height() / physical_size.y);
-                    let display = egui::vec2(
-                        physical_size.x * fit * self.vp().zoom,
-                        physical_size.y * fit * self.vp().zoom,
-                    );
+                    // Scale to fit the panel at current zoom level (per-viewport zoom).
+                    let display = if self.vp().view_mode == ViewMode::Mpr && !self.vp().scale_by_physical {
+                        // Pixel-based scaling
+                        let fit = (rect.width() / img_w).min(rect.height() / img_h);
+                        egui::vec2(img_w * fit * self.vp().zoom, img_h * fit * self.vp().zoom)
+                    } else {
+                        // Physical-size based scaling (preserves real-world proportions)
+                        let fit = (rect.width() / physical_size.x).min(rect.height() / physical_size.y);
+                        egui::vec2(physical_size.x * fit * self.vp().zoom, physical_size.y * fit * self.vp().zoom)
+                    };
 
                 let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
