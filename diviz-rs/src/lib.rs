@@ -1294,14 +1294,21 @@ impl DicomViewApp {
                 self.vp_mut().displayed_physical_size = Some(physical_size);
             }
             ViewMode::Mpr => {
-                let Some(volume) = &self.mpr_volume else {
-                    self.vp_mut().wl_dirty = false;
-                    return;
+                // Limit the immutable borrow of `self.mpr_volume` to this inner scope
+                // so we can mutably borrow `self` afterwards to set texture/state.
+                let (width, height, rgba, physical_size) = {
+                    let Some(volume) = &self.mpr_volume else {
+                        self.vp_mut().wl_dirty = false;
+                        return;
+                    };
+                    let plane_index = self.current_mpr_slice();
+                    let pixels = volume.extract_plane(self.vp().mpr_plane, plane_index);
+                    let (width, height) = volume.plane_dimensions(self.vp().mpr_plane);
+                    let rgba = scalar_to_rgba(&pixels, self.vp().window_center, self.vp().window_width);
+                    let physical_size = volume.physical_size(self.vp().mpr_plane);
+                    (width, height, rgba, physical_size)
                 };
-                let plane_index = self.current_mpr_slice();
-                let pixels = volume.extract_plane(self.vp().mpr_plane, plane_index);
-                let (width, height) = volume.plane_dimensions(self.vp().mpr_plane);
-                let rgba = scalar_to_rgba(&pixels, self.vp().window_center, self.vp().window_width);
+
                 let color_image = egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
                 let tex = ctx.load_texture(
                     format!("dicom_image_vp_{}", self.active_viewport),
@@ -1309,7 +1316,7 @@ impl DicomViewApp {
                     egui::TextureOptions::LINEAR,
                 );
                 self.set_texture_for_active(Some(tex));
-                self.vp_mut().displayed_physical_size = Some(volume.physical_size(self.vp().mpr_plane));
+                self.vp_mut().displayed_physical_size = Some(physical_size);
             }
         }
 
