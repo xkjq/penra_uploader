@@ -2108,15 +2108,29 @@ impl eframe::App for DicomViewApp {
 
                 if active_tex.is_none() {
                     ui.centered_and_justified(|ui| {
-                        if self.vp().view_mode == ViewMode::Mpr {
-                            ui.label(
-                                self.mpr_error
-                                    .as_deref()
-                                    .unwrap_or("MPR is not available for the selected series"),
-                            );
-                        } else {
-                            ui.label("Open DICOM files/folders or drag and drop them here");
-                        }
+                        ui.vertical_centered(|ui| {
+                            if self.vp().view_mode == ViewMode::Mpr {
+                                ui.label(
+                                    self.mpr_error
+                                        .as_deref()
+                                        .unwrap_or("MPR is not available for the selected series"),
+                                );
+                            } else {
+                                ui.label("Open DICOM files/folders or drag and drop them here");
+                            }
+
+                            // Recent folders (clickable)
+                            if !self.recent_folders.is_empty() {
+                                ui.add_space(8.0);
+                                ui.label("Recent:");
+                                for p in &self.recent_folders {
+                                    let display = p.display().to_string();
+                                    if ui.add(egui::Button::new(display)).clicked() {
+                                        self.pending_load = Some(vec![p.clone()]);
+                                    }
+                                }
+                            }
+                        });
                     });
                     return;
                 }
