@@ -49,6 +49,7 @@ pub fn run_meta_viewer_with_mode(paths: Vec<String>, mode: MetadataReadMode) {
         full_text: String::new(),
         context_menu_open: false,
         context_menu_text: None,
+        context_menu_pos: None,
         show_diagnostics: false,
         show_only_different: false,
         last_pairs: Vec::new(),
@@ -487,6 +488,7 @@ fn render_key_cell(
     last_pairs: &mut Vec<(String, String)>,
     context_menu_open: &mut bool,
     context_menu_text: &mut Option<String>,
+    context_menu_pos: &mut Option<egui::Pos2>,
 ) {
     let (depth, key_display, key_hover) = get_key_display(row_id);
     let has_children = row_has_children(row_id, rows);
@@ -538,6 +540,7 @@ fn render_key_cell(
             // Right-clicking the key opens a popup menu with 'Copy'
             *context_menu_open = true;
             *context_menu_text = Some(row_id.to_string());
+            *context_menu_pos = ui.ctx().input(|i| i.pointer.interact_pos());
         }
     });
 }
@@ -554,6 +557,7 @@ fn render_metadata_table(
     last_pairs: &mut Vec<(String, String)>,
     context_menu_open: &mut bool,
     context_menu_text: &mut Option<String>,
+    context_menu_pos: &mut Option<egui::Pos2>,
 ) {
     let mut table = TableBuilder::new(ui)
         .striped(true)
@@ -591,6 +595,7 @@ fn render_metadata_table(
                             last_pairs,
                             context_menu_open,
                             context_menu_text,
+                            context_menu_pos,
                         );
                     });
 
@@ -634,6 +639,7 @@ fn render_metadata_table(
                                     // Right-clicking a value opens a popup menu with 'Copy'
                                     *context_menu_open = true;
                                     *context_menu_text = Some(full.clone());
+                                    *context_menu_pos = ui.ctx().input(|i| i.pointer.interact_pos());
                                 }
                             });
                         }
@@ -664,8 +670,9 @@ struct DivueApp {
     identifiable_only: bool,
     full_open: bool,
     full_text: String,
-    context_menu_open: bool,
-    context_menu_text: Option<String>,
+        context_menu_open: bool,
+        context_menu_text: Option<String>,
+        context_menu_pos: Option<egui::Pos2>,
     show_diagnostics: bool,
     show_only_different: bool,
     last_pairs: Vec<(String, String)>,
@@ -686,6 +693,7 @@ impl DivueApp {
             full_text: String::new(),
             context_menu_open: false,
             context_menu_text: None,
+            context_menu_pos: None,
             show_diagnostics: false,
             show_only_different: false,
             last_pairs: Vec::new(),
@@ -1022,6 +1030,7 @@ impl DivueApp {
             &mut self.last_pairs,
             &mut self.context_menu_open,
             &mut self.context_menu_text,
+            &mut self.context_menu_pos,
         );
 
         // Full-text window for selecting/copying long values
@@ -1054,7 +1063,7 @@ impl DivueApp {
 
         // Render context popup menu if requested
         if self.context_menu_open {
-            if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+            if let Some(pos) = self.context_menu_pos {
                 egui::Area::new("context_menu_area".into())
                     .fixed_pos(pos)
                     .show(ctx, |ui| {
@@ -1062,22 +1071,27 @@ impl DivueApp {
                             ui.vertical(|ui| {
                                 if ui.button("Copy").clicked() {
                                     if let Some(txt) = &self.context_menu_text {
+                                        // Try to set egui's copied_text (eframe/platform integration)
+                                        ui.ctx().output_mut(|o| o.copied_text = txt.clone());
+                                        // Also attempt direct clipboard write as a best-effort fallback
                                         if let Ok(mut clipboard) = ClipboardContext::new() {
                                             let _ = clipboard.set_contents(txt.clone());
                                         }
                                     }
                                     self.context_menu_open = false;
                                     self.context_menu_text = None;
+                                    self.context_menu_pos = None;
                                 }
                                 if ui.button("Close").clicked() {
                                     self.context_menu_open = false;
                                     self.context_menu_text = None;
+                                    self.context_menu_pos = None;
                                 }
                             });
                         });
                     });
             } else {
-                // If we can't determine pointer pos, just close the menu
+                // No stored position — close the menu
                 self.context_menu_open = false;
                 self.context_menu_text = None;
             }
@@ -1095,6 +1109,7 @@ struct MetaApp {
     full_text: String,
     context_menu_open: bool,
     context_menu_text: Option<String>,
+    context_menu_pos: Option<egui::Pos2>,
     show_diagnostics: bool,
     show_only_different: bool,
     last_pairs: Vec<(String, String)>,
@@ -1194,6 +1209,7 @@ impl eframe::App for MetaApp {
                 &mut self.last_pairs,
                 &mut self.context_menu_open,
                 &mut self.context_menu_text,
+                &mut self.context_menu_pos,
             );
 
             // Full-text window for selecting/copying long values
