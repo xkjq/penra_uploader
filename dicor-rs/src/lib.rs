@@ -52,6 +52,14 @@ fn minute_offset_by_study(study_uid: &str, seed: Option<&str>) -> i64 {
     raw - 720
 }
 
+fn vr_is_safe_private(vr: VR) -> bool {
+    matches!(vr,
+        VR::US | VR::SS | VR::UL | VR::SL | VR::FL | VR::FD |
+        VR::IS | VR::DS | VR::CS |
+        VR::DA | VR::DT | VR::TM
+    )
+}
+
 fn process_inmem_top<D: dicom_core::DataDictionary + Clone>(
     ds: &mut dicom_object::InMemDicomObject<D>,
     study_uid: &str,
@@ -465,7 +473,9 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, pr
     map.insert(format!("PatientName:{}", pat_name), pn.clone());
     map.insert(format!("PatientID:{}", pid), pid.clone());
 
-    // Collect private-group tags; if not preserving, remove them now
+    // Collect private-group tags; if not preserving, remove them now.
+    // If preserving, remove only those private attributes that are not considered safe
+    // (retain numeric-like VRs and private creator IDs so retained privates remain definable).
     let mut private_tags: Vec<Tag> = Vec::new();
     for el in obj.iter() {
         let t = el.tag();
@@ -476,6 +486,20 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, pr
     if !preserve_private {
         for t in &private_tags {
             let _ = obj.remove_element(*t);
+        }
+    } else {
+        for t in &private_tags {
+            // Private creator IDs are in elements 0x0010..0x00FF; always keep those
+            if t.1 >= 0x0010 && t.1 <= 0x00FF {
+                continue;
+            }
+            if let Ok(el) = obj.element(*t) {
+                if !vr_is_safe_private(el.vr()) {
+                    let _ = obj.remove_element(*t);
+                }
+            } else {
+                let _ = obj.remove_element(*t);
+            }
         }
     }
 
@@ -676,6 +700,11 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, pr
     if remove_original {
         let _ = fs::remove_file(input);
     }
+
+    // Indicate that the dataset has been de-identified and that re-identification is
+    // not supported (irreversible anonymization).
+    let _ = obj.put_str(Tag(0x0012, 0x0062), VR::CS, "YES");
+    let _ = obj.put_str(Tag(0x0012, 0x0063), VR::LO, "dicor-rs: irreversible; re-identification not supported");
 
     Ok(out_path)
 }

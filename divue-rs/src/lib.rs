@@ -50,6 +50,7 @@ pub fn run_meta_viewer_with_mode(paths: Vec<String>, mode: MetadataReadMode) {
         context_menu_open: false,
         context_menu_text: None,
         context_menu_pos: None,
+        context_menu_row_id: None,
         show_diagnostics: false,
         show_only_different: false,
         last_pairs: Vec::new(),
@@ -489,6 +490,7 @@ fn render_key_cell(
     context_menu_open: &mut bool,
     context_menu_text: &mut Option<String>,
     context_menu_pos: &mut Option<egui::Pos2>,
+    context_menu_row_id: &mut Option<String>,
 ) {
     let (depth, key_display, key_hover) = get_key_display(row_id);
     let has_children = row_has_children(row_id, rows);
@@ -541,6 +543,7 @@ fn render_key_cell(
             *context_menu_open = true;
             *context_menu_text = Some(row_id.to_string());
             *context_menu_pos = ui.ctx().input(|i| i.pointer.interact_pos());
+            *context_menu_row_id = Some(row_id.to_string());
         }
     });
 }
@@ -558,6 +561,7 @@ fn render_metadata_table(
     context_menu_open: &mut bool,
     context_menu_text: &mut Option<String>,
     context_menu_pos: &mut Option<egui::Pos2>,
+    context_menu_row_id: &mut Option<String>,
 ) {
     let mut table = TableBuilder::new(ui)
         .striped(true)
@@ -596,6 +600,7 @@ fn render_metadata_table(
                             context_menu_open,
                             context_menu_text,
                             context_menu_pos,
+                            context_menu_row_id,
                         );
                     });
 
@@ -626,6 +631,9 @@ fn render_metadata_table(
                                     .add_sized([ui.available_width(), ui.spacing().interact_size.y], label)
                                     .on_hover_text(full.clone());
                                 if resp.clicked() {
+                                    // Open value on double-click instead of single click
+                                }
+                                if resp.double_clicked() {
                                     last_pairs.clear();
                                     last_pairs.extend(pairs.clone());
                                     if comps.len() > 1 {
@@ -640,6 +648,7 @@ fn render_metadata_table(
                                     *context_menu_open = true;
                                     *context_menu_text = Some(full.clone());
                                     *context_menu_pos = ui.ctx().input(|i| i.pointer.interact_pos());
+                                    *context_menu_row_id = None;
                                 }
                             });
                         }
@@ -672,7 +681,8 @@ struct DivueApp {
     full_text: String,
         context_menu_open: bool,
         context_menu_text: Option<String>,
-        context_menu_pos: Option<egui::Pos2>,
+            context_menu_pos: Option<egui::Pos2>,
+            context_menu_row_id: Option<String>,
     show_diagnostics: bool,
     show_only_different: bool,
     last_pairs: Vec<(String, String)>,
@@ -694,6 +704,7 @@ impl DivueApp {
             context_menu_open: false,
             context_menu_text: None,
             context_menu_pos: None,
+            context_menu_row_id: None,
             show_diagnostics: false,
             show_only_different: false,
             last_pairs: Vec::new(),
@@ -1031,6 +1042,7 @@ impl DivueApp {
             &mut self.context_menu_open,
             &mut self.context_menu_text,
             &mut self.context_menu_pos,
+            &mut self.context_menu_row_id,
         );
 
         // Full-text window for selecting/copying long values
@@ -1063,12 +1075,59 @@ impl DivueApp {
 
         // Render context popup menu if requested
         if self.context_menu_open {
+            // Modal background: clicking anywhere outside the popup should close it.
+            if let Some(_pos) = self.context_menu_pos {
+                egui::Area::new("context_menu_bg".into())
+                    .fixed_pos(egui::pos2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        let rect = ui.available_rect_before_wrap();
+                        let resp = ui.allocate_rect(rect, egui::Sense::click());
+                        if resp.clicked() {
+                            self.context_menu_open = false;
+                            self.context_menu_text = None;
+                            self.context_menu_pos = None;
+                            self.context_menu_row_id = None;
+                        }
+                    });
+            }
             if let Some(pos) = self.context_menu_pos {
                 egui::Area::new("context_menu_area".into())
                     .fixed_pos(pos)
                     .show(ctx, |ui| {
                         egui::Frame::popup(&ui.style()).show(ui, |ui| {
                             ui.vertical(|ui| {
+                                if ui.button("Open").clicked() {
+                                    // If the context was opened on a key row, try to build per-file pairs and open the full-text window.
+                                    if let Some(row_id) = &self.context_menu_row_id {
+                                        if let Some(row) = rows.iter().find(|r| r.row_id == *row_id) {
+                                            if let Some(value_key) = &row.value_key {
+                                                let pairs: Vec<(String, String)> = self
+                                                    .comps
+                                                    .iter()
+                                                    .map(|(name, map)| (name.clone(), map.get(value_key).cloned().unwrap_or_default()))
+                                                    .collect();
+                                                self.last_pairs.clear();
+                                                self.last_pairs.extend(pairs.clone());
+                                                if self.comps.len() > 1 {
+                                                    self.full_text = build_diff_text(&pairs);
+                                                } else {
+                                                    self.full_text = pairs.get(0).map(|(_, v)| v.clone()).unwrap_or_default();
+                                                }
+                                                self.full_open = true;
+                                            }
+                                        }
+                                    } else if let Some(txt) = &self.context_menu_text {
+                                        // Context refers to a single value cell
+                                        self.full_text = txt.clone();
+                                        self.last_pairs.clear();
+                                        self.last_pairs.push(("Value".to_string(), txt.clone()));
+                                        self.full_open = true;
+                                    }
+                                    self.context_menu_open = false;
+                                    self.context_menu_text = None;
+                                    self.context_menu_pos = None;
+                                    self.context_menu_row_id = None;
+                                }
                                 if ui.button("Copy").clicked() {
                                     if let Some(txt) = &self.context_menu_text {
                                         // Request egui/eframe to copy text via PlatformOutput command
@@ -1110,6 +1169,7 @@ struct MetaApp {
     context_menu_open: bool,
     context_menu_text: Option<String>,
     context_menu_pos: Option<egui::Pos2>,
+    context_menu_row_id: Option<String>,
     show_diagnostics: bool,
     show_only_different: bool,
     last_pairs: Vec<(String, String)>,
@@ -1210,6 +1270,7 @@ impl eframe::App for MetaApp {
                 &mut self.context_menu_open,
                 &mut self.context_menu_text,
                 &mut self.context_menu_pos,
+                &mut self.context_menu_row_id,
             );
 
             // Full-text window for selecting/copying long values
