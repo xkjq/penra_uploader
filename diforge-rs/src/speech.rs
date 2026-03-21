@@ -89,6 +89,37 @@ mod vosk_impl {
             // spawn a thread to own the audio stream and recognizer
             thread::spawn(move || {
                 // try to load model
+                // Emit CPAL/host/device diagnostics to help debug ALSA poll errors.
+                let host = cpal::default_host();
+                let _ = tx.send("[dbg] cpal default host obtained".to_string());
+                match host.default_input_device() {
+                    Some(d) => match d.name() {
+                        Ok(n) => { let _ = tx.send(format!("[dbg] default input device: {}", n)); }
+                        Err(e) => { let _ = tx.send(format!("[dbg] default input device name error: {}", e)); }
+                    },
+                    None => { let _ = tx.send("[dbg] no default input device (cpal)".to_string()); }
+                }
+
+                match host.input_devices() {
+                    Ok(devs) => {
+                        for (i, dev) in devs.enumerate() {
+                            let name = dev.name().unwrap_or_else(|_| "<unknown>".to_string());
+                            let _ = tx.send(format!("[dbg] device {}: {}", i, name));
+                        }
+                    }
+                    Err(e) => { let _ = tx.send(format!("[dbg] input_devices error: {:?}", e)); }
+                }
+
+                match host.default_input_device() {
+                    Some(dev) => match dev.default_input_config() {
+                        Ok(cfg) => {
+                            let _ = tx.send(format!("[dbg] default_input_config: channels={} sample_rate={} sample_format={}", cfg.channels(), cfg.sample_rate().0, cfg.sample_format()));
+                        }
+                        Err(e) => { let _ = tx.send(format!("[dbg] default_input_config error: {}", e)); }
+                    },
+                    None => { let _ = tx.send("[dbg] no default input device (cpal)".to_string()); }
+                }
+
                 let model = match Model::new(&model_path) {
                     Some(m) => m,
                     None => {
