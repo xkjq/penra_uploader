@@ -1738,7 +1738,9 @@ impl eframe::App for DicomViewApp {
                                 let display = egui::vec2(physical_size.x * fit * vp.zoom, physical_size.y * fit * vp.zoom);
                                 let center = cell_rect.center() + vp.pan;
                                 let angle_rad = vp.rotation_degrees.to_radians();
-                                paint_rotated_texture(ui.painter(), tex.id(), center, display, angle_rad);
+                                let painter = ui.painter();
+                                let clipped = painter.with_clip_rect(cell_rect);
+                                paint_rotated_texture(&clipped, tex.id(), center, display, angle_rad);
                                     // Draw per-viewport vertical slice indicator on the right side of the cell
                                     let total_slices = if vp.view_mode == ViewMode::Stack {
                                         self.series_groups
@@ -2203,7 +2205,9 @@ impl eframe::App for DicomViewApp {
 
                 let center = rect.center() + self.vp().pan;
                 let angle_rad = self.vp().rotation_degrees.to_radians();
-                paint_rotated_texture(ui.painter(), texture.id(), center, display, angle_rad);
+                let painter = ui.painter();
+                let clipped = painter.with_clip_rect(rect);
+                paint_rotated_texture(&clipped, texture.id(), center, display, angle_rad);
                 // Draw a vertical scroll indicator on the right side of the image panel
                 let total_slices = self.current_view_slice_len();
                 if total_slices > 1 {
