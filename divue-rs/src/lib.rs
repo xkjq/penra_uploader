@@ -320,8 +320,14 @@ fn render_diff_preview(ui: &mut egui::Ui, pairs: &[(String, String)]) {
                 let suffix: String = chars[len - suffix_len..len].iter().collect();
 
                 ui.label(prefix);
-                // colored mid (no brackets in preview)
-                ui.label(egui::RichText::new(mid).background_color(egui::Color32::from_rgb(255, 200, 200)));
+                // colored mid (no brackets in preview) - choose color appropriate for theme
+                let dark = ui.ctx().style().visuals.dark_mode;
+                let diff_bg = if dark {
+                    egui::Color32::from_rgb(150, 60, 60)
+                } else {
+                    egui::Color32::from_rgb(255, 200, 200)
+                };
+                ui.label(egui::RichText::new(mid).background_color(diff_bg));
                 ui.label(suffix);
             }
         });
@@ -643,11 +649,16 @@ fn render_metadata_table(
                             table_row.col(|ui| {
                                 let full = pairs[_idx].1.clone();
                                 let display = truncate_string(&full, 80);
+                                // Use a highlight color that contrasts with the current theme
+                                let highlight = if ui.style().visuals.dark_mode {
+                                    egui::Color32::from_rgb(80, 70, 50)
+                                } else {
+                                    egui::Color32::from_rgb(255, 243, 205)
+                                };
                                 let text = if same {
                                     egui::RichText::new(display.clone())
                                 } else {
-                                    egui::RichText::new(display.clone())
-                                        .background_color(egui::Color32::from_rgb(255, 243, 205))
+                                    egui::RichText::new(display.clone()).background_color(highlight)
                                 };
                                 let label = egui::Label::new(text).truncate().sense(egui::Sense::click());
                                 let resp = ui
