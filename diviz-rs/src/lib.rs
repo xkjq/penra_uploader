@@ -5,9 +5,11 @@ use dicom_pixeldata::PixelDecoder;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read;
+use std::fs::create_dir_all;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc;
+use directories::ProjectDirs;
 
 const METADATA_TAGS: &[(Tag, &str)] = &[
     (Tag(0x0010, 0x0010), "Patient Name"),
@@ -1001,6 +1003,8 @@ struct DicomViewApp {
     viewport_textures: Vec<Option<egui::TextureHandle>>,
     mpr_volume: Option<MprVolume>,
     mpr_error: Option<String>,
+    // Recently opened folders (persisted to disk)
+    recent_folders: Vec<PathBuf>,
     texture: Option<egui::TextureHandle>,
     thumbnail_textures: HashMap<String, egui::TextureHandle>,
     zoom: f32,
@@ -1026,6 +1030,7 @@ impl DicomViewApp {
             viewport_textures: vec![None],
             mpr_volume: None,
             mpr_error: None,
+            recent_folders: Self::load_recent_folders(),
             texture: None,
             thumbnail_textures: HashMap::new(),
             zoom: 1.0,
@@ -1041,6 +1046,8 @@ impl DicomViewApp {
     }
 
     fn load_files(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
+        // Keep original input so we can record the originating folder for recent list
+        let orig_paths = paths.clone();
         let paths = collect_dicom_files_recursively(paths);
         self.error = None;
         self.images.clear();
@@ -1063,6 +1070,16 @@ impl DicomViewApp {
             self.error = Some("No DICOM files found (searched recursively, including extensionless files)".to_string());
             self.loading = None;
             return;
+        }
+
+        // Record a recent folder entry: prefer a chosen folder, otherwise use the parent
+        if let Some(folder_candidate) = orig_paths.get(0) {
+            let folder = if folder_candidate.is_dir() {
+                folder_candidate.clone()
+            } else {
+                folder_candidate.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| folder_candidate.clone())
+            };
+            self.push_recent_folder(folder);
         }
 
         let total = paths.len();
@@ -1149,6 +1166,51 @@ impl DicomViewApp {
             MprPlane::Coronal => self.vp_mut().current_coronal_slice = index,
             MprPlane::Sagittal => self.vp_mut().current_sagittal_slice = index,
         }
+    }
+
+    // --- Recent folders persistence ---------------------------------
+    fn recent_config_path() -> Option<PathBuf> {
+        ProjectDirs::from("io", "penra", "diviz-rs").map(|pd| pd.config_dir().join("recent_folders.json"))
+    }
+
+    fn load_recent_folders() -> Vec<PathBuf> {
+        if let Some(path) = Self::recent_config_path() {
+            if path.exists() {
+                if let Ok(mut f) = File::open(&path) {
+                    let mut s = String::new();
+                    if f.read_to_string(&mut s).is_ok() {
+                        if let Ok(list) = serde_json::from_str::<Vec<String>>(&s) {
+                            return list.into_iter().map(PathBuf::from).collect();
+                        }
+                    }
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    fn save_recent_folders(&self) {
+        if let Some(path) = Self::recent_config_path() {
+            if let Some(dir) = path.parent() {
+                let _ = create_dir_all(dir);
+            }
+            let strings: Vec<String> = self.recent_folders.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+            if let Ok(mut f) = File::create(&path) {
+                let _ = serde_json::to_writer_pretty(&mut f, &strings);
+                let _ = f.flush();
+            }
+        }
+    }
+
+    fn push_recent_folder(&mut self, folder: PathBuf) {
+        // Remove duplicates and insert at front
+        self.recent_folders.retain(|p| p != &folder);
+        self.recent_folders.insert(0, folder);
+        // cap to 10 entries
+        if self.recent_folders.len() > 10 {
+            self.recent_folders.truncate(10);
+        }
+        self.save_recent_folders();
     }
 
     fn current_view_slice_len(&self) -> usize {
@@ -1442,6 +1504,18 @@ impl eframe::App for DicomViewApp {
                     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                         self.pending_load = Some(vec![folder]);
                     }
+                }
+
+                // Recent folders menu
+                if !self.recent_folders.is_empty() {
+                    ui.menu_button("Recent", |ui| {
+                        for p in &self.recent_folders {
+                            if ui.button(p.display().to_string()).clicked() {
+                                self.pending_load = Some(vec![p.clone()]);
+                                ui.close_menu();
+                            }
+                        }
+                    });
                 }
 
                 ui.separator();
