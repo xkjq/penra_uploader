@@ -1071,8 +1071,8 @@ impl DivueApp {
                             ui.vertical(|ui| {
                                 if ui.button("Copy").clicked() {
                                     if let Some(txt) = &self.context_menu_text {
-                                        // Try to set egui's copied_text (eframe/platform integration)
-                                        ui.ctx().output_mut(|o| o.copied_text = txt.clone());
+                                        // Request egui/eframe to copy text via PlatformOutput command
+                                        ui.ctx().output_mut(|o| o.commands.push(egui::output::OutputCommand::CopyText(txt.clone())));
                                         // Also attempt direct clipboard write as a best-effort fallback
                                         if let Ok(mut clipboard) = ClipboardContext::new() {
                                             let _ = clipboard.set_contents(txt.clone());
