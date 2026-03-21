@@ -1,0 +1,18 @@
+id: "chest_xr_basic"
+title: "Chest X-ray — Basic Report"
+tags: ["XR","Chest"]
+applicable_codes: []
+modalities: ["XR"]
+scope: "project"
+created_by: "rad_admin"
+created_at: "2026-03-21T12:00:00Z"
+version: 1
+body: |
+  Clinical details: {{clinical_history|Not provided}}
+
+  Findings:
+  - Cardiomediastinal silhouette within normal limits for technique.
+  - Lungs clear of focal consolidation.
+
+  Impression:
+  1. No acute cardiopulmonary disease identified.

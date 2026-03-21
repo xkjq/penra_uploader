@@ -12,6 +12,8 @@ anyhow = "1.0"
 # Optional Vosk bindings; enable with `--features vosk` when available
 vosk = { version = "0.3", optional = true }
 serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
 
 [features]
 default = []

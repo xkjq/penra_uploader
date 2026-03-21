@@ -1,0 +1,19 @@
+id: "ct_head_trauma_v1"
+title: "CT Head — Trauma (short)"
+tags: ["CT","Head","Trauma"]
+applicable_codes: ["NICIP:12345","NICIP:67890"]
+modalities: ["CT"]
+scope: "project"
+created_by: "rad_admin"
+created_at: "2026-03-21T12:00:00Z"
+version: 1
+body: |
+  Clinical details: {{clinical_history}}
+
+  Findings:
+  - No acute intracranial hemorrhage identified.
+  - No midline shift.
+
+  Impression:
+  1. No acute hemorrhage.
+  2. Further correlation with clinical exam recommended.

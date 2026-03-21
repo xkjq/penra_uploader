@@ -2020,8 +2020,9 @@ impl eframe::App for DicomViewApp {
                                             egui::vec2(track_width, cell_rect.height() - padding * 2.0),
                                         );
 
-                                        // Draw track background
-                                        ui.painter().rect_filled(
+                                        // Draw track background (clipped to cell)
+                                        let track_painter = painter.with_clip_rect(cell_rect);
+                                        track_painter.rect_filled(
                                             track_rect,
                                             track_width * 0.5,
                                             egui::Color32::from_rgba_unmultiplied(60, 60, 60, 120),
@@ -2042,23 +2043,23 @@ impl eframe::App for DicomViewApp {
                                         );
 
                                         // Draw thumb
-                                        ui.painter().rect_filled(
+                                        track_painter.rect_filled(
                                             thumb_rect,
                                             6.0,
                                             egui::Color32::from_rgb(200, 200, 200),
                                         );
 
-                                        // Thin shadow/border
-                                        ui.painter().rect_filled(
+                                        // Thin shadow/border (clipped)
+                                        track_painter.rect_filled(
                                             thumb_rect.shrink(0.5),
                                             6.0,
                                             egui::Color32::from_rgba_unmultiplied(0, 0, 0, 80),
                                         );
 
-                                        // Draw slice count small label
+                                        // Draw slice count small label (clipped)
                                         let label = format!("{}/{}", current_idx + 1, total_slices);
                                         let text_pos = egui::pos2(track_rect.left() - 6.0, thumb_rect.center().y - 8.0);
-                                        ui.painter().text(
+                                        track_painter.text(
                                             text_pos,
                                             egui::Align2::RIGHT_CENTER,
                                             label,
@@ -2156,6 +2157,7 @@ impl eframe::App for DicomViewApp {
                                     let top = center.y - display.y * 0.5;
                                     let y = top + t * display.y;
                                     let anchor = egui::pos2(center.x, y);
+                                    eprintln!("[xref-anchor] idx={} t={:.3} anchor={:?} rect={:?}", idx, t, anchor, cell_rect);
                                     vp_anchors.push((idx, anchor, study_id, cell_rect));
                                 }
                             }
@@ -2396,12 +2398,13 @@ impl eframe::App for DicomViewApp {
                                                     let vp_b = &self.viewports[*ib];
                                                     let screen_p0 = self.pixel_to_screen(u0, v0, w_b as f32, h_b as f32, cell_rect, vp_b);
                                                     let screen_p1 = self.pixel_to_screen(u1, v1, w_b as f32, h_b as f32, cell_rect, vp_b);
-                                                    // draw endpoint markers for debugging (only if finite)
+                                                    // draw endpoint markers for debugging (only if finite) clipped to target cell
+                                                    let clipped_painter = painter.with_clip_rect(cell_rect);
                                                     if screen_p0.x.is_finite() && screen_p0.y.is_finite() {
-                                                        painter.circle_filled(screen_p0, 3.0, egui::Color32::from_rgba_unmultiplied(220, 40, 40, 220));
+                                                        clipped_painter.circle_filled(screen_p0, 3.0, egui::Color32::from_rgba_unmultiplied(220, 40, 40, 220));
                                                     }
                                                     if screen_p1.x.is_finite() && screen_p1.y.is_finite() {
-                                                        painter.circle_filled(screen_p1, 3.0, egui::Color32::from_rgba_unmultiplied(220, 40, 40, 220));
+                                                        clipped_painter.circle_filled(screen_p1, 3.0, egui::Color32::from_rgba_unmultiplied(220, 40, 40, 220));
                                                     }
                                                     // Log details to stderr to aid debugging (captured in terminal)
                                                     // More detailed debug: include display/center/dx/dy and viewport zoom/pan
@@ -2421,22 +2424,14 @@ impl eframe::App for DicomViewApp {
                                                     let dx1 = (u1 - (w_b as f32) * 0.5) * (display.x / (w_b as f32));
                                                     let dy1 = (v1 - (h_b as f32) * 0.5) * (display.y / (h_b as f32));
                                                     eprintln!("[xref] ia={} ib={} zoom={} pan={:?} display={:?} center={:?} dx0={:.3} dy0={:.3} dx1={:.3} dy1={:.3} u0={:.2} v0={:.2} u1={:.2} v1={:.2} screen_p0={:?} screen_p1={:?}", ia, ib, vp_debug.zoom, vp_debug.pan, display, center, dx0, dy0, dx1, dy1, u0, v0, u1, v1, screen_p0, screen_p1);
-                                                    painter.line_segment([screen_p0, screen_p1], egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(200, 40, 40, 220)));
-                                                    // Debug: draw projected pixel coordinates near anchor B
-                                                    let info = format!("u0={:.1},v0={:.1}\nu1={:.1},v1={:.1}", u0, v0, u1, v1);
-                                                    painter.text(*anchor_b + egui::vec2(6.0, 6.0), egui::Align2::LEFT_TOP, info, egui::FontId::monospace(12.0), egui::Color32::WHITE);
+                                                    clipped_painter.line_segment([screen_p0, screen_p1], egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(200, 40, 40, 220)));
+                                                    // (debug text removed to avoid UI clutter)
                                                 } else {
                                                     // intersection produced no visible segment on target; fall back to anchor-to-anchor line for visibility
                                                 }
                                             }
                                         }
-                                        // Fallback: draw a faint line between the computed anchors so user can see relation
-                                        let anchor_a_pos = *anchor_a;
-                                        let anchor_b_pos = *anchor_b;
-                                        painter.line_segment([
-                                            anchor_a_pos,
-                                            anchor_b_pos,
-                                        ], egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(100, 160, 240, 140)));
+                                        // Fallback removed: do not draw anchor-to-anchor line to avoid duplicate UI elements
                                     }
                                 }
                             }
@@ -2444,6 +2439,7 @@ impl eframe::App for DicomViewApp {
                     }
                 }
 
+                if self.viewports.len() <= 1 {
                 if active_tex.is_none() {
                     ui.centered_and_justified(|ui| {
                         ui.vertical_centered(|ui| {
@@ -2740,6 +2736,7 @@ impl eframe::App for DicomViewApp {
                         egui::FontId::proportional(12.0),
                         egui::Color32::WHITE,
                     );
+                }
                 }
             }
         });
