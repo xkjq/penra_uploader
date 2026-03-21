@@ -138,156 +138,163 @@ mod vosk_impl {
                     }
                 };
 
-                let config = match device.default_input_config() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = tx.send(format!("failed to get default input config: {}", e));
-                        return;
-                    }
-                };
+                // Try default device first, then iterate other input devices until one works.
+                let mut final_stream: Option<cpal::Stream> = None;
 
-                let sample_rate = config.sample_rate().0 as f32;
-
-                // recognizer expects the model and sample rate
-                let mut recognizer = match Recognizer::new(&model, sample_rate) {
-                    Some(r) => r,
-                    None => {
-                        let _ = tx.send("vosk recognizer error: failed to create recognizer".to_string());
-                        return;
-                    }
-                };
-
-                // build input stream depending on sample format
-                let stream_config = StreamConfig {
-                    channels: config.channels(),
-                    sample_rate: config.sample_rate(),
-                    buffer_size: cpal::BufferSize::Default,
-                };
-
-                let stream_result = match config.sample_format() {
-                    SampleFormat::F32 => {
-                        let recognizer = Arc::new(Mutex::new(recognizer));
-                        let r2 = recognizer.clone();
-                        let data_tx = tx.clone();
-                        let err_tx = tx.clone();
-                        device.build_input_stream(
-                            &stream_config,
-                            move |data: &[f32], _| {
-                                let mut rec = r2.lock().unwrap();
-                                // convert f32 samples to i16 PCM
-                                let buf: Vec<i16> = data.iter().map(|&s| {
-                                    (s * i16::MAX as f32) as i16
-                                }).collect();
-                                match rec.accept_waveform(&buf) {
-                                    Ok(state) => match state {
-                                        DecodingState::Finalized => {
-                                            let finalr = rec.final_result();
-                                            let s = serde_json::to_string(&finalr).unwrap_or_default();
-                                            if !s.is_empty() { let _ = data_tx.send(s); }
-                                        }
-                                        DecodingState::Running => {
-                                            let partial = rec.partial_result();
-                                            let s = serde_json::to_string(&partial).unwrap_or_default();
-                                            if !s.is_empty() { let _ = data_tx.send(s); }
-                                        }
-                                        DecodingState::Failed => {
-                                            let _ = data_tx.send("decoding failed".to_string());
-                                        }
-                                    },
-                                    Err(e) => { let _ = data_tx.send(format!("accept_waveform error: {}", e)); }
-                                }
-                            },
-                            move |err| {
-                                let _ = err_tx.send(format!("audio input error: {:?}", err));
-                            },
-                            None,
-                        )
-                    }
-                    SampleFormat::I16 => {
-                        let recognizer = Arc::new(Mutex::new(recognizer));
-                        let r2 = recognizer.clone();
-                        let data_tx = tx.clone();
-                        let err_tx = tx.clone();
-                        device.build_input_stream(
-                            &stream_config,
-                            move |data: &[i16], _| {
-                                let mut rec = r2.lock().unwrap();
-                                match rec.accept_waveform(data) {
-                                    Ok(state) => match state {
-                                        DecodingState::Finalized => {
-                                            let finalr = rec.final_result();
-                                            let s = serde_json::to_string(&finalr).unwrap_or_default();
-                                            if !s.is_empty() { let _ = data_tx.send(s); }
-                                        }
-                                        DecodingState::Running => {
-                                            let partial = rec.partial_result();
-                                            let s = serde_json::to_string(&partial).unwrap_or_default();
-                                            if !s.is_empty() { let _ = data_tx.send(s); }
-                                        }
-                                        DecodingState::Failed => { let _ = data_tx.send("decoding failed".to_string()); }
-                                    },
-                                    Err(e) => { let _ = data_tx.send(format!("accept_waveform error: {}", e)); }
-                                }
-                            },
-                            move |err| {
-                                let _ = err_tx.send(format!("audio input error: {:?}", err));
-                            },
-                            None,
-                        )
-                    }
-                    SampleFormat::U16 => {
-                        // convert u16 to i16 by offsetting
-                        let recognizer = Arc::new(Mutex::new(recognizer));
-                        let r2 = recognizer.clone();
-                        let data_tx = tx.clone();
-                        let err_tx = tx.clone();
-                        device.build_input_stream(
-                            &stream_config,
-                            move |data: &[u16], _| {
-                                // convert
-                                let buf: Vec<i16> = data.iter().map(|&s| (s as i32 - 32768) as i16).collect();
-                                let mut rec = r2.lock().unwrap();
-                                match rec.accept_waveform(&buf) {
-                                    Ok(state) => match state {
-                                        DecodingState::Finalized => {
-                                            let finalr = rec.final_result();
-                                            let s = serde_json::to_string(&finalr).unwrap_or_default();
-                                            if !s.is_empty() { let _ = data_tx.send(s); }
-                                        }
-                                        DecodingState::Running => {
-                                            let partial = rec.partial_result();
-                                            let s = serde_json::to_string(&partial).unwrap_or_default();
-                                            if !s.is_empty() { let _ = data_tx.send(s); }
-                                        }
-                                        DecodingState::Failed => { let _ = data_tx.send("decoding failed".to_string()); }
-                                    },
-                                    Err(e) => { let _ = data_tx.send(format!("accept_waveform error: {}", e)); }
-                                }
-                            },
-                            move |err| {
-                                let _ = err_tx.send(format!("audio input error: {:?}", err));
-                            },
-                            None,
-                        )
-                    }
-                    _ => {
-                        let _ = tx.send("unsupported sample format".to_string());
-                        return;
-                    }
-                };
-
-                let stream = match stream_result {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = tx.send(format!("failed to build input stream: {}", e));
-                        return;
-                    }
-                };
-
-                if let Err(e) = stream.play() {
-                    let _ = tx.send(format!("failed to play input stream: {}", e));
-                    return;
+                // collect candidate devices (default first)
+                let mut candidates: Vec<cpal::Device> = Vec::new();
+                if let Some(d) = host.default_input_device() {
+                    candidates.push(d);
                 }
+                if let Ok(devs) = host.input_devices() {
+                    for d in devs {
+                        // avoid duplicates by name
+                        let name = d.name().unwrap_or_else(|_| "<unknown>".to_string());
+                        if !candidates.iter().any(|cd| cd.name().map(|n| n==name).unwrap_or(false)) {
+                            candidates.push(d);
+                        }
+                    }
+                }
+
+                for dev in candidates.into_iter() {
+                    let dev_name = dev.name().unwrap_or_else(|_| "<unknown>".to_string());
+                    let _ = tx.send(format!("[dbg] trying device: {}", dev_name));
+
+                    let cfg = match dev.default_input_config() {
+                        Ok(c) => c,
+                        Err(e) => { let _ = tx.send(format!("[dbg] device {} config error: {}", dev_name, e)); continue; }
+                    };
+
+                    let sample_rate = cfg.sample_rate().0 as f32;
+
+                    // create a recognizer for this sample rate
+                    let recognizer = match Recognizer::new(&model, sample_rate) {
+                        Some(r) => r,
+                        None => { let _ = tx.send(format!("[dbg] recognizer create failed for {}", dev_name)); continue; }
+                    };
+
+                    let stream_config = StreamConfig {
+                        channels: cfg.channels(),
+                        sample_rate: cfg.sample_rate(),
+                        buffer_size: cpal::BufferSize::Default,
+                    };
+
+                    let build_result = match cfg.sample_format() {
+                        SampleFormat::F32 => {
+                            let recognizer = Arc::new(Mutex::new(recognizer));
+                            let r2 = recognizer.clone();
+                            let data_tx = tx.clone();
+                            let err_tx = tx.clone();
+                            dev.build_input_stream(
+                                &stream_config,
+                                move |data: &[f32], _| {
+                                    let mut rec = r2.lock().unwrap();
+                                    let buf: Vec<i16> = data.iter().map(|&s| (s * i16::MAX as f32) as i16).collect();
+                                    match rec.accept_waveform(&buf) {
+                                        Ok(state) => match state {
+                                            DecodingState::Finalized => {
+                                                let finalr = rec.final_result();
+                                                let s = serde_json::to_string(&finalr).unwrap_or_default();
+                                                if !s.is_empty() { let _ = data_tx.send(s); }
+                                            }
+                                            DecodingState::Running => {
+                                                let partial = rec.partial_result();
+                                                let s = serde_json::to_string(&partial).unwrap_or_default();
+                                                if !s.is_empty() { let _ = data_tx.send(s); }
+                                            }
+                                            DecodingState::Failed => { let _ = data_tx.send("decoding failed".to_string()); }
+                                        },
+                                        Err(e) => { let _ = data_tx.send(format!("accept_waveform error: {}", e)); }
+                                    }
+                                },
+                                move |err| { let _ = err_tx.send(format!("audio input error: {:?}", err)); },
+                                None,
+                            )
+                        }
+                        SampleFormat::I16 => {
+                            let recognizer = Arc::new(Mutex::new(recognizer));
+                            let r2 = recognizer.clone();
+                            let data_tx = tx.clone();
+                            let err_tx = tx.clone();
+                            dev.build_input_stream(
+                                &stream_config,
+                                move |data: &[i16], _| {
+                                    let mut rec = r2.lock().unwrap();
+                                    match rec.accept_waveform(data) {
+                                        Ok(state) => match state {
+                                            DecodingState::Finalized => {
+                                                let finalr = rec.final_result();
+                                                let s = serde_json::to_string(&finalr).unwrap_or_default();
+                                                if !s.is_empty() { let _ = data_tx.send(s); }
+                                            }
+                                            DecodingState::Running => {
+                                                let partial = rec.partial_result();
+                                                let s = serde_json::to_string(&partial).unwrap_or_default();
+                                                if !s.is_empty() { let _ = data_tx.send(s); }
+                                            }
+                                            DecodingState::Failed => { let _ = data_tx.send("decoding failed".to_string()); }
+                                        },
+                                        Err(e) => { let _ = data_tx.send(format!("accept_waveform error: {}", e)); }
+                                    }
+                                },
+                                move |err| { let _ = err_tx.send(format!("audio input error: {:?}", err)); },
+                                None,
+                            )
+                        }
+                        SampleFormat::U16 => {
+                            let recognizer = Arc::new(Mutex::new(recognizer));
+                            let r2 = recognizer.clone();
+                            let data_tx = tx.clone();
+                            let err_tx = tx.clone();
+                            dev.build_input_stream(
+                                &stream_config,
+                                move |data: &[u16], _| {
+                                    let buf: Vec<i16> = data.iter().map(|&s| (s as i32 - 32768) as i16).collect();
+                                    let mut rec = r2.lock().unwrap();
+                                    match rec.accept_waveform(&buf) {
+                                        Ok(state) => match state {
+                                            DecodingState::Finalized => {
+                                                let finalr = rec.final_result();
+                                                let s = serde_json::to_string(&finalr).unwrap_or_default();
+                                                if !s.is_empty() { let _ = data_tx.send(s); }
+                                            }
+                                            DecodingState::Running => {
+                                                let partial = rec.partial_result();
+                                                let s = serde_json::to_string(&partial).unwrap_or_default();
+                                                if !s.is_empty() { let _ = data_tx.send(s); }
+                                            }
+                                            DecodingState::Failed => { let _ = data_tx.send("decoding failed".to_string()); }
+                                        },
+                                        Err(e) => { let _ = data_tx.send(format!("accept_waveform error: {}", e)); }
+                                    }
+                                },
+                                move |err| { let _ = err_tx.send(format!("audio input error: {:?}", err)); },
+                                None,
+                            )
+                        }
+                        _ => { let _ = tx.send("unsupported sample format".to_string()); continue; }
+                    };
+
+                    match build_result {
+                        Ok(s) => {
+                            if let Err(e) = s.play() {
+                                let _ = tx.send(format!("[dbg] play failed on {}: {}", dev_name, e));
+                                continue;
+                            }
+                            final_stream = Some(s);
+                            break;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(format!("[dbg] build_input_stream failed on {}: {}", dev_name, e));
+                            continue;
+                        }
+                    }
+                }
+
+                let stream = match final_stream {
+                    Some(s) => s,
+                    None => { let _ = tx.send("failed to open any input stream".to_string()); return; }
+                };
 
                 // keep the thread alive while running is true
                 while *running.lock().unwrap() {

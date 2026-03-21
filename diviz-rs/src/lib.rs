@@ -1741,6 +1741,20 @@ impl eframe::App for DicomViewApp {
                                 let painter = ui.painter();
                                 let clipped = painter.with_clip_rect(cell_rect);
                                 paint_rotated_texture(&clipped, tex.id(), center, display, angle_rad);
+
+                                // Overlay: window/level and rotation status (top-left)
+                                let overlay_padding = 6.0_f32;
+                                let overlay_pos = egui::pos2(cell_rect.left() + overlay_padding, cell_rect.top() + overlay_padding);
+                                let overlay_text = format!(
+                                    "W/L: {:.0}/{:.0}  Rot: {:.0}°",
+                                    vp.window_center, vp.window_width, vp.rotation_degrees
+                                );
+                                let font = egui::FontId::proportional(12.0);
+                                let box_w = 160.0_f32;
+                                let box_h = 20.0_f32;
+                                let bg_rect = egui::Rect::from_min_size(overlay_pos, egui::vec2(box_w, box_h));
+                                painter.rect_filled(bg_rect, 4.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160));
+                                painter.text(egui::pos2(bg_rect.left() + 8.0, bg_rect.top() + 2.0), egui::Align2::LEFT_TOP, overlay_text, font, egui::Color32::WHITE);
                                     // Draw per-viewport vertical slice indicator on the right side of the cell
                                     let total_slices = if vp.view_mode == ViewMode::Stack {
                                         self.series_groups
@@ -2208,6 +2222,23 @@ impl eframe::App for DicomViewApp {
                 let painter = ui.painter();
                 let clipped = painter.with_clip_rect(rect);
                 paint_rotated_texture(&clipped, texture.id(), center, display, angle_rad);
+                // Overlay: window/level and rotation status (top-left) for single viewport
+                {
+                    let vp = self.vp();
+                    let overlay_padding = 6.0_f32;
+                    let overlay_pos = egui::pos2(rect.left() + overlay_padding, rect.top() + overlay_padding);
+                    let overlay_text = format!(
+                        "W/L: {:.0}/{:.0}  Rot: {:.0}°",
+                        vp.window_center, vp.window_width, vp.rotation_degrees
+                    );
+                    let font = egui::FontId::proportional(12.0);
+                    let box_w = 220.0_f32;
+                    let box_h = 22.0_f32;
+                    let bg_rect = egui::Rect::from_min_size(overlay_pos, egui::vec2(box_w, box_h));
+                    let painter = ui.painter();
+                    painter.rect_filled(bg_rect, 4.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160));
+                    painter.text(egui::pos2(bg_rect.left() + 8.0, bg_rect.top() + 3.0), egui::Align2::LEFT_TOP, overlay_text, font, egui::Color32::WHITE);
+                }
                 // Draw a vertical scroll indicator on the right side of the image panel
                 let total_slices = self.current_view_slice_len();
                 if total_slices > 1 {
