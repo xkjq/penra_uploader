@@ -9,14 +9,26 @@ use dicom_core::Tag;
 use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry};
 use dicom_dictionary_std::StandardDataDictionary;
 use copypasta::{ClipboardContext, ClipboardProvider};
+use std::time::Instant;
+use std::thread;
+use std::time::Duration;
 
 fn copy_text_to_clipboard(ctx: &egui::Context, txt: &str) {
     ctx.output_mut(|o| {
         o.commands.push(egui::output::OutputCommand::CopyText(txt.to_owned()));
     });
-    if let Ok(mut clipboard) = ClipboardContext::new() {
-        let _ = clipboard.set_contents(txt.to_owned());
-    }
+    // Spawn a background thread to attempt direct clipboard writes with retries
+    let txt_owned = txt.to_owned();
+    thread::spawn(move || {
+        for _ in 0..3 {
+            if let Ok(mut clipboard) = ClipboardContext::new() {
+                if clipboard.set_contents(txt_owned.clone()).is_ok() {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
 }
 
 pub fn run_meta_viewer(paths: Vec<String>) {
@@ -63,6 +75,8 @@ pub fn run_meta_viewer_with_mode(paths: Vec<String>, mode: MetadataReadMode) {
         show_diagnostics: false,
         show_only_different: false,
         last_pairs: Vec::new(),
+            last_copy_feedback: None,
+            pending_copy: None,
     };
     let native_options = eframe::NativeOptions::default();
     eframe::run_native("DICOM Metadata Viewer", native_options, Box::new(|_cc| Ok(Box::new(app)))).ok();
@@ -695,6 +709,8 @@ struct DivueApp {
     show_diagnostics: bool,
     show_only_different: bool,
     last_pairs: Vec<(String, String)>,
+    last_copy_feedback: Option<(String, Instant)>,
+    pending_copy: Option<(String, u8, Instant)>,
 }
 
 impl DivueApp {
@@ -717,6 +733,8 @@ impl DivueApp {
             show_diagnostics: false,
             show_only_different: false,
             last_pairs: Vec::new(),
+            last_copy_feedback: None,
+            pending_copy: None,
         }
     }
 
@@ -769,6 +787,30 @@ impl eframe::App for DivueApp {
                 self.render_file_selection_view(ctx, ui);
             }
         });
+
+        // transient copy feedback (top-right)
+        if let Some((msg, time)) = &self.last_copy_feedback {
+            if time.elapsed().as_secs_f32() < 2.0 {
+                    egui::Area::new("copy_feedback_meta".into()).anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0)).show(ctx, |ui| {
+                        ui.label(egui::RichText::new(msg).strong());
+                    });
+            } else {
+                self.last_copy_feedback = None;
+            }
+        }
+
+        // schedule additional egui CopyText commands across frames to improve reliability
+        if let Some((txt, retries, last_time)) = &mut self.pending_copy {
+            if last_time.elapsed() >= Duration::from_millis(80) {
+                if *retries > 0 {
+                    ctx.output_mut(|o| o.commands.push(egui::output::OutputCommand::CopyText(txt.clone())));
+                    *retries -= 1;
+                    *last_time = Instant::now();
+                } else {
+                    self.pending_copy = None;
+                }
+            }
+        }
     }
 }
 
@@ -1077,6 +1119,8 @@ impl DivueApp {
                         self.full_text = tmp;
                         if ui.button("Copy to clipboard").clicked() {
                             copy_text_to_clipboard(ctx, &self.full_text);
+                            self.last_copy_feedback = Some(("Copied to clipboard".to_string(), Instant::now()));
+                            self.pending_copy = Some((self.full_text.clone(), 3u8, Instant::now()));
                         }
                     });
                 });
@@ -1140,6 +1184,8 @@ impl DivueApp {
                                 if ui.button("Copy").clicked() {
                                     if let Some(txt) = &self.context_menu_text {
                                         copy_text_to_clipboard(ui.ctx(), txt);
+                                        self.last_copy_feedback = Some(("Copied to clipboard".to_string(), Instant::now()));
+                                        self.pending_copy = Some((txt.clone(), 3u8, Instant::now()));
                                     }
                                     self.context_menu_open = false;
                                     self.context_menu_text = None;
@@ -1177,6 +1223,8 @@ struct MetaApp {
     show_diagnostics: bool,
     show_only_different: bool,
     last_pairs: Vec<(String, String)>,
+    last_copy_feedback: Option<(String, Instant)>,
+    pending_copy: Option<(String, u8, Instant)>,
 }
 
 impl eframe::App for MetaApp {
@@ -1301,11 +1349,37 @@ impl eframe::App for MetaApp {
                             self.full_text = tmp;
                             if ui.button("Copy to clipboard").clicked() {
                                 copy_text_to_clipboard(ctx, &self.full_text);
+                                self.last_copy_feedback = Some(("Copied to clipboard".to_string(), Instant::now()));
+                                self.pending_copy = Some((self.full_text.clone(), 3u8, Instant::now()));
                             }
                         });
                     });
             }
         });
+
+        // transient copy feedback (top-right)
+        if let Some((msg, time)) = &self.last_copy_feedback {
+            if time.elapsed().as_secs_f32() < 2.0 {
+                egui::Area::new("copy_feedback_meta".into()).anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0)).show(ctx, |ui| {
+                    ui.label(egui::RichText::new(msg).strong());
+                });
+            } else {
+                self.last_copy_feedback = None;
+            }
+        }
+
+        // schedule additional egui CopyText commands across frames to improve reliability
+        if let Some((txt, retries, last_time)) = &mut self.pending_copy {
+            if last_time.elapsed() >= Duration::from_millis(80) {
+                if *retries > 0 {
+                    ctx.output_mut(|o| o.commands.push(egui::output::OutputCommand::CopyText(txt.clone())));
+                    *retries -= 1;
+                    *last_time = Instant::now();
+                } else {
+                    self.pending_copy = None;
+                }
+            }
+        }
     }
 }
 
