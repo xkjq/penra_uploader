@@ -1,7 +1,7 @@
 id: "chest_xr_basic"
 title: "Chest X-ray — Basic Report"
 tags: ["XR","Chest"]
-applicable_codes: []
+applicable_codes: ["XCHES"]
 modalities: ["XR"]
 scope: "project"
 created_by: "rad_admin"

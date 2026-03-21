@@ -2398,13 +2398,13 @@ impl eframe::App for DicomViewApp {
                                                     let vp_b = &self.viewports[*ib];
                                                     let screen_p0 = self.pixel_to_screen(u0, v0, w_b as f32, h_b as f32, cell_rect, vp_b);
                                                     let screen_p1 = self.pixel_to_screen(u1, v1, w_b as f32, h_b as f32, cell_rect, vp_b);
-                                                    // draw endpoint markers for debugging (only if finite) clipped to target cell
-                                                    let clipped_painter = painter.with_clip_rect(cell_rect);
+                                                    // draw endpoint markers for debugging (only if finite) clipped to target cell B
+                                                    let clipped_painter_b = painter.with_clip_rect(cell_rect);
                                                     if screen_p0.x.is_finite() && screen_p0.y.is_finite() {
-                                                        clipped_painter.circle_filled(screen_p0, 3.0, egui::Color32::from_rgba_unmultiplied(220, 40, 40, 220));
+                                                        clipped_painter_b.circle_filled(screen_p0, 3.0, egui::Color32::from_rgba_unmultiplied(220, 40, 40, 220));
                                                     }
                                                     if screen_p1.x.is_finite() && screen_p1.y.is_finite() {
-                                                        clipped_painter.circle_filled(screen_p1, 3.0, egui::Color32::from_rgba_unmultiplied(220, 40, 40, 220));
+                                                        clipped_painter_b.circle_filled(screen_p1, 3.0, egui::Color32::from_rgba_unmultiplied(220, 40, 40, 220));
                                                     }
                                                     // Log details to stderr to aid debugging (captured in terminal)
                                                     // More detailed debug: include display/center/dx/dy and viewport zoom/pan
@@ -2424,7 +2424,66 @@ impl eframe::App for DicomViewApp {
                                                     let dx1 = (u1 - (w_b as f32) * 0.5) * (display.x / (w_b as f32));
                                                     let dy1 = (v1 - (h_b as f32) * 0.5) * (display.y / (h_b as f32));
                                                     eprintln!("[xref] ia={} ib={} zoom={} pan={:?} display={:?} center={:?} dx0={:.3} dy0={:.3} dx1={:.3} dy1={:.3} u0={:.2} v0={:.2} u1={:.2} v1={:.2} screen_p0={:?} screen_p1={:?}", ia, ib, vp_debug.zoom, vp_debug.pan, display, center, dx0, dy0, dx1, dy1, u0, v0, u1, v1, screen_p0, screen_p1);
-                                                    clipped_painter.line_segment([screen_p0, screen_p1], egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(200, 40, 40, 220)));
+                                                    clipped_painter_b.line_segment([screen_p0, screen_p1], egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(200, 40, 40, 220)));
+                                                    // Also compute and draw the corresponding segment in viewport A so both viewports show cross-refs
+                                                    // compute t-range for A (similar logic as for B)
+                                                    let a_u_a = dot(sub(p0, orig_a), col_a) / col_sp_a;
+                                                    let b_u_a = dot(dir, col_a) / col_sp_a;
+                                                    let a_v_a = dot(sub(p0, orig_a), row_a) / row_sp_a;
+                                                    let b_v_a = dot(dir, row_a) / row_sp_a;
+
+                                                    let mut t_min_a = f32::NEG_INFINITY;
+                                                    let mut t_max_a = f32::INFINITY;
+
+                                                    let ua0 = 0.0_f32;
+                                                    let ua1 = (w_a as f32) - 1.0;
+                                                    if b_u_a.abs() < 1e-6 {
+                                                        if a_u_a < ua0 || a_u_a > ua1 {
+                                                            // no intersection for A
+                                                            t_min_a = 1.0;
+                                                            t_max_a = 0.0;
+                                                        }
+                                                    } else {
+                                                        let t1 = (ua0 - a_u_a) / b_u_a;
+                                                        let t2 = (ua1 - a_u_a) / b_u_a;
+                                                        let (ta, tb) = if t1 < t2 { (t1, t2) } else { (t2, t1) };
+                                                        t_min_a = t_min_a.max(ta);
+                                                        t_max_a = t_max_a.min(tb);
+                                                    }
+
+                                                    let va0 = 0.0_f32;
+                                                    let va1 = (h_a as f32) - 1.0;
+                                                    if b_v_a.abs() < 1e-6 {
+                                                        if a_v_a < va0 || a_v_a > va1 {
+                                                            t_min_a = 1.0;
+                                                            t_max_a = 0.0;
+                                                        }
+                                                    } else {
+                                                        let t1 = (va0 - a_v_a) / b_v_a;
+                                                        let t2 = (va1 - a_v_a) / b_v_a;
+                                                        let (ta, tb) = if t1 < t2 { (t1, t2) } else { (t2, t1) };
+                                                        t_min_a = t_min_a.max(ta);
+                                                        t_max_a = t_max_a.min(tb);
+                                                    }
+
+                                                    if t_min_a <= t_max_a && t_min_a.is_finite() && t_max_a.is_finite() {
+                                                        let p_start_a = add(p0, scale(dir, t_min_a));
+                                                        let p_end_a = add(p0, scale(dir, t_max_a));
+                                                        let (ua0p, va0p) = self.project_point_to_pixel(orig_a, col_a, row_a, col_sp_a, row_sp_a, p_start_a);
+                                                        let (ua1p, va1p) = self.project_point_to_pixel(orig_a, col_a, row_a, col_sp_a, row_sp_a, p_end_a);
+                                                        let cell_rect_a = *rect_a;
+                                                        let vp_a = &self.viewports[*ia];
+                                                        let screen_pa0 = self.pixel_to_screen(ua0p, va0p, w_a as f32, h_a as f32, cell_rect_a, vp_a);
+                                                        let screen_pa1 = self.pixel_to_screen(ua1p, va1p, w_a as f32, h_a as f32, cell_rect_a, vp_a);
+                                                        let clipped_painter_a = painter.with_clip_rect(cell_rect_a);
+                                                        if screen_pa0.x.is_finite() && screen_pa0.y.is_finite() {
+                                                            clipped_painter_a.circle_filled(screen_pa0, 3.0, egui::Color32::from_rgba_unmultiplied(220, 40, 40, 220));
+                                                        }
+                                                        if screen_pa1.x.is_finite() && screen_pa1.y.is_finite() {
+                                                            clipped_painter_a.circle_filled(screen_pa1, 3.0, egui::Color32::from_rgba_unmultiplied(220, 40, 40, 220));
+                                                        }
+                                                        clipped_painter_a.line_segment([screen_pa0, screen_pa1], egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(200, 40, 40, 220)));
+                                                    }
                                                     // (debug text removed to avoid UI clutter)
                                                 } else {
                                                     // intersection produced no visible segment on target; fall back to anchor-to-anchor line for visibility

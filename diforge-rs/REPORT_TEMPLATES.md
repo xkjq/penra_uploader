@@ -25,7 +25,7 @@ Use YAML or JSON for template files. Example minimal YAML schema:
 - id: "ct_head_trauma_v1"
   title: "CT Head — Trauma (short)"
   tags: ["CT","Head","Trauma"]
-  applicable_codes: ["NICIP:12345","NICIP:67890"]
+  applicable_codes: ["CSKUH"]
   modalities: ["CT"]
   scope: "project"            # project | user
   favorites: false
