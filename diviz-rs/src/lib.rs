@@ -2157,7 +2157,7 @@ impl eframe::App for DicomViewApp {
                                     let top = center.y - display.y * 0.5;
                                     let y = top + t * display.y;
                                     let anchor = egui::pos2(center.x, y);
-                                    eprintln!("[xref-anchor] idx={} t={:.3} anchor={:?} rect={:?}", idx, t, anchor, cell_rect);
+                                    // anchor debug log removed
                                     vp_anchors.push((idx, anchor, study_id, cell_rect));
                                 }
                             }
@@ -2329,10 +2329,7 @@ impl eframe::App for DicomViewApp {
                     // Draw cross-reference lines between viewports that belong to the same study
                     if !vp_anchors.is_empty() {
                         let painter = ui.painter();
-                        // Draw debug anchors (small circles) so we can verify positions
-                        for (_, anchor, _study, _rect) in &vp_anchors {
-                            painter.circle_filled(*anchor, 4.0, egui::Color32::from_rgba_unmultiplied(255, 200, 0, 200));
-                        }
+                        // debug anchors removed
                         for i in 0..vp_anchors.len() {
                                 for j in (i + 1)..vp_anchors.len() {
                                 let (ia, anchor_a, study_a, rect_a) = &vp_anchors[i];
@@ -2423,7 +2420,7 @@ impl eframe::App for DicomViewApp {
                                                     let dy0 = (v0 - (h_b as f32) * 0.5) * (display.y / (h_b as f32));
                                                     let dx1 = (u1 - (w_b as f32) * 0.5) * (display.x / (w_b as f32));
                                                     let dy1 = (v1 - (h_b as f32) * 0.5) * (display.y / (h_b as f32));
-                                                    eprintln!("[xref] ia={} ib={} zoom={} pan={:?} display={:?} center={:?} dx0={:.3} dy0={:.3} dx1={:.3} dy1={:.3} u0={:.2} v0={:.2} u1={:.2} v1={:.2} screen_p0={:?} screen_p1={:?}", ia, ib, vp_debug.zoom, vp_debug.pan, display, center, dx0, dy0, dx1, dy1, u0, v0, u1, v1, screen_p0, screen_p1);
+                                                    // projection debug log removed
                                                     clipped_painter_b.line_segment([screen_p0, screen_p1], egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(200, 40, 40, 220)));
                                                     // Also compute and draw the corresponding segment in viewport A so both viewports show cross-refs
                                                     // compute t-range for A (similar logic as for B)
