@@ -1489,30 +1489,63 @@ impl eframe::App for DicomViewApp {
         // ── Toolbar ───────────────────────────────────────────────────────────
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("📄 Open Files").clicked() {
-                    if let Some(paths) = rfd::FileDialog::new()
-                        .add_filter("DICOM", &["dcm", "DCM"])
-                        .add_filter("DICOM", &["dicom", "DICOM"])
-                        .add_filter("All Files", &["*"])
-                        .pick_files()
-                    {
-                        self.pending_load = Some(paths);
+                if self.series_groups.is_empty() {
+                    if ui.button("📄 Open Files").clicked() {
+                        if let Some(paths) = rfd::FileDialog::new()
+                            .add_filter("DICOM", &["dcm", "DCM"])
+                            .add_filter("DICOM", &["dicom", "DICOM"])
+                            .add_filter("All Files", &["*"])
+                            .pick_files()
+                        {
+                            self.pending_load = Some(paths);
+                        }
                     }
-                }
 
-                if ui.button("📁 Open Folder").clicked() {
-                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                        self.pending_load = Some(vec![folder]);
+                    if ui.button("📁 Open Folder").clicked() {
+                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                            self.pending_load = Some(vec![folder]);
+                        }
                     }
-                }
 
-                // Recent folders menu
-                if !self.recent_folders.is_empty() {
-                    ui.menu_button("Recent", |ui| {
-                        for p in &self.recent_folders {
-                            if ui.button(p.display().to_string()).clicked() {
-                                self.pending_load = Some(vec![p.clone()]);
-                                ui.close_menu();
+                    // Recent folders menu
+                    if !self.recent_folders.is_empty() {
+                        ui.menu_button("Recent", |ui| {
+                            for p in &self.recent_folders {
+                                if ui.button(p.display().to_string()).clicked() {
+                                    self.pending_load = Some(vec![p.clone()]);
+                                    ui.close();
+                                }
+                            }
+                        });
+                    }
+                } else {
+                    // Collapsed single-icon menu when files are already opened
+                    ui.menu_button("📂", |ui| {
+                        if ui.button("📄 Open Files").clicked() {
+                            if let Some(paths) = rfd::FileDialog::new()
+                                .add_filter("DICOM", &["dcm", "DCM"])
+                                .add_filter("DICOM", &["dicom", "DICOM"])
+                                .add_filter("All Files", &["*"])
+                                .pick_files()
+                            {
+                                self.pending_load = Some(paths);
+                                ui.close();
+                            }
+                        }
+                        if ui.button("📁 Open Folder").clicked() {
+                            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                self.pending_load = Some(vec![folder]);
+                                ui.close();
+                            }
+                        }
+                        if !self.recent_folders.is_empty() {
+                            ui.separator();
+                            ui.label("Recent:");
+                            for p in &self.recent_folders {
+                                if ui.button(p.display().to_string()).clicked() {
+                                    self.pending_load = Some(vec![p.clone()]);
+                                    ui.close();
+                                }
                             }
                         }
                     });

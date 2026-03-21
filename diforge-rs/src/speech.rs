@@ -260,6 +260,7 @@ mod vosk_impl {
 
                         if stream_opt.is_some() { break; }
                     }
+                }
 
                 let stream = match stream_opt {
                     Some(s) => s,
