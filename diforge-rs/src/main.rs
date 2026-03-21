@@ -78,6 +78,7 @@ impl eframe::App for ReportApp {
                             let ctx = ctx.clone();
                             std::thread::spawn(move || {
                                 while let Ok(msg) = eng_rx.recv() {
+                                    eprintln!("SPEECH: {}", &msg);
                                     let _ = ui_tx.send(msg);
                                     let _ = ctx.request_repaint();
                                 }

@@ -55,7 +55,7 @@ mod vosk_impl {
     use std::thread;
 
     use cpal::traits::{HostTrait, DeviceTrait, StreamTrait};
-    use cpal::{SampleFormat, StreamConfig};
+    use cpal::{SampleFormat, StreamConfig, BufferSize};
     use vosk::{Model, Recognizer, DecodingState};
     use serde_json;
 
@@ -98,10 +98,11 @@ mod vosk_impl {
 
                 // Prefer Pulse then Alsa hosts
                 let mut host_ids: Vec<cpal::HostId> = cpal::available_hosts().into_iter().collect();
-                host_ids.sort_by_key(|h| match h {
-                    cpal::HostId::Pulse => 0,
-                    cpal::HostId::Alsa => 1,
-                    _ => 2,
+                host_ids.sort_by_key(|h| {
+                    let s = format!("{:?}", h);
+                    if s.contains("Pulse") || s.contains("PipeWire") { 0 }
+                    else if s.contains("Alsa") { 1 }
+                    else { 2 }
                 });
 
                 let mut stream_opt: Option<cpal::Stream> = None;
@@ -110,23 +111,37 @@ mod vosk_impl {
                     if let Ok(host) = cpal::host_from_id(hid) {
                         let _ = tx.send(format!("[dbg] trying host: {:?}", hid));
 
-                        // Build candidate list: default first, then others
+                        // Build candidate list: gather devices and prefer plughw/hw names first
                         let mut candidates: Vec<cpal::Device> = Vec::new();
-                        if let Some(d) = host.default_input_device() {
-                            candidates.push(d);
-                        }
                         if let Ok(devs) = host.input_devices() {
                             for d in devs {
-                                let name = d.name().unwrap_or_else(|_| "<unknown>".to_string());
-                                if !candidates.iter().any(|cd| cd.name().map(|n| n==name).unwrap_or(false)) {
-                                    candidates.push(d);
-                                }
+                                candidates.push(d);
                             }
                         }
+                        // Uniquify by name
+                        candidates.sort_by_key(|d| d.name().unwrap_or_default());
+                        candidates.dedup_by_key(|d| d.name().ok());
+                        // Move devices with names like "plughw:" or starting with "hw:" to the front
+                        candidates.sort_by_key(|d| {
+                            let n = d.name().unwrap_or_default().to_lowercase();
+                            if n.contains("plughw") || n.contains("hw:") { 0 } else { 1 }
+                        });
 
                         for dev in candidates.into_iter() {
                             let dev_name = dev.name().unwrap_or_else(|_| "<unknown>".to_string());
                             let _ = tx.send(format!("[dbg] trying device: {}", dev_name));
+
+                            // Report supported input configs for diagnostics (helps with ALSA issues)
+                            match dev.supported_input_configs() {
+                                Ok(mut it) => {
+                                    while let Some(sup) = it.next() {
+                                        let ranges = format!("min_rate={} max_rate={} channels={} fmt={:?}",
+                                            sup.min_sample_rate().0, sup.max_sample_rate().0, sup.channels(), sup.sample_format());
+                                        let _ = tx.send(format!("[dbg] supported: {} on {}", ranges, dev_name));
+                                    }
+                                }
+                                Err(e) => { let _ = tx.send(format!("[dbg] supported_input_configs() error for {}: {}", dev_name, e)); }
+                            }
 
                             let cfg = match dev.default_input_config() {
                                 Ok(c) => c,
@@ -139,123 +154,123 @@ mod vosk_impl {
                                 Some(r) => r,
                                 None => { let _ = tx.send(format!("[dbg] recognizer create failed for {}", dev_name)); continue; }
                             };
+                            let recognizer = Arc::new(Mutex::new(recognizer));
 
-                            let stream_config = StreamConfig {
-                                channels: cfg.channels(),
-                                sample_rate: cfg.sample_rate(),
-                                buffer_size: cpal::BufferSize::Default,
-                            };
+                            // Try a few buffer sizes in case defaults hit ALSA POLLERR
+                            let buffer_options = vec![BufferSize::Default, BufferSize::Fixed(512), BufferSize::Fixed(1024), BufferSize::Fixed(2048)];
+                            let mut succeeded = false;
+                            for buf in buffer_options.into_iter() {
+                                let stream_config = StreamConfig {
+                                    channels: cfg.channels(),
+                                    sample_rate: cfg.sample_rate(),
+                                    buffer_size: buf.clone(),
+                                };
 
-                            let build_result = match cfg.sample_format() {
-                                SampleFormat::F32 => {
-                                    let recognizer = Arc::new(Mutex::new(recognizer));
-                                    let r2 = recognizer.clone();
-                                    let data_tx = tx.clone();
-                                    let err_tx = tx.clone();
-                                    dev.build_input_stream(
-                                        &stream_config,
-                                        move |data: &[f32], _| {
-                                            let mut rec = r2.lock().unwrap();
-                                            let buf: Vec<i16> = data.iter().map(|&s| (s * i16::MAX as f32) as i16).collect();
-                                            match rec.accept_waveform(&buf) {
-                                                Ok(state) => match state {
-                                                    DecodingState::Finalized => {
-                                                        let finalr = rec.final_result();
-                                                        let s = serde_json::to_string(&finalr).unwrap_or_default();
-                                                        if !s.is_empty() { let _ = data_tx.send(s); }
-                                                    }
-                                                    DecodingState::Running => {
-                                                        let partial = rec.partial_result();
-                                                        let s = serde_json::to_string(&partial).unwrap_or_default();
-                                                        if !s.is_empty() { let _ = data_tx.send(s); }
-                                                    }
-                                                    DecodingState::Failed => { let _ = data_tx.send("decoding failed".to_string()); }
-                                                },
-                                                Err(e) => { let _ = data_tx.send(format!("accept_waveform error: {}", e)); }
-                                            }
-                                        },
-                                        move |err| { let _ = err_tx.send(format!("audio input error: {:?}", err)); },
-                                        None,
-                                    )
-                                }
-                                SampleFormat::I16 => {
-                                    let recognizer = Arc::new(Mutex::new(recognizer));
-                                    let r2 = recognizer.clone();
-                                    let data_tx = tx.clone();
-                                    let err_tx = tx.clone();
-                                    dev.build_input_stream(
-                                        &stream_config,
-                                        move |data: &[i16], _| {
-                                            let mut rec = r2.lock().unwrap();
-                                            match rec.accept_waveform(data) {
-                                                Ok(state) => match state {
-                                                    DecodingState::Finalized => {
-                                                        let finalr = rec.final_result();
-                                                        let s = serde_json::to_string(&finalr).unwrap_or_default();
-                                                        if !s.is_empty() { let _ = data_tx.send(s); }
-                                                    }
-                                                    DecodingState::Running => {
-                                                        let partial = rec.partial_result();
-                                                        let s = serde_json::to_string(&partial).unwrap_or_default();
-                                                        if !s.is_empty() { let _ = data_tx.send(s); }
-                                                    }
-                                                    DecodingState::Failed => { let _ = data_tx.send("decoding failed".to_string()); }
-                                                },
-                                                Err(e) => { let _ = data_tx.send(format!("accept_waveform error: {}", e)); }
-                                            }
-                                        },
-                                        move |err| { let _ = err_tx.send(format!("audio input error: {:?}", err)); },
-                                        None,
-                                    )
-                                }
-                                SampleFormat::U16 => {
-                                    let recognizer = Arc::new(Mutex::new(recognizer));
-                                    let r2 = recognizer.clone();
-                                    let data_tx = tx.clone();
-                                    let err_tx = tx.clone();
-                                    dev.build_input_stream(
-                                        &stream_config,
-                                        move |data: &[u16], _| {
-                                            let buf: Vec<i16> = data.iter().map(|&s| (s as i32 - 32768) as i16).collect();
-                                            let mut rec = r2.lock().unwrap();
-                                            match rec.accept_waveform(&buf) {
-                                                Ok(state) => match state {
-                                                    DecodingState::Finalized => {
-                                                        let finalr = rec.final_result();
-                                                        let s = serde_json::to_string(&finalr).unwrap_or_default();
-                                                        if !s.is_empty() { let _ = data_tx.send(s); }
-                                                    }
-                                                    DecodingState::Running => {
-                                                        let partial = rec.partial_result();
-                                                        let s = serde_json::to_string(&partial).unwrap_or_default();
-                                                        if !s.is_empty() { let _ = data_tx.send(s); }
-                                                    }
-                                                    DecodingState::Failed => { let _ = data_tx.send("decoding failed".to_string()); }
-                                                },
-                                                Err(e) => { let _ = data_tx.send(format!("accept_waveform error: {}", e)); }
-                                            }
-                                        },
-                                        move |err| { let _ = err_tx.send(format!("audio input error: {:?}", err)); },
-                                        None,
-                                    )
-                                }
-                                _ => { let _ = tx.send("unsupported sample format".to_string()); continue; }
-                            };
-
-                            match build_result {
-                                Ok(s) => {
-                                    if let Err(e) = s.play() {
-                                        let _ = tx.send(format!("[dbg] play failed on {}: {}", dev_name, e));
-                                        continue;
+                                let attempt = match cfg.sample_format() {
+                                    SampleFormat::F32 => {
+                                        let r2 = recognizer.clone();
+                                        let data_tx = tx.clone();
+                                        let err_tx = tx.clone();
+                                        dev.build_input_stream(
+                                            &stream_config,
+                                            move |data: &[f32], _| {
+                                                let mut rec = r2.lock().unwrap();
+                                                let buf: Vec<i16> = data.iter().map(|&s| (s * i16::MAX as f32) as i16).collect();
+                                                match rec.accept_waveform(&buf) {
+                                                    Ok(state) => match state {
+                                                        DecodingState::Finalized => {
+                                                            let finalr = rec.final_result();
+                                                            let s = serde_json::to_string(&finalr).unwrap_or_default();
+                                                            if !s.is_empty() { let _ = data_tx.send(s); }
+                                                        }
+                                                        DecodingState::Running => {
+                                                            let partial = rec.partial_result();
+                                                            let s = serde_json::to_string(&partial).unwrap_or_default();
+                                                            if !s.is_empty() { let _ = data_tx.send(s); }
+                                                        }
+                                                        DecodingState::Failed => { let _ = data_tx.send("decoding failed".to_string()); }
+                                                    },
+                                                    Err(e) => { let _ = data_tx.send(format!("accept_waveform error: {}", e)); }
+                                                }
+                                            },
+                                            move |err| { let _ = err_tx.send(format!("audio input error: {:?}", err)); },
+                                            None,
+                                        )
                                     }
-                                    stream_opt = Some(s);
-                                    break;
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(format!("[dbg] build_input_stream failed on {}: {:?}", dev_name, e));
-                                    continue;
+                                    SampleFormat::I16 => {
+                                        let r2 = recognizer.clone();
+                                        let data_tx = tx.clone();
+                                        let err_tx = tx.clone();
+                                        dev.build_input_stream(
+                                            &stream_config,
+                                            move |data: &[i16], _| {
+                                                let mut rec = r2.lock().unwrap();
+                                                match rec.accept_waveform(data) {
+                                                    Ok(state) => match state {
+                                                        DecodingState::Finalized => {
+                                                            let finalr = rec.final_result();
+                                                            let s = serde_json::to_string(&finalr).unwrap_or_default();
+                                                            if !s.is_empty() { let _ = data_tx.send(s); }
+                                                        }
+                                                        DecodingState::Running => {
+                                                            let partial = rec.partial_result();
+                                                            let s = serde_json::to_string(&partial).unwrap_or_default();
+                                                            if !s.is_empty() { let _ = data_tx.send(s); }
+                                                        }
+                                                        DecodingState::Failed => { let _ = data_tx.send("decoding failed".to_string()); }
+                                                    },
+                                                    Err(e) => { let _ = data_tx.send(format!("accept_waveform error: {}", e)); }
+                                                }
+                                            },
+                                            move |err| { let _ = err_tx.send(format!("audio input error: {:?}", err)); },
+                                            None,
+                                        )
+                                    }
+                                    SampleFormat::U16 => {
+                                        let r2 = recognizer.clone();
+                                        let data_tx = tx.clone();
+                                        let err_tx = tx.clone();
+                                        dev.build_input_stream(
+                                            &stream_config,
+                                            move |data: &[u16], _| {
+                                                let buf: Vec<i16> = data.iter().map(|&s| (s as i32 - 32768) as i16).collect();
+                                                let mut rec = r2.lock().unwrap();
+                                                match rec.accept_waveform(&buf) {
+                                                    Ok(state) => match state {
+                                                        DecodingState::Finalized => {
+                                                            let finalr = rec.final_result();
+                                                            let s = serde_json::to_string(&finalr).unwrap_or_default();
+                                                            if !s.is_empty() { let _ = data_tx.send(s); }
+                                                        }
+                                                        DecodingState::Running => {
+                                                            let partial = rec.partial_result();
+                                                            let s = serde_json::to_string(&partial).unwrap_or_default();
+                                                            if !s.is_empty() { let _ = data_tx.send(s); }
+                                                        }
+                                                        DecodingState::Failed => { let _ = data_tx.send("decoding failed".to_string()); }
+                                                    },
+                                                    Err(e) => { let _ = data_tx.send(format!("accept_waveform error: {}", e)); }
+                                                }
+                                            },
+                                            move |err| { let _ = err_tx.send(format!("audio input error: {:?}", err)); },
+                                            None,
+                                        )
+                                    }
+                                    _ => { let _ = tx.send("unsupported sample format".to_string()); continue; }
+                                };
+
+                                match attempt {
+                                    Ok(s) => {
+                                        match s.play() {
+                                            Ok(()) => { stream_opt = Some(s); succeeded = true; break; }
+                                            Err(e) => { let _ = tx.send(format!("[dbg] play failed on {} buf={:?}: {}", dev_name, buf, e)); }
+                                        }
+                                    }
+                                    Err(e) => { let _ = tx.send(format!("[dbg] build_input_stream failed on {} buf={:?}: {:?}", dev_name, buf, e)); }
                                 }
                             }
+
+                            if succeeded { break; }
                         }
 
                         if stream_opt.is_some() { break; }

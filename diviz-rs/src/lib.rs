@@ -650,6 +650,7 @@ struct LoadedImage {
     spacing_between_slices: Option<f32>,
     image_position_patient: Option<[f32; 3]>,
     image_orientation_patient: Option<[f32; 6]>,
+    study_uid: Option<String>,
 }
 
 impl LoadedImage {
@@ -868,6 +869,8 @@ fn decode_single_file(path: &PathBuf) -> Result<LoadedImage, String> {
         _ => format!("Series - {}", series_desc),
     };
 
+    let study_uid = get_str(Tag(0x0020, 0x000D));
+
     let rescale_intercept = get_f32(Tag(0x0028, 0x1052)).unwrap_or(0.0);
     let rescale_slope = get_f32(Tag(0x0028, 0x1053)).unwrap_or(1.0);
     let wc_dicom = get_f32(Tag(0x0028, 0x1050));
@@ -989,6 +992,7 @@ fn decode_single_file(path: &PathBuf) -> Result<LoadedImage, String> {
         spacing_between_slices,
         image_position_patient,
         image_orientation_patient,
+        study_uid,
     })
 }
 
@@ -1166,6 +1170,89 @@ impl DicomViewApp {
             MprPlane::Coronal => self.vp_mut().current_coronal_slice = index,
             MprPlane::Sagittal => self.vp_mut().current_sagittal_slice = index,
         }
+    }
+
+    // Return plane geometry for a viewport: origin (patient), normal, column_dir, row_dir, col_spacing, row_spacing, width, height
+    fn viewport_plane(&self, idx: usize) -> Option<([f32; 3], [f32; 3], [f32; 3], [f32; 3], f32, f32, usize, usize)> {
+        let vp = self.viewports.get(idx)?;
+        if vp.view_mode == ViewMode::Mpr {
+            let vol = self.mpr_volume.as_ref()?;
+            let col_dir = vol.column_dir;
+            let row_dir = vol.row_dir;
+            let normal = vol.slice_dir;
+            let origin = add(vol.origin, scale(vol.slice_dir, vp.current_axial_slice as f32 * vol.slice_spacing));
+            return Some((origin, normal, col_dir, row_dir, vol.col_spacing, vol.row_spacing, vol.width, vol.height));
+        } else {
+            let group = self.series_groups.get(vp.current_series)?;
+            let idx_in_group = vp.current_stack_slice.min(group.image_indices.len().saturating_sub(1));
+            let img = self.images.get(*group.image_indices.get(idx_in_group)?)?;
+            let pos = img.image_position_patient?;
+            let orient = img.image_orientation_patient?;
+            let col_dir = [orient[0], orient[1], orient[2]];
+            let row_dir = [orient[3], orient[4], orient[5]];
+            let normal = normalize(cross(col_dir, row_dir))?;
+            let pixel_spacing = img.pixel_spacing.unwrap_or([1.0, 1.0]);
+            let (w, h) = img.raw_image.dimensions();
+            return Some((pos, normal, col_dir, row_dir, pixel_spacing[1].abs().max(0.001), pixel_spacing[0].abs().max(0.001), w, h));
+        }
+    }
+
+    // Intersect two planes (n1·x = d1, n2·x = d2). Returns (point_on_line, direction)
+    fn intersect_planes(n1: [f32; 3], p1: [f32; 3], n2: [f32; 3], p2: [f32; 3]) -> Option<([f32; 3], [f32; 3])> {
+        let d1 = dot(n1, p1);
+        let d2 = dot(n2, p2);
+        let dir = cross(n1, n2);
+        let denom = dot(dir, dir);
+        if denom.abs() < 1e-6 {
+            return None;
+        }
+        // point = ( (d1 * (n2 x dir)) + (d2 * (dir x n1)) ) / denom
+        let term1 = scale(cross(n2, dir), d1);
+        let term2 = scale(cross(dir, n1), d2);
+        let point = scale(add(term1, term2), 1.0 / denom);
+        Some((point, dir))
+    }
+
+    // Project a patient-space point into image pixel coordinates for a viewport plane
+    fn project_point_to_pixel(
+        &self,
+        origin: [f32; 3],
+        col_dir: [f32; 3],
+        row_dir: [f32; 3],
+        col_spacing: f32,
+        row_spacing: f32,
+        p: [f32; 3],
+    ) -> (f32, f32) {
+        let v = sub(p, origin);
+        let u = dot(v, col_dir) / col_spacing; // column index
+        let vcoord = dot(v, row_dir) / row_spacing; // row index
+        (u, vcoord)
+    }
+
+    // Convert image pixel coords to screen pos inside a cell (handles pan/zoom/rotation similar to texture drawing)
+    fn pixel_to_screen(
+        &self,
+        u: f32,
+        v: f32,
+        img_w: f32,
+        img_h: f32,
+        cell_rect: egui::Rect,
+        vp: &ViewportState,
+    ) -> egui::Pos2 {
+        let physical_size = vp.displayed_physical_size.unwrap_or_else(|| egui::vec2(img_w, img_h));
+        let display = if vp.view_mode == ViewMode::Mpr && !vp.scale_by_physical {
+            let fit = (cell_rect.width() / img_w).min(cell_rect.height() / img_h);
+            egui::vec2(img_w * fit * vp.zoom, img_h * fit * vp.zoom)
+        } else {
+            let fit = (cell_rect.width() / physical_size.x).min(cell_rect.height() / physical_size.y);
+            egui::vec2(physical_size.x * fit * vp.zoom, physical_size.y * fit * vp.zoom)
+        };
+        let center = cell_rect.center() + vp.pan;
+        // pixel coords origin top-left; convert to centered coordinates
+        let dx = (u - img_w * 0.5) * (display.x / img_w);
+        let dy = (v - img_h * 0.5) * (display.y / img_h);
+        let rotated = rotate_vec2(egui::vec2(dx, dy), vp.rotation_degrees.to_radians());
+        center + rotated
     }
 
     // --- Recent folders persistence ---------------------------------
@@ -1755,7 +1842,36 @@ impl eframe::App for DicomViewApp {
             let Some(active_image) = self.metadata_image() else {
                 return;
             };
-            let metadata = &active_image.metadata;
+            // Build metadata list from DICOM tags plus derived fields
+            let mut metadata = active_image.metadata.clone();
+
+            if let Some(study) = &active_image.study_uid {
+                metadata.push(("Study Instance UID".to_string(), study.clone()));
+            }
+            metadata.push(("Series UID".to_string(), active_image.series_uid.clone()));
+
+            if let Some(pos) = active_image.image_position_patient {
+                metadata.push((
+                    "Image Position (Patient)".to_string(),
+                    format!("{:.4}, {:.4}, {:.4}", pos[0], pos[1], pos[2]),
+                ));
+            }
+            if let Some(orient) = active_image.image_orientation_patient {
+                metadata.push((
+                    "Image Orientation (Patient)".to_string(),
+                    format!("{:.6}, {:.6}, {:.6}, {:.6}, {:.6}, {:.6}", orient[0], orient[1], orient[2], orient[3], orient[4], orient[5]),
+                ));
+            }
+            if let Some(sp) = active_image.pixel_spacing {
+                metadata.push(("Pixel Spacing".to_string(), format!("{:.6} \\ {:.6}", sp[0], sp[1])));
+            }
+            if let Some(st) = active_image.slice_thickness {
+                metadata.push(("Slice Thickness".to_string(), format!("{:.6}", st)));
+            }
+            if let Some(sbs) = active_image.spacing_between_slices {
+                metadata.push(("Spacing Between Slices".to_string(), format!("{:.6}", sbs)));
+            }
+
             if !metadata.is_empty() {
                 egui::SidePanel::right("metadata_panel")
                     .min_width(180.0)
@@ -1768,7 +1884,7 @@ impl eframe::App for DicomViewApp {
                                 .num_columns(2)
                                 .striped(true)
                                 .show(ui, |ui| {
-                                    for (label, value) in metadata {
+                                    for (label, value) in &metadata {
                                         ui.strong(label);
                                         ui.label(value);
                                         ui.end_row();
@@ -1819,6 +1935,7 @@ impl eframe::App for DicomViewApp {
                     let rect = ui.available_rect_before_wrap();
                     let cell_w = rect.width() / (cols as f32);
                     let cell_h = rect.height() / (rows as f32);
+                    let mut vp_anchors: Vec<(usize, egui::Pos2, Option<String>, egui::Rect)> = Vec::new();
                     for r in 0..rows {
                         for c in 0..cols {
                             let idx = r * cols + c;
@@ -1837,7 +1954,7 @@ impl eframe::App for DicomViewApp {
                             painter.line_segment([cell_rect.right_bottom(), cell_rect.left_bottom()], stroke);
                             painter.line_segment([cell_rect.left_bottom(), cell_rect.left_top()], stroke);
 
-                            // Draw texture or placeholder
+                                // Draw texture or placeholder
                             if let Some(tex) = self.viewport_textures.get(idx).and_then(|o| o.clone()) {
                                 let tex_size = tex.size();
                                 let img_w = tex_size[0] as f32;
@@ -1972,6 +2089,75 @@ impl eframe::App for DicomViewApp {
 
                             if response.clicked() {
                                 self.active_viewport = idx;
+                            }
+
+                            // record slice anchor point for cross-references (position along the displayed image)
+                            if let Some(_tex) = self.viewport_textures.get(idx).and_then(|o| o.clone()) {
+                                let vp = &self.viewports[idx];
+                                // determine study id for this viewport's series (use first image in the series)
+                                let study_id = self.series_groups.get(vp.current_series).and_then(|g| g.image_indices.first()).and_then(|first_idx| self.images.get(*first_idx)).and_then(|img| img.study_uid.clone());
+
+                                // compute normalized slice position t in [0,1]
+                                let mut t_opt: Option<f32> = None;
+                                if vp.view_mode == ViewMode::Stack {
+                                    if let Some(group) = self.series_groups.get(vp.current_series) {
+                                        let mut positions: Vec<f32> = group
+                                            .image_indices
+                                            .iter()
+                                            .filter_map(|&gi| self.images.get(gi).map(|img| img.slice_position()))
+                                            .collect();
+                                        if !positions.is_empty() {
+                                            let minp = positions.iter().cloned().fold(f32::INFINITY, f32::min);
+                                            let maxp = positions.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                                            let cur_idx = vp.current_stack_slice.min(group.image_indices.len().saturating_sub(1));
+                                            if let Some(img) = self.images.get(group.image_indices[cur_idx]) {
+                                                let pos = img.slice_position();
+                                                if (maxp - minp).abs() > 1e-6 {
+                                                    t_opt = Some(((pos - minp) / (maxp - minp)).clamp(0.0, 1.0));
+                                                } else if group.image_indices.len() > 1 {
+                                                    t_opt = Some(cur_idx as f32 / (group.image_indices.len() - 1) as f32);
+                                                } else {
+                                                    t_opt = Some(0.5);
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    if let Some(volume) = &self.mpr_volume {
+                                        let len = volume.plane_len(vp.mpr_plane) as usize;
+                                        if len > 1 {
+                                            let cur = match vp.mpr_plane {
+                                                MprPlane::Axial => vp.current_axial_slice,
+                                                MprPlane::Coronal => vp.current_coronal_slice,
+                                                MprPlane::Sagittal => vp.current_sagittal_slice,
+                                            } as usize;
+                                            t_opt = Some((cur as f32 / (len - 1) as f32).clamp(0.0, 1.0));
+                                        }
+                                    }
+                                }
+
+                                if let Some(t) = t_opt {
+                                    // `display` and `center` were computed earlier for this viewport rendering
+                                    let tex_size = self.viewport_textures.get(idx).and_then(|o| o.as_ref()).map(|t| t.size());
+                                    // fallback: use cell_rect if texture size not available
+                                    let display_h = if let Some(sz) = tex_size { sz[1] as f32 } else { cell_rect.height() };
+                                    // We can reuse the previously computed `display` if available by recomputing similarly
+                                    let img_w = tex_size.map(|s| s[0] as f32).unwrap_or(cell_rect.width());
+                                    let img_h = tex_size.map(|s| s[1] as f32).unwrap_or(cell_rect.height());
+                                    let physical_size = vp.displayed_physical_size.unwrap_or_else(|| egui::vec2(img_w, img_h));
+                                    let display = if vp.view_mode == ViewMode::Mpr && !vp.scale_by_physical {
+                                        let fit = (cell_rect.width() / img_w).min(cell_rect.height() / img_h);
+                                        egui::vec2(img_w * fit * vp.zoom, img_h * fit * vp.zoom)
+                                    } else {
+                                        let fit = (cell_rect.width() / physical_size.x).min(cell_rect.height() / physical_size.y);
+                                        egui::vec2(physical_size.x * fit * vp.zoom, physical_size.y * fit * vp.zoom)
+                                    };
+                                    let center = cell_rect.center() + vp.pan;
+                                    let top = center.y - display.y * 0.5;
+                                    let y = top + t * display.y;
+                                    let anchor = egui::pos2(center.x, y);
+                                    vp_anchors.push((idx, anchor, study_id, cell_rect));
+                                }
                             }
 
                             // Per-cell scroll: change slice (if stack/MPR) or zoom (single image)
@@ -2134,9 +2320,128 @@ impl eframe::App for DicomViewApp {
 
                                 self.active_viewport = prev_active;
                             }
+
                         }
                     }
-                    return;
+
+                    // Draw cross-reference lines between viewports that belong to the same study
+                    if !vp_anchors.is_empty() {
+                        let painter = ui.painter();
+                        // Draw debug anchors (small circles) so we can verify positions
+                        for (_, anchor, _study, _rect) in &vp_anchors {
+                            painter.circle_filled(*anchor, 4.0, egui::Color32::from_rgba_unmultiplied(255, 200, 0, 200));
+                        }
+                        for i in 0..vp_anchors.len() {
+                                for j in (i + 1)..vp_anchors.len() {
+                                let (ia, anchor_a, study_a, rect_a) = &vp_anchors[i];
+                                let (ib, anchor_b, study_b, rect_b) = &vp_anchors[j];
+                                if let (Some(s1), Some(s2)) = (study_a, study_b) {
+                                    if !s1.is_empty() && s1 == s2 {
+                                        // compute plane geometry for both viewports
+                                        if let (Some((orig_a, n_a, col_a, row_a, col_sp_a, row_sp_a, w_a, h_a)),
+                                                Some((orig_b, n_b, col_b, row_b, col_sp_b, row_sp_b, w_b, h_b))) =
+                                            (self.viewport_plane(*ia), self.viewport_plane(*ib))
+                                        {
+                                            // intersect planes
+                                            if let Some((p0, dir)) = Self::intersect_planes(n_a, orig_a, n_b, orig_b) {
+                                                // for target B, find t range where projected (u,v) within image bounds
+                                                let a_u = dot(sub(p0, orig_b), col_b) / col_sp_b;
+                                                let b_u = dot(dir, col_b) / col_sp_b;
+                                                let a_v = dot(sub(p0, orig_b), row_b) / row_sp_b;
+                                                let b_v = dot(dir, row_b) / row_sp_b;
+
+                                                let mut t_min = f32::NEG_INFINITY;
+                                                let mut t_max = f32::INFINITY;
+
+                                                // u bounds [0, w_b-1]
+                                                let ub0 = 0.0_f32;
+                                                let ub1 = (w_b as f32) - 1.0;
+                                                if b_u.abs() < 1e-6 {
+                                                    if a_u < ub0 || a_u > ub1 {
+                                                        continue;
+                                                    }
+                                                } else {
+                                                    let t1 = (ub0 - a_u) / b_u;
+                                                    let t2 = (ub1 - a_u) / b_u;
+                                                    let (ta, tb) = if t1 < t2 { (t1, t2) } else { (t2, t1) };
+                                                    t_min = t_min.max(ta);
+                                                    t_max = t_max.min(tb);
+                                                }
+
+                                                // v bounds [0, h_b-1]
+                                                let vb0 = 0.0_f32;
+                                                let vb1 = (h_b as f32) - 1.0;
+                                                if b_v.abs() < 1e-6 {
+                                                    if a_v < vb0 || a_v > vb1 {
+                                                        continue;
+                                                    }
+                                                } else {
+                                                    let t1 = (vb0 - a_v) / b_v;
+                                                    let t2 = (vb1 - a_v) / b_v;
+                                                    let (ta, tb) = if t1 < t2 { (t1, t2) } else { (t2, t1) };
+                                                    t_min = t_min.max(ta);
+                                                    t_max = t_max.min(tb);
+                                                }
+
+                                                if t_min <= t_max && t_min.is_finite() && t_max.is_finite() {
+                                                    // compute endpoints in patient space
+                                                    let p_start = add(p0, scale(dir, t_min));
+                                                    let p_end = add(p0, scale(dir, t_max));
+
+                                                    // project into B pixel coords then to screen
+                                                    let (u0, v0) = self.project_point_to_pixel(orig_b, col_b, row_b, col_sp_b, row_sp_b, p_start);
+                                                    let (u1, v1) = self.project_point_to_pixel(orig_b, col_b, row_b, col_sp_b, row_sp_b, p_end);
+                                                    // convert to screen positions inside the stored cell rect for ib
+                                                    let cell_rect = *rect_b;
+                                                    let vp_b = &self.viewports[*ib];
+                                                    let screen_p0 = self.pixel_to_screen(u0, v0, w_b as f32, h_b as f32, cell_rect, vp_b);
+                                                    let screen_p1 = self.pixel_to_screen(u1, v1, w_b as f32, h_b as f32, cell_rect, vp_b);
+                                                    // draw endpoint markers for debugging (only if finite)
+                                                    if screen_p0.x.is_finite() && screen_p0.y.is_finite() {
+                                                        painter.circle_filled(screen_p0, 3.0, egui::Color32::from_rgba_unmultiplied(220, 40, 40, 220));
+                                                    }
+                                                    if screen_p1.x.is_finite() && screen_p1.y.is_finite() {
+                                                        painter.circle_filled(screen_p1, 3.0, egui::Color32::from_rgba_unmultiplied(220, 40, 40, 220));
+                                                    }
+                                                    // Log details to stderr to aid debugging (captured in terminal)
+                                                    // More detailed debug: include display/center/dx/dy and viewport zoom/pan
+                                                    let vp_debug = vp_b;
+                                                    // compute display and center the same way pixel_to_screen does
+                                                    let physical_size = vp_debug.displayed_physical_size.unwrap_or_else(|| egui::vec2(w_b as f32, h_b as f32));
+                                                    let display = if vp_debug.view_mode == ViewMode::Mpr && !vp_debug.scale_by_physical {
+                                                        let fit = (cell_rect.width() / (w_b as f32)).min(cell_rect.height() / (h_b as f32));
+                                                        egui::vec2((w_b as f32) * fit * vp_debug.zoom, (h_b as f32) * fit * vp_debug.zoom)
+                                                    } else {
+                                                        let fit = (cell_rect.width() / physical_size.x).min(cell_rect.height() / physical_size.y);
+                                                        egui::vec2(physical_size.x * fit * vp_debug.zoom, physical_size.y * fit * vp_debug.zoom)
+                                                    };
+                                                    let center = cell_rect.center() + vp_debug.pan;
+                                                    let dx0 = (u0 - (w_b as f32) * 0.5) * (display.x / (w_b as f32));
+                                                    let dy0 = (v0 - (h_b as f32) * 0.5) * (display.y / (h_b as f32));
+                                                    let dx1 = (u1 - (w_b as f32) * 0.5) * (display.x / (w_b as f32));
+                                                    let dy1 = (v1 - (h_b as f32) * 0.5) * (display.y / (h_b as f32));
+                                                    eprintln!("[xref] ia={} ib={} zoom={} pan={:?} display={:?} center={:?} dx0={:.3} dy0={:.3} dx1={:.3} dy1={:.3} u0={:.2} v0={:.2} u1={:.2} v1={:.2} screen_p0={:?} screen_p1={:?}", ia, ib, vp_debug.zoom, vp_debug.pan, display, center, dx0, dy0, dx1, dy1, u0, v0, u1, v1, screen_p0, screen_p1);
+                                                    painter.line_segment([screen_p0, screen_p1], egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(200, 40, 40, 220)));
+                                                    // Debug: draw projected pixel coordinates near anchor B
+                                                    let info = format!("u0={:.1},v0={:.1}\nu1={:.1},v1={:.1}", u0, v0, u1, v1);
+                                                    painter.text(*anchor_b + egui::vec2(6.0, 6.0), egui::Align2::LEFT_TOP, info, egui::FontId::monospace(12.0), egui::Color32::WHITE);
+                                                } else {
+                                                    // intersection produced no visible segment on target; fall back to anchor-to-anchor line for visibility
+                                                }
+                                            }
+                                        }
+                                        // Fallback: draw a faint line between the computed anchors so user can see relation
+                                        let anchor_a_pos = *anchor_a;
+                                        let anchor_b_pos = *anchor_b;
+                                        painter.line_segment([
+                                            anchor_a_pos,
+                                            anchor_b_pos,
+                                        ], egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(100, 160, 240, 140)));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 if active_tex.is_none() {
@@ -2512,6 +2817,7 @@ mod tests {
             series_label: "Series 1".to_string(),
             instance_number: Some(instance_number),
             default_wc_ww: Some((0.0, 1.0)),
+            study_uid: None,
             pixel_spacing: Some(pixel_spacing),
             slice_thickness: Some(2.0),
             spacing_between_slices: Some(2.0),
