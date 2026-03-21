@@ -39,7 +39,9 @@ fn device_and_software_tags_are_anonymised() {
     let out_bytes = std::fs::read(&res).expect("read out");
     let out_text = String::from_utf8_lossy(&out_bytes).to_lowercase();
 
-    for s in &["acme medical", "model x", "sn-12345", "v1.2.3"] {
+    // ManufacturerModelName (0008,1090) is preserved (but sanitized), the others should be removed
+    assert!(out_text.contains("model x"), "expected model x to be preserved/sanitized");
+    for s in &["acme medical", "sn-12345", "v1.2.3"] {
         assert!(!out_text.contains(s), "found '{}' in anonymised output", s);
     }
 }

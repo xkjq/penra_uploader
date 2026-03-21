@@ -10,6 +10,15 @@ use dicom_core::dictionary::{DataDictionary, DataDictionaryEntry};
 use dicom_dictionary_std::StandardDataDictionary;
 use copypasta::{ClipboardContext, ClipboardProvider};
 
+fn copy_text_to_clipboard(ctx: &egui::Context, txt: &str) {
+    ctx.output_mut(|o| {
+        o.commands.push(egui::output::OutputCommand::CopyText(txt.to_owned()));
+    });
+    if let Ok(mut clipboard) = ClipboardContext::new() {
+        let _ = clipboard.set_contents(txt.to_owned());
+    }
+}
+
 pub fn run_meta_viewer(paths: Vec<String>) {
     run_meta_viewer_with_mode(paths, MetadataReadMode::InDepth);
 }
@@ -1067,7 +1076,7 @@ impl DivueApp {
                         ui.add_sized([ui.available_width(), 240.0], egui::TextEdit::multiline(&mut tmp).desired_rows(12).lock_focus(true));
                         self.full_text = tmp;
                         if ui.button("Copy to clipboard").clicked() {
-                            // Clipboard API changed in newer egui; keep value visible for manual copy.
+                            copy_text_to_clipboard(ctx, &self.full_text);
                         }
                     });
                 });
@@ -1130,12 +1139,7 @@ impl DivueApp {
                                 }
                                 if ui.button("Copy").clicked() {
                                     if let Some(txt) = &self.context_menu_text {
-                                        // Request egui/eframe to copy text via PlatformOutput command
-                                        ui.ctx().output_mut(|o| o.commands.push(egui::output::OutputCommand::CopyText(txt.clone())));
-                                        // Also attempt direct clipboard write as a best-effort fallback
-                                        if let Ok(mut clipboard) = ClipboardContext::new() {
-                                            let _ = clipboard.set_contents(txt.clone());
-                                        }
+                                        copy_text_to_clipboard(ui.ctx(), txt);
                                     }
                                     self.context_menu_open = false;
                                     self.context_menu_text = None;
@@ -1296,7 +1300,7 @@ impl eframe::App for MetaApp {
                             // reflect edits back into stored string so copy will use edited content
                             self.full_text = tmp;
                             if ui.button("Copy to clipboard").clicked() {
-                                // Clipboard API changed in newer egui; keep value visible for manual copy.
+                                copy_text_to_clipboard(ctx, &self.full_text);
                             }
                         });
                     });

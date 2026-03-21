@@ -60,6 +60,35 @@ fn vr_is_safe_private(vr: VR) -> bool {
     )
 }
 
+fn sanitize_text_field(s: &str, orig_name: &str, orig_pid: &str, shift_days: i64) -> String {
+    let mut out_tokens: Vec<String> = Vec::new();
+    let name_lc = orig_name.to_lowercase();
+    let pid_lc = orig_pid.to_lowercase();
+    for tok in s.split_whitespace() {
+        let t = tok.trim_matches(|c: char| !c.is_alphanumeric() && c != '@' && c != '.' && c != '-');
+        if t.is_empty() { continue; }
+        let tl = t.to_lowercase();
+        if !name_lc.is_empty() && tl.contains(&name_lc) { continue; }
+        if !pid_lc.is_empty() && tl.contains(&pid_lc) { continue; }
+        if tl.contains('@') && tl.contains('.') { continue; }
+        // check for 8-digit YYYYMMDD dates and replace with shifted date
+        if t.len() == 8 && t.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(dt) = NaiveDate::parse_from_str(t, "%Y%m%d") {
+                let shifted = dt + Duration::days(shift_days);
+                out_tokens.push(shifted.format("%Y%m%d").to_string());
+                continue;
+            } else {
+                // if not a valid date, drop if it's long numeric
+                continue;
+            }
+        }
+        let digits_only: String = t.chars().filter(|c| c.is_ascii_digit()).collect();
+        if digits_only.len() >= 6 { continue; }
+        out_tokens.push(tok.to_string());
+    }
+    out_tokens.join(" ").trim().to_string()
+}
+
 fn process_inmem_top<D: dicom_core::DataDictionary + Clone>(
     ds: &mut dicom_object::InMemDicomObject<D>,
     study_uid: &str,
@@ -184,8 +213,34 @@ fn process_inmem_top<D: dicom_core::DataDictionary + Clone>(
             }
         }
 
-        if text_vrs.contains(&el.vr()) && !vr_whitelist.contains(&t) {
-            puts.push((t, el.vr(), "".to_string()));
+        if text_vrs.contains(&el.vr()) {
+            if !vr_whitelist.contains(&t) {
+                // default behavior: blank non-whitelisted text VRs
+                puts.push((t, el.vr(), "".to_string()));
+                continue;
+            }
+            // For whitelisted text tags (preserved descriptive fields), sanitize content
+            // but skip patient name/id which are handled separately.
+            if t == Tag(0x0010,0x0010) || t == Tag(0x0010,0x0020) {
+                continue;
+            }
+            // derive original patient name/id from map keys if available
+            let mut orig_name = String::new();
+            let mut orig_pid = String::new();
+            for k in map.keys() {
+                if k.starts_with("PatientName:") {
+                    orig_name = k["PatientName:".len()..].to_string();
+                }
+                if k.starts_with("PatientID:") {
+                    orig_pid = k["PatientID:".len()..].to_string();
+                }
+            }
+            if let Ok(s) = el.to_str() {
+                let cleaned = sanitize_text_field(&s, &orig_name, &orig_pid, shift_date_by_study(study_uid, seed));
+                puts.push((t, el.vr(), cleaned));
+            } else {
+                puts.push((t, el.vr(), "".to_string()));
+            }
             continue;
         }
 
@@ -390,8 +445,34 @@ fn process_file<D: dicom_core::DataDictionary + Clone>(
                 continue;
             }
         }
-        if text_vrs.contains(&el.vr()) && !vr_whitelist.contains(&t) {
-            puts.push((t, el.vr(), "".to_string()));
+        if text_vrs.contains(&el.vr()) {
+            if !vr_whitelist.contains(&t) {
+                // default behavior: blank non-whitelisted text VRs
+                puts.push((t, el.vr(), "".to_string()));
+                continue;
+            }
+            // For whitelisted text tags (preserved descriptive fields), sanitize content
+            // but skip patient name/id which are handled separately.
+            if t == Tag(0x0010,0x0010) || t == Tag(0x0010,0x0020) {
+                continue;
+            }
+            // derive original patient name/id from map keys if available
+            let mut orig_name = String::new();
+            let mut orig_pid = String::new();
+            for k in map.keys() {
+                if k.starts_with("PatientName:") {
+                    orig_name = k["PatientName:".len()..].to_string();
+                }
+                if k.starts_with("PatientID:") {
+                    orig_pid = k["PatientID:".len()..].to_string();
+                }
+            }
+            if let Ok(s) = el.to_str() {
+                let cleaned = sanitize_text_field(&s, &orig_name, &orig_pid, shift_date_by_study(study_uid, seed));
+                puts.push((t, el.vr(), cleaned));
+            } else {
+                puts.push((t, el.vr(), "".to_string()));
+            }
             continue;
         }
         if el.vr() == VR::DA || date_tags.contains(&t) {
@@ -505,6 +586,9 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, pr
 
     let shift_days = shift_date_by_study(&study_uid, seed);
 
+    // Capture original PatientID (for PHI scanning inside free-text)
+    let orig_patient_id = obj.element(Tag(0x0010,0x0020)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()).unwrap_or_else(|| String::new());
+
     let _ = obj.put_str(Tag(0x0010, 0x0010), VR::PN, &pn);
     let _ = obj.put_str(Tag(0x0010, 0x0020), VR::LO, &pid);
 
@@ -556,9 +640,10 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, pr
     use dicom_object::InMemDicomObject;
 
     let text_vrs = vec![VR::UT, VR::LT, VR::SH, VR::LO, VR::PN];
-    let vr_whitelist = vec![Tag(0x0010,0x0010), Tag(0x0010,0x0020)];
-
-    
+    let mut vr_whitelist = vec![Tag(0x0010,0x0010), Tag(0x0010,0x0020)];
+    // Preserve these descriptive fields but sanitize their content for PHI
+    let preserve_text_tags = vec![Tag(0x0008,0x1030), Tag(0x0008,0x103E), Tag(0x0008,0x1090)];
+    for t in &preserve_text_tags { vr_whitelist.push(*t); }
 
     for tag in &clear_tags {
         if let Ok(elem) = obj.element(*tag) {
@@ -638,6 +723,22 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, pr
     process_file(&mut obj, &study_uid, preserve_private, seed, &clear_tags, &date_tags, &mut map, &text_vrs, &vr_whitelist);
 
     // (private tags restoration will be applied below)
+
+    // Sanitize preserved descriptive text fields for likely PHI tokens
+    if let Ok(orig_name_el) = obj.element(Tag(0x0010,0x0010)) {
+        let orig_name = orig_name_el.to_str().ok().map(|s| s.to_string()).unwrap_or_else(|| String::new());
+        for tag in &preserve_text_tags {
+            if let Ok(el) = obj.element(*tag) {
+                    if let Ok(s) = el.to_str() {
+                        let s_owned = s.to_string();
+                        let vr = el.vr();
+                        let _ = el;
+                        let cleaned = sanitize_text_field(&s_owned, &orig_name, &orig_patient_id, shift_days);
+                        let _ = obj.put_str(*tag, vr, &cleaned);
+                    }
+                }
+        }
+    }
 
     let date_tags = vec![Tag(0x0008,0x0020), Tag(0x0008,0x0021), Tag(0x0008,0x0022), Tag(0x0008,0x0023), Tag(0x0010,0x0030)];
     for tag in date_tags {
