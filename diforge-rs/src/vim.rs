@@ -307,6 +307,72 @@ impl ReportBuffer {
         } else { e };
         self.set_caret_pos(target);
     }
+
+    /// Shared Normal-mode key handler used by the app and tests.
+    /// Returns `true` when the caller should request focus (i.e., entering Insert mode).
+    pub fn handle_normal_key(
+        buffer: &mut ReportBuffer,
+        vim_mode: &mut crate::VimMode,
+        last_vim_key: &mut Option<char>,
+        ch: char,
+    ) -> bool {
+        match ch {
+            'i' => {
+                *vim_mode = crate::VimMode::Insert;
+                *last_vim_key = None;
+                true
+            }
+            'a' => {
+                buffer.move_caret_by(1);
+                *vim_mode = crate::VimMode::Insert;
+                *last_vim_key = None;
+                true
+            }
+            'A' => {
+                buffer.append_at_end_of_line();
+                *vim_mode = crate::VimMode::Insert;
+                *last_vim_key = None;
+                true
+            }
+            'I' => {
+                let (s, _e, _c) = buffer.move_to_line_bounds();
+                buffer.set_caret_pos(s);
+                *vim_mode = crate::VimMode::Insert;
+                *last_vim_key = None;
+                true
+            }
+            'o' => {
+                buffer.open_line_below();
+                *vim_mode = crate::VimMode::Insert;
+                *last_vim_key = None;
+                true
+            }
+            'O' => {
+                buffer.open_line_above();
+                *vim_mode = crate::VimMode::Insert;
+                *last_vim_key = None;
+                true
+            }
+            'h' => { buffer.move_caret_by(-1); *last_vim_key = None; false }
+            'l' => { buffer.move_caret_by(1); *last_vim_key = None; false }
+            'j' => { buffer.move_line_down(); *last_vim_key = None; false }
+            'k' => { buffer.move_line_up(); *last_vim_key = None; false }
+            'w' => { buffer.move_word_forward(); *last_vim_key = None; false }
+            'b' => { buffer.move_word_backward(); *last_vim_key = None; false }
+            'e' => { buffer.move_word_end(); *last_vim_key = None; false }
+            'x' => { buffer.delete_char_at_cursor(); *last_vim_key = None; false }
+            'd' => {
+                if *last_vim_key == Some('d') {
+                    buffer.delete_current_line();
+                    *last_vim_key = None;
+                } else {
+                    *last_vim_key = Some('d');
+                }
+                false
+            }
+            _ => { *last_vim_key = None; false }
+        }
+    }
     pub fn get_caret_line_number(&self) -> usize {
         let chars: Vec<char> = self.report.chars().collect();
         let pos = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
@@ -410,7 +476,9 @@ mod tests {
         b.caret_char_range = Some(0..0);
 
         // 'a' should move caret one character right (append)
-        b.move_caret_by(1);
+        let mut mode = crate::VimMode::Normal;
+        let mut last = None;
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, 'a');
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, 1);
     }
 
@@ -439,7 +507,9 @@ mod tests {
         let (s, _e, _c) = b.move_to_line_bounds();
 
         // 'I' should move caret to the start of the line
-        b.set_caret_pos(s);
+        let mut mode = crate::VimMode::Normal;
+        let mut last = None;
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, 'I');
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, s);
     }
 
