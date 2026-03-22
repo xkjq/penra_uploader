@@ -323,6 +323,82 @@ impl ReportBuffer {
         self.set_caret_pos(target);
     }
 
+    /// Return the start (char index) of the line containing `pos` or the
+    /// start of the previous line when moving upward. Used by operator ranges.
+    fn prev_line_start_from(&self, pos: usize) -> usize {
+        let chars: Vec<char> = self.report.chars().collect();
+        if pos == 0 { return 0; }
+        let mut i = pos.saturating_sub(1);
+        while i > 0 {
+            if chars[i] == '\n' { return i + 1; }
+            i = i.saturating_sub(1);
+        }
+        0
+    }
+
+    /// Delete `count` lines starting at `start_char` (char indices). If the
+    /// requested range extends past EOF, clamp to EOF.
+    fn delete_lines_from(&mut self, start_char: usize, count: usize) {
+        if count == 0 { return; }
+        let chars: Vec<char> = self.report.chars().collect();
+        let n = chars.len();
+        if start_char >= n {
+            return;
+        }
+        let mut end = start_char;
+        let mut lines_deleted = 0usize;
+        while end < n && lines_deleted < count {
+            if let Some(pos) = chars[end..].iter().position(|&c| c == '\n') {
+                end = end + pos + 1; // include the newline
+            } else {
+                end = n;
+            }
+            lines_deleted += 1;
+        }
+        if start_char < end {
+            self.delete_range(start_char, end);
+        }
+    }
+
+    /// Move caret to the start of the specified 1-based line number. If the
+    /// line number is out of range, clamp to the first/last line.
+    pub fn goto_line_start(&mut self, line_1based: usize) {
+        if line_1based == 0 {
+            return;
+        }
+        let chars: Vec<char> = self.report.chars().collect();
+        let n = chars.len();
+        if n == 0 {
+            self.set_caret_pos(0);
+            return;
+        }
+        let mut line = 1usize;
+        let mut pos = 0usize;
+        if line_1based == 1 {
+            self.set_caret_pos(0);
+            return;
+        }
+        while pos < n && line < line_1based {
+            if chars[pos] == '\n' {
+                line += 1;
+                if line == line_1based {
+                    pos += 1; // move to char after newline
+                    break;
+                }
+            }
+            pos += 1;
+        }
+        // If we reached end, clamp to end-of-file start
+        if pos > n { pos = n; }
+        self.set_caret_pos(pos);
+    }
+
+    /// Move caret to the end of the buffer (after the last character).
+    pub fn goto_end_of_file(&mut self) {
+        let pos = self.char_len();
+        self.set_caret_pos(pos);
+    }
+
     pub fn delete_char_at_cursor(&mut self) {
         if let Some(range) = &self.caret_char_range {
             let pos = range.start;
@@ -494,8 +570,58 @@ impl ReportBuffer {
             }
             'u' => { buffer.undo(); *last_vim_key = None; *last_vim_count = None; false }
             
-            'j' => { buffer.move_line_down(); *last_vim_key = None; false }
-            'k' => { buffer.move_line_up(); *last_vim_key = None; false }
+            'j' => {
+                // operator-pending: d/j or c/j ranges
+                if *last_vim_key == Some('d') {
+                    let start = buffer.move_to_line_bounds().0;
+                    let op_count = last_vim_count.take().unwrap_or(1);
+                    // include current line + op_count motions
+                    buffer.delete_lines_from(start, op_count + 0);
+                    *last_vim_key = None;
+                    false
+                } else if *last_vim_key == Some('c') {
+                    let start = buffer.move_to_line_bounds().0;
+                    let op_count = last_vim_count.take().unwrap_or(1);
+                    buffer.start_undo_group();
+                    buffer.delete_lines_from(start, op_count + 0);
+                    *last_vim_key = None;
+                    *vim_mode = crate::VimMode::Insert;
+                    true
+                } else {
+                    let repeats = last_vim_count.take().unwrap_or(1);
+                    for _ in 0..repeats { buffer.move_line_down(); }
+                    *last_vim_key = None; false
+                }
+            }
+            'k' => {
+                if *last_vim_key == Some('d') {
+                    let end = buffer.move_to_line_bounds().0;
+                    let op_count = last_vim_count.take().unwrap_or(1);
+                    let mut start = end;
+                    for _ in 0..op_count {
+                        start = buffer.prev_line_start_from(start);
+                    }
+                    buffer.delete_range(start, end);
+                    *last_vim_key = None;
+                    false
+                } else if *last_vim_key == Some('c') {
+                    let end = buffer.move_to_line_bounds().0;
+                    let op_count = last_vim_count.take().unwrap_or(1);
+                    let mut start = end;
+                    for _ in 0..op_count {
+                        start = buffer.prev_line_start_from(start);
+                    }
+                    buffer.start_undo_group();
+                    buffer.delete_range(start, end);
+                    *last_vim_key = None;
+                    *vim_mode = crate::VimMode::Insert;
+                    true
+                } else {
+                    let repeats = last_vim_count.take().unwrap_or(1);
+                    for _ in 0..repeats { buffer.move_line_up(); }
+                    *last_vim_key = None; false
+                }
+            }
             'w' => {
                 if *last_vim_key == Some('d') {
                     let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
@@ -608,10 +734,37 @@ impl ReportBuffer {
                     false
                 }
             }
+            'g' => {
+                if *last_vim_key == Some('g') {
+                    // 'gg' -> go to first line or to count if provided (Ngg)
+                    let line = last_vim_count.take().unwrap_or(1);
+                    buffer.goto_line_start(line);
+                    *last_vim_key = None;
+                    *last_vim_count = None;
+                    false
+                } else {
+                    *last_vim_key = Some('g');
+                    false
+                }
+            }
+            'G' => {
+                // 'G' goes to end of file, or to specified line if a count is present
+                if let Some(n) = last_vim_count.take() {
+                    buffer.goto_line_start(n);
+                } else {
+                    buffer.goto_end_of_file();
+                }
+                *last_vim_key = None;
+                *last_vim_count = None;
+                false
+            }
             'x' => { buffer.delete_char_at_cursor(); *last_vim_key = None; false }
             'd' => {
                 if *last_vim_key == Some('d') {
-                    buffer.delete_current_line();
+                    // 'dd' or 'Ndd' deletes whole lines. Honor count if present.
+                    let count = last_vim_count.take().unwrap_or(1);
+                    let start = buffer.move_to_line_bounds().0;
+                    buffer.delete_lines_from(start, count);
                     *last_vim_key = None;
                 } else {
                     *last_vim_key = Some('d');
@@ -907,5 +1060,82 @@ mod tests {
 
         b.redo();
         assert_eq!(b.report, "a\nc");
+    }
+
+    #[test]
+    fn numeric_prefix_h_moves_left() {
+        let mut b = ReportBuffer::new();
+        b.report = "abcdefgh".to_string();
+        b.caret_char_range = Some(5..5); // at 'f'
+
+        let mut mode = crate::VimMode::Normal;
+        let mut last = None;
+        let mut count = None;
+        // '3h' should move left 3 chars
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, '3');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'h');
+        assert_eq!(b.caret_char_range.as_ref().unwrap().start, 2);
+    }
+
+    #[test]
+    fn numeric_prefix_3dw() {
+        let mut b = ReportBuffer::new();
+        b.report = "one two three four five".to_string();
+        b.caret_char_range = Some(4..4); // start of 'two'
+
+        let mut mode = crate::VimMode::Normal;
+        let mut last = None;
+        let mut count = None;
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, '3');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'w');
+
+        assert_eq!(b.report, "one five");
+    }
+
+    #[test]
+    fn numeric_prefix_2cw_grouped() {
+        let mut b = ReportBuffer::new();
+        b.report = "one two three".to_string();
+        b.caret_char_range = Some(4..4); // start of 'two'
+
+        let mut mode = crate::VimMode::Normal;
+        let mut last = None;
+        let mut count = None;
+        let prev = b.report.clone();
+
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, '2');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'c');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'w');
+
+        // in Insert mode now; simulate typing
+        b.insert_at_caret("X");
+        b.end_undo_group();
+
+        let after = b.report.clone();
+        b.undo();
+        assert_eq!(b.report, prev);
+        b.redo();
+        assert_eq!(b.report, after);
+    }
+
+    #[test]
+    fn numeric_prefix_3dd() {
+        let mut b = ReportBuffer::new();
+        b.report = "a\nb\nc\nd\ne\nf".to_string();
+        // place caret at start of second line ('b')
+        // 'a' (0), '\n'(1), 'b' (2)
+        b.caret_char_range = Some(2..2);
+
+        let mut mode = crate::VimMode::Normal;
+        let mut last = None;
+        let mut count = None;
+
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, '3');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'd');
+
+        // expect lines b,c,d removed -> remaining a\ne\nf
+        assert_eq!(b.report, "a\ne\nf");
     }
 }

@@ -299,6 +299,16 @@ impl eframe::App for ReportApp {
                         }
                     }
 
+                    // Ensure any active undo group is ended on Escape regardless
+                    // of whether Vim emulation is enabled. This prevents leaving
+                    // grouped edits open when the user presses Escape or when
+                    // other UI flows cause focus changes.
+                    for ev in events.iter() {
+                        if let Event::Key { key: egui::Key::Escape, pressed: true, .. } = ev {
+                            self.buffer.end_undo_group();
+                        }
+                    }
+
                     // Vim-only handling: Escape and text input handling for modal editing
                     if self.vim_enabled {
                         for ev in events.iter() {
