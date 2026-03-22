@@ -413,20 +413,42 @@ impl eframe::App for ReportApp {
                                     let s = anchor.min(cur);
                                     let e = anchor.max(cur);
                                     if s < e {
-                                        let start_cursor = CCursor::new(s);
-                                        let end_cursor = CCursor::new(e);
-                                        let start_pos = output.galley.pos_from_cursor(start_cursor);
-                                        let end_pos = output.galley.pos_from_cursor(end_cursor);
-                                        // convert to screen coords
-                                        let start_screen = output.response.rect.min + start_pos.min.to_vec2();
-                                        let end_screen = output.response.rect.min + end_pos.max.to_vec2();
-                                        // restrict to widget bounds
-                                        let x0 = start_screen.x.clamp(output.response.rect.min.x, output.response.rect.max.x);
-                                        let x1 = end_screen.x.clamp(output.response.rect.min.x, output.response.rect.max.x);
-                                        let y0 = start_screen.y.clamp(output.response.rect.min.y, output.response.rect.max.y);
-                                        let y1 = (y0 + 18.0_f32).min(output.response.rect.max.y);
-                                        let sel_rect = egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1));
-                                        painter.rect_filled(sel_rect, 0.0, egui::Color32::from_rgba_unmultiplied(120, 160, 255, 140));
+                                        // Determine exact per-line glyph bounds by splitting the selected
+                                        // substring on newline boundaries and mapping each segment back
+                                        // to absolute char indices to query `pos_from_cursor`.
+                                        let report = &self.buffer.report;
+                                        let sel = report.chars().skip(s).take(e - s).collect::<String>();
+                                        let mut offset = 0usize;
+                                        let mut abs_index = s;
+                                        for (i, line) in sel.split('\n').enumerate() {
+                                            let line_len = line.chars().count();
+                                            let line_start = abs_index;
+                                            let line_end = abs_index + line_len;
+
+                                            // compute screen coords for line_start and line_end (end is exclusive)
+                                            let start_cursor = CCursor::new(line_start);
+                                            let end_cursor = CCursor::new(line_end);
+                                            let start_pos = output.galley.pos_from_cursor(start_cursor);
+                                            let end_pos = output.galley.pos_from_cursor(end_cursor);
+                                            let start_screen = output.response.rect.min + start_pos.min.to_vec2();
+                                            let end_screen = output.response.rect.min + end_pos.max.to_vec2();
+
+                                            // derive a per-line height from the glyph extents
+                                            let line_h = (start_pos.max.y - start_pos.min.y).abs().max(14.0_f32).min(48.0_f32);
+
+                                            // For empty lines (line_len == 0), draw a caret-width selection
+                                            let x0 = if line_len == 0 { start_screen.x } else { start_screen.x };
+                                            let x1 = if line_len == 0 { start_screen.x + 8.0 } else { end_screen.x };
+                                            let y0 = start_screen.y.clamp(output.response.rect.min.y, output.response.rect.max.y);
+                                            let y1 = (y0 + line_h).min(output.response.rect.max.y);
+                                            let sel_rect = egui::Rect::from_min_max(egui::pos2(x0.clamp(output.response.rect.min.x, output.response.rect.max.x), y0), egui::pos2(x1.clamp(output.response.rect.min.x, output.response.rect.max.x), y1));
+                                            painter.rect_filled(sel_rect, 0.0, egui::Color32::from_rgba_unmultiplied(120, 160, 255, 140));
+
+                                            // advance absolute index past this line and the newline (if present)
+                                            abs_index = line_end + 1; // skip the newline; safe even if at end because we'll not use abs_index further
+                                            offset += line_len + 1;
+                                            if abs_index > e { break; }
+                                        }
                                     }
                                 }
                             }
