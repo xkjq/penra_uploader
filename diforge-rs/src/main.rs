@@ -106,6 +106,8 @@ struct ReportApp {
     vim_mode: VimMode,
     // last key pressed (for multi-key commands like dd)
     last_vim_key: Option<char>,
+    // numeric prefix for vim commands (e.g., `3dw`)
+    vim_count: Option<usize>,
 }
 
 impl Default for ReportApp {
@@ -137,6 +139,7 @@ impl Default for ReportApp {
             vim_enabled: false,
             vim_mode: VimMode::Normal,
             last_vim_key: None,
+            vim_count: None,
         };
 
         // Load persisted settings (if any) and apply
@@ -313,7 +316,7 @@ impl eframe::App for ReportApp {
                                     let ch = text.chars().next().unwrap();
                                     match self.vim_mode {
                                         VimMode::Normal => {
-                                            let focus = vim::ReportBuffer::handle_normal_key(&mut self.buffer, &mut self.vim_mode, &mut self.last_vim_key, ch);
+                                            let focus = vim::ReportBuffer::handle_normal_key(&mut self.buffer, &mut self.vim_mode, &mut self.last_vim_key, &mut self.vim_count, ch);
                                             if focus {
                                                 output.response.request_focus();
                                                 if let Some(range) = &self.buffer.caret_char_range {
