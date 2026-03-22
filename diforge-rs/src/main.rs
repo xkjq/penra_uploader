@@ -34,6 +34,10 @@ struct ReportApp {
     overlay_h: i32,
     // last known caret/selection as char indices
     caret_char_range: Option<Range<usize>>,
+    // debug flag to show caret diagnostics
+    show_caret_debug: bool,
+    // manual pixel offset to correct caret X position when needed (debug tweak)
+    caret_x_offset: f32,
 }
 
 impl Default for ReportApp {
@@ -61,6 +65,8 @@ impl Default for ReportApp {
             overlay_w: 600,
             overlay_h: 200,
             caret_char_range: None,
+            show_caret_debug: false,
+            caret_x_offset: 3.0,
         }
     }
 }
@@ -192,6 +198,45 @@ impl eframe::App for ReportApp {
                         output.state.store(ui.ctx(), output.response.id);
                     }
 
+                    // Draw an unfocused caret indicator so the user can see the caret when the editor is not focused.
+                    if !output.response.has_focus() {
+                        // Try to use the widget-reported cursor_range, otherwise fall back to our stored `caret_char_range`.
+                        let maybe_ccr = output.cursor_range.or_else(|| {
+                            self.caret_char_range.as_ref().map(|r| CCursorRange::two(CCursor::new(r.start), CCursor::new(r.end)))
+                        });
+
+                        if let Some(ccr) = maybe_ccr {
+                            // Use the primary cursor position
+                            let ccursor = ccr.primary;
+                            // Position inside the laid-out galley (pos_from_cursor returns a Rect)
+                            let galley_pos = output.galley.pos_from_cursor(ccursor);
+                            // Convert to screen coords: widget rect min + galley_pos offset
+                            // Note: `galley_pos` is already positioned relative to the widget; avoid double-adding `output.galley_pos`.
+                            let screen_pos = output.response.rect.min + galley_pos.min.to_vec2();
+                            // Draw a visible caret line, clamped to the TextEdit rect
+                            let caret_height = 18.0_f32;
+                            let painter = ui.painter();
+                            let x = (screen_pos.x + self.caret_x_offset).clamp(output.response.rect.min.x, output.response.rect.max.x - 1.0);
+                            let y0 = screen_pos.y.clamp(output.response.rect.min.y, output.response.rect.max.y - caret_height);
+                            let y1 = y0 + caret_height;
+                            painter.line_segment(
+                                [egui::pos2(x, y0), egui::pos2(x, y1)],
+                                egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 80, 80)),
+                            );
+                            if self.show_caret_debug {
+                                painter.circle_filled(egui::pos2(x, y0), 4.0, egui::Color32::from_rgb(80, 200, 255));
+                                let info = format!("screen: {:.1},{:.1}  char_range: {:?}", screen_pos.x + self.caret_x_offset, screen_pos.y, self.caret_char_range);
+                                painter.text(
+                                    egui::pos2(output.response.rect.min.x + 6.0, output.response.rect.min.y + 6.0),
+                                    egui::Align2::LEFT_TOP,
+                                    info,
+                                    egui::FontId::proportional(12.0),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                        }
+                    }
+
                     if self.attach_requested {
                         if let Some(writers) = &self.ipc_writers {
                             let rect = output.response.rect;
@@ -220,6 +265,11 @@ impl eframe::App for ReportApp {
                         ));
                     } else {
                         ui.label("Caret: -");
+                    }
+
+                    ui.checkbox(&mut self.show_caret_debug, "Debug caret pos");
+                    if self.show_caret_debug {
+                        ui.add(egui::Slider::new(&mut self.caret_x_offset, -40.0..=40.0).text("Caret X offset"));
                     }
 
                     ui.horizontal(|ui| {
