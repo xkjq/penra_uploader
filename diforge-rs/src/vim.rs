@@ -141,8 +141,9 @@ impl ReportBuffer {
 
     pub fn move_to_line_bounds(&self) -> (usize, usize, usize) {
         let chars: Vec<char> = self.report.chars().collect();
-        let pos = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+        let raw_pos = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
         let n = chars.len();
+        let pos = raw_pos.min(n);
         let mut start = 0usize;
         for i in (0..pos).rev() {
             if chars[i] == '\n' {
@@ -267,6 +268,17 @@ impl ReportBuffer {
                 self.caret_char_range = Some(line_start_byte..line_start_byte);
             }
         }
+    }
+    pub fn get_caret_line_number(&self) -> usize {
+        let chars: Vec<char> = self.report.chars().collect();
+        let pos = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+        let mut line_num = 0usize;
+        for i in 0..pos.min(chars.len()) {
+            if chars[i] == '\n' {
+                line_num += 1;
+            }
+        }
+        line_num
     }
 }
 

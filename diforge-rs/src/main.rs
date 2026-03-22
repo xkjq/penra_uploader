@@ -377,9 +377,12 @@ impl eframe::App for ReportApp {
                                                     'O' => {
                                                         // open new line above: insert newline at start of current line
                                                         let (s, _e, _c) = self.buffer.move_to_line_bounds();
-                                                        self.buffer.set_caret_pos(s);
+                                                        let insert_pos = s.min(self.buffer.char_len());
+                                                        self.buffer.set_caret_pos(insert_pos);
                                                         self.buffer.insert_at_caret("\n");
-                                                        // caret will be placed at start of the newly inserted line (s + 1)
+                                                        // ensure caret is at the start of the newly inserted line
+                                                        let new_pos = insert_pos + 1.min(self.buffer.char_len().saturating_sub(insert_pos));
+                                                        self.buffer.set_caret_pos(new_pos);
                                                         self.vim_mode = VimMode::Insert;
                                                         output.response.request_focus();
                                                         if let Some(range) = &self.buffer.caret_char_range {
