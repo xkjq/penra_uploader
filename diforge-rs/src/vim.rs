@@ -603,14 +603,27 @@ impl ReportBuffer {
                 true
             }
             'o' => {
-                // Start grouping before creating the new line so subsequent typing
-                // becomes part of the same undo step (Vim-like behavior).
-                buffer.start_undo_group();
-                buffer.open_line_below();
-                *vim_mode = crate::VimMode::Insert;
-                *last_vim_key = None;
-                *last_vim_count = None;
-                true
+                // If we're in Visual mode, `o` should move the caret to the
+                // other end of the selection (reverse selection endpoints).
+                if *vim_mode == crate::VimMode::Visual {
+                    if let Some(anchor_pos) = *visual_anchor {
+                        let cur = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                        *visual_anchor = Some(cur);
+                        buffer.set_caret_pos(anchor_pos);
+                    }
+                    *last_vim_key = None;
+                    *last_vim_count = None;
+                    false
+                } else {
+                    // Start grouping before creating the new line so subsequent typing
+                    // becomes part of the same undo step (Vim-like behavior).
+                    buffer.start_undo_group();
+                    buffer.open_line_below();
+                    *vim_mode = crate::VimMode::Insert;
+                    *last_vim_key = None;
+                    *last_vim_count = None;
+                    true
+                }
             }
             'O' => {
                 buffer.start_undo_group();
