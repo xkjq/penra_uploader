@@ -3,6 +3,8 @@ use std::fs;
 use crossbeam_channel::{unbounded, Receiver};
 use anyhow::Result;
 use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 mod speech;
 mod templates;
@@ -12,11 +14,64 @@ use speech::{create_vosk_engine, SpeechEngine};
 use std::ops::Range;
 use egui::text::{CCursor, CCursorRange};
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Serialize, Deserialize, Clone, Copy, Debug)]
 enum VimMode {
     Normal,
     Insert,
     Visual,
+}
+
+impl Default for VimMode {
+    fn default() -> Self {
+        VimMode::Normal
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+struct Settings {
+    vim_enabled: bool,
+    vim_mode: VimMode,
+    caret_x_offset: f32,
+    show_caret_debug: bool,
+    overlay_x: i32,
+    overlay_y: i32,
+    overlay_w: i32,
+    overlay_h: i32,
+}
+
+fn settings_path() -> PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        let mut p = PathBuf::from(xdg);
+        p.push("diforge-rs");
+        p.push("settings.json");
+        p
+    } else if let Ok(home) = std::env::var("HOME") {
+        let mut p = PathBuf::from(home);
+        p.push(".config/diforge-rs/settings.json");
+        p
+    } else {
+        PathBuf::from("./diforge-settings.json")
+    }
+}
+
+fn load_settings() -> Settings {
+    let p = settings_path();
+    if let Ok(txt) = fs::read_to_string(&p) {
+        if let Ok(s) = serde_json::from_str::<Settings>(&txt) {
+            return s;
+        }
+    }
+    Settings::default()
+}
+
+fn save_settings(s: &Settings) -> Result<()> {
+    let p = settings_path();
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let txt = serde_json::to_string_pretty(s)?;
+    fs::write(p, txt)?;
+    Ok(())
 }
 
 struct ReportApp {
@@ -59,7 +114,7 @@ impl Default for ReportApp {
         let (tx, rx_local) = crossbeam_channel::unbounded();
         let ipc_writers = dragon_ipc::start_listener(tx);
 
-        Self {
+        let mut app = Self {
             report: String::new(),
             templates: templates::load_templates(),
             engine: create_vosk_engine("models/vosk-small").unwrap_or_else(|_| create_vosk_engine("").unwrap()),
@@ -83,7 +138,47 @@ impl Default for ReportApp {
             vim_enabled: false,
             vim_mode: VimMode::Normal,
             last_vim_key: None,
+        };
+
+        // Load persisted settings (if any) and apply
+        let settings = load_settings();
+        app.apply_settings(settings);
+
+        // Add default multiline text for testing if the report is empty
+        if app.report.is_empty() {
+            let sample = "Patient: John Doe\nDOB: 1970-01-01\nStudy: CT Head\n\nFindings:\n- No acute intracranial hemorrhage.\n- Mild chronic microvascular ischemic change.\n\nImpression:\n1. No acute intracranial hemorrhage.\n2. Chronic microvascular ischemic change.\n";
+            app.report = sample.to_string();
+            let pos = app.report.chars().count();
+            app.caret_char_range = Some(pos..pos);
         }
+
+        app
+    }
+}
+
+impl ReportApp {
+    fn to_settings(&self) -> Settings {
+        Settings {
+            vim_enabled: self.vim_enabled,
+            vim_mode: self.vim_mode,
+            caret_x_offset: self.caret_x_offset,
+            show_caret_debug: self.show_caret_debug,
+            overlay_x: self.overlay_x,
+            overlay_y: self.overlay_y,
+            overlay_w: self.overlay_w,
+            overlay_h: self.overlay_h,
+        }
+    }
+
+    fn apply_settings(&mut self, s: Settings) {
+        self.vim_enabled = s.vim_enabled;
+        self.vim_mode = s.vim_mode;
+        self.caret_x_offset = s.caret_x_offset;
+        self.show_caret_debug = s.show_caret_debug;
+        self.overlay_x = s.overlay_x;
+        self.overlay_y = s.overlay_y;
+        self.overlay_w = s.overlay_w;
+        self.overlay_h = s.overlay_h;
     }
 }
 
@@ -568,6 +663,8 @@ impl eframe::App for ReportApp {
                                 self.vim_mode = VimMode::Normal;
                                 self.last_vim_key = None;
                             }
+                            // persist settings when user toggles Vim emulation
+                            let _ = save_settings(&self.to_settings());
                         }
                         let mode_label = match self.vim_mode {
                             VimMode::Normal => "Normal",
