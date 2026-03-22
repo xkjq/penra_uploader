@@ -9,6 +9,9 @@ mod templates;
 mod dragon_ipc;
 use speech::{create_vosk_engine, SpeechEngine};
 
+use std::ops::Range;
+use egui::text::{CCursor, CCursorRange};
+
 struct ReportApp {
     report: String,
     templates: Vec<templates::Template>,
@@ -29,6 +32,8 @@ struct ReportApp {
     overlay_y: i32,
     overlay_w: i32,
     overlay_h: i32,
+    // last known caret/selection as char indices
+    caret_char_range: Option<Range<usize>>,
 }
 
 impl Default for ReportApp {
@@ -55,7 +60,48 @@ impl Default for ReportApp {
             overlay_y: 100,
             overlay_w: 600,
             overlay_h: 200,
+            caret_char_range: None,
         }
+    }
+}
+
+impl ReportApp {
+    fn insert_at_caret(&mut self, insert: &str) {
+        // Insert `insert` into `self.report` at the current caret/selection (char indices).
+        // If there's a selection, replace it. Otherwise insert at cursor or append.
+        let (start_char, end_char) = if let Some(r) = &self.caret_char_range {
+            (r.start, r.end)
+        } else {
+            (self.report.chars().count(), self.report.chars().count())
+        };
+
+        // Convert char indices to byte indices
+        let mut cur = 0usize;
+        let mut start_byte = self.report.len();
+        let mut end_byte = self.report.len();
+        for (b, _) in self.report.char_indices() {
+            if cur == start_char {
+                start_byte = b;
+            }
+            if cur == end_char {
+                end_byte = b;
+                break;
+            }
+            cur += 1;
+        }
+        // If start/end point to end of string
+        if start_char >= self.report.chars().count() {
+            start_byte = self.report.len();
+        }
+        if end_char >= self.report.chars().count() {
+            end_byte = self.report.len();
+        }
+
+        self.report.replace_range(start_byte..end_byte, insert);
+
+        // Update caret to be after inserted text (no selection)
+        let new_char_pos = start_char + insert.chars().count();
+        self.caret_char_range = Some(new_char_pos..new_char_pos);
     }
 }
 
@@ -70,155 +116,205 @@ impl eframe::App for ReportApp {
                 self.report.push_str(&msg);
             }
         }
+        // (removed SidePanel overlay; templates render inline when requested)
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("New").clicked() {
-                    self.report.clear();
-                }
-                if ui.button("Open...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().pick_file() {
-                        if let Ok(txt) = fs::read_to_string(path) {
-                            self.report = txt;
+            // Build a two-column layout: left = main report area, right = templates (fixed width)
+            let avail = ui.available_rect_before_wrap();
+            let avail_w = avail.width();
+            let avail_h = avail.height();
+            let right_w = 320.0_f32.min(avail_w.max(0.0));
+            let left_w = (avail_w - right_w).max(180.0);
+
+            let left_rect = egui::Rect::from_min_max(avail.min, egui::pos2(avail.min.x + left_w, avail.max.y));
+            let right_rect = egui::Rect::from_min_max(egui::pos2(avail.min.x + left_w, avail.min.y), avail.max);
+
+            ui.allocate_ui_at_rect(left_rect, |ui| {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("New").clicked() {
+                            self.report.clear();
+                            self.caret_char_range = Some(0..0);
                         }
-                    }
-                }
-                if ui.button("Save...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new().save_file() {
-                        let _ = fs::write(path, &self.report);
-                    }
-                }
-                if ui.button("Attach Dragon Overlay").clicked() {
-                    // Request attach; actual rect is computed after TextEdit is added below
-                    self.attach_requested = true;
-                }
-                ui.separator();
-                for (i, t) in self.templates.iter().enumerate() {
-                    if ui.small_button(format!("T{}", i + 1)).clicked() {
-                        if !self.report.is_empty() && !self.report.ends_with('\n') {
-                            self.report.push('\n');
+                        if ui.button("Open...").clicked() {
+                            if let Some(path) = rfd::FileDialog::new().pick_file() {
+                                if let Ok(txt) = fs::read_to_string(path) {
+                                    self.report = txt;
+                                }
+                            }
                         }
-                        self.report.push_str(&t.body);
+                        if ui.button("Save...").clicked() {
+                            if let Some(path) = rfd::FileDialog::new().save_file() {
+                                let _ = fs::write(path, &self.report);
+                            }
+                        }
+                        if ui.button("Attach Dragon Overlay").clicked() {
+                            self.attach_requested = true;
+                        }
+                        ui.separator();
+                        // Clone templates to avoid borrowing `self` across UI calls so we can mutably borrow later
+                        let templates_top = self.templates.clone();
+                        for (i, t) in templates_top.iter().enumerate() {
+                            if ui.small_button(format!("T{}", i + 1)).clicked() {
+                                // Insert at caret (or append)
+                                let mut body = t.body.clone();
+                                if !self.report.is_empty() && !self.report.ends_with('\n') && self.caret_char_range.is_none() {
+                                    // if no caret known, preserve previous append behavior and add newline
+                                    body = format!("\n{}", body);
+                                }
+                                self.insert_at_caret(&body);
+                            }
+                        }
+                    });
+
+                    ui.separator();
+
+                    ui.label("Radiology report");
+                    // Show the editable report and capture TextEdit output so we can track/store the cursor.
+                    let text_edit = egui::TextEdit::multiline(&mut self.report)
+                        .desired_rows(20)
+                        .desired_width(left_w)
+                        .lock_focus(true);
+
+                    let mut output = text_edit.show(ui);
+
+                    // Update stored caret char range from the widget's reported cursor_range
+                    if let Some(ccr) = output.cursor_range {
+                        let sorted = ccr.as_sorted_char_range();
+                        self.caret_char_range = Some(sorted);
                     }
-                }
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Overlay X:");
-                    ui.add(egui::DragValue::new(&mut self.overlay_x));
-                    ui.label("Y:");
-                    ui.add(egui::DragValue::new(&mut self.overlay_y));
-                    ui.label("W:");
-                    ui.add(egui::DragValue::new(&mut self.overlay_w));
-                    ui.label("H:");
-                    ui.add(egui::DragValue::new(&mut self.overlay_h));
-                    if ui.button("Send Overlay Position").clicked() {
+
+                    // If we already have a desired caret position (e.g. from an insert earlier this frame), push it into widget state
+                    if let Some(range) = &self.caret_char_range {
+                        let start = CCursor::new(range.start);
+                        let end = CCursor::new(range.end);
+                        output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
+                        output.state.store(ui.ctx(), output.response.id);
+                    }
+
+                    if self.attach_requested {
                         if let Some(writers) = &self.ipc_writers {
+                            let rect = output.response.rect;
+                            let x = rect.min.x.round() as i32;
+                            let y = rect.min.y.round() as i32;
+                            let w = rect.width().round() as i32;
+                            let h = rect.height().round() as i32;
                             let cmd = serde_json::json!({
-                                "cmd": "set_overlay_position",
-                                "x": self.overlay_x,
-                                "y": self.overlay_y,
-                                "w": self.overlay_w,
-                                "h": self.overlay_h
+                                "cmd": "show_overlay",
+                                "text": self.report,
+                                "x": x,
+                                "y": y,
+                                "w": w,
+                                "h": h,
                             });
                             dragon_ipc::send_to_helpers(writers, &cmd);
                         }
+                        self.attach_requested = false;
                     }
+
+                    // Show caret position below the text edit so user always sees it
+                    if let Some(range) = &self.caret_char_range {
+                        ui.label(format!("Caret: {}{}",
+                            range.end,
+                            if range.start != range.end { format!(" (sel {}..{})", range.start, range.end) } else { String::new() }
+                        ));
+                    } else {
+                        ui.label("Caret: -");
+                    }
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Preview").clicked() {
+                            ctx.request_repaint();
+                        }
+                        if ui.button("Insert Template").clicked() {
+                            self.show_templates_window = true;
+                        }
+                    });
+
+                    ui.separator();
+
+                    ui.horizontal(|ui| {
+                        ui.label("Overlay X:");
+                        ui.add(egui::DragValue::new(&mut self.overlay_x));
+                        ui.label("Y:");
+                        ui.add(egui::DragValue::new(&mut self.overlay_y));
+                        ui.label("W:");
+                        ui.add(egui::DragValue::new(&mut self.overlay_w));
+                        ui.label("H:");
+                        ui.add(egui::DragValue::new(&mut self.overlay_h));
+                        if ui.button("Send Overlay Position").clicked() {
+                            if let Some(writers) = &self.ipc_writers {
+                                let cmd = serde_json::json!({
+                                    "cmd": "set_overlay_position",
+                                    "x": self.overlay_x,
+                                    "y": self.overlay_y,
+                                    "w": self.overlay_w,
+                                    "h": self.overlay_h
+                                });
+                                dragon_ipc::send_to_helpers(writers, &cmd);
+                            }
+                        }
+                    });
                 });
             });
 
-            ui.separator();
-            // Speech recognition temporarily hidden — re-enable later if needed.
-
-            ui.label("Radiology report");
-            let text_resp = ui.add(
-                egui::TextEdit::multiline(&mut self.report)
-                    .desired_rows(20)
-                    .desired_width(f32::INFINITY)
-                    .lock_focus(true),
-            );
-
-            // If an attach was requested before we rendered the TextEdit, compute its rect and send overlay command
-            if self.attach_requested {
-                if let Some(writers) = &self.ipc_writers {
-                    let rect = text_resp.rect;
-                    let x = rect.min.x.round() as i32;
-                    let y = rect.min.y.round() as i32;
-                    let w = rect.width().round() as i32;
-                    let h = rect.height().round() as i32;
-                    let cmd = serde_json::json!({
-                        "cmd": "show_overlay",
-                        "text": self.report,
-                        "x": x,
-                        "y": y,
-                        "w": w,
-                        "h": h,
-                    });
-                    dragon_ipc::send_to_helpers(writers, &cmd);
-                }
-                self.attach_requested = false;
-            }
-
-            ui.horizontal(|ui| {
-                if ui.button("Preview").clicked() {
-                    // For now, just trigger a repaint
-                    ctx.request_repaint();
-                }
-                if ui.button("Insert Template").clicked() {
-                    self.show_templates_window = true;
-                }
-            });
-
-            // Templates side panel (right)
+            // Templates area: render in the right column when requested
             if self.show_templates_window {
-                egui::SidePanel::right("templates_panel").resizable(true).show(ctx, |ui| {
-                    ui.heading("Templates");
-                    ui.horizontal(|ui| {
-                        ui.label("NICIP codes (comma-separated):");
-                        ui.text_edit_singleline(&mut self.template_nicip);
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Search:");
-                        ui.text_edit_singleline(&mut self.template_search);
-                        if ui.button("Close").clicked() {
-                            self.show_templates_window = false;
-                        }
-                    });
+                ui.allocate_ui_at_rect(right_rect, |ui| {
+                    ui.vertical(|ui| {
+                        ui.heading("Templates");
+                        ui.separator();
 
-                    // parse nicips
-                    let nicips: Vec<String> = self
-                        .template_nicip
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
+                        ui.horizontal(|ui| {
+                            ui.label("NICIP codes (comma-separated):");
+                            ui.text_edit_singleline(&mut self.template_nicip);
+                        });
 
-                    // list matching templates
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for (i, t) in self.templates.iter().enumerate() {
-                            // basic matching by nicip codes
-                            if !templates::matches_template(t, &nicips, None) {
-                                continue;
+                        ui.horizontal(|ui| {
+                            ui.label("Search:");
+                            ui.text_edit_singleline(&mut self.template_search);
+                            if ui.button("Hide").clicked() {
+                                self.show_templates_window = false;
                             }
-                            let title = t.display_title();
-                            if !self.template_search.is_empty()
-                                && !title.to_lowercase().contains(&self.template_search.to_lowercase())
-                                && !t.body.to_lowercase().contains(&self.template_search.to_lowercase())
-                            {
-                                continue;
-                            }
-                            ui.horizontal(|ui| {
-                                if ui.small_button("Insert").clicked() {
-                                    // render with empty vars for now
-                                    let vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-                                    let rendered = templates::render_template(&t.body, &vars);
-                                    if !self.report.is_empty() && !self.report.ends_with('\n') {
-                                        self.report.push('\n');
-                                    }
-                                    self.report.push_str(&rendered);
-                                    self.show_templates_window = false;
+                        });
+
+                        let nicips: Vec<String> = self
+                            .template_nicip
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+
+                        // Clone templates to avoid immutable borrow across UI closures.
+                        let templates_list = self.templates.clone();
+
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            for (i, t) in templates_list.iter().enumerate() {
+                                if !templates::matches_template(t, &nicips, None) {
+                                    continue;
                                 }
-                                ui.label(title);
-                            });
-                        }
+                                let title = t.display_title();
+                                if !self.template_search.is_empty()
+                                    && !title.to_lowercase().contains(&self.template_search.to_lowercase())
+                                    && !t.body.to_lowercase().contains(&self.template_search.to_lowercase())
+                                {
+                                    continue;
+                                }
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("Insert").clicked() {
+                                        let vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                                        let rendered = templates::render_template(&t.body, &vars);
+                                        let mut body = rendered.clone();
+                                        if !self.report.is_empty() && !self.report.ends_with('\n') && self.caret_char_range.is_none() {
+                                            body = format!("\n{}", body);
+                                        }
+                                        self.insert_at_caret(&body);
+                                        // After inserting ensure widget state will be updated next frame by the TextEdit output handling
+                                    }
+                                    ui.label(title);
+                                });
+                            }
+                        });
                     });
                 });
             }
