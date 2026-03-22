@@ -769,4 +769,105 @@ mod tests {
         // caret should be at the start of the newly inserted blank line
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, s);
     }
+
+    #[test]
+    fn grouped_undo_for_o_then_type() {
+        let mut b = ReportBuffer::new();
+        b.report = "first\nsecond".to_string();
+        // place caret on first line
+        b.caret_char_range = Some(2..2);
+
+        // use normal handler to perform 'o' which should start an undo group
+        let mut mode = crate::VimMode::Normal;
+        let mut last = None;
+        let prev = b.report.clone();
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, 'o');
+
+        // simulate typing in Insert mode (TextEdit would normally do this)
+        b.insert_at_caret("hello");
+
+        // end the undo group (simulate pressing Escape)
+        b.end_undo_group();
+
+        // take the post-change snapshot for redo verification
+        let after = b.report.clone();
+
+        // a single undo should revert both the inserted newline and typed text
+        b.undo();
+        assert_eq!(b.report, prev);
+
+        // redo should restore the grouped change
+        b.redo();
+        assert_eq!(b.report, after);
+    }
+
+    #[test]
+    fn undo_redo_dw() {
+        let mut b = ReportBuffer::new();
+        b.report = "one two three".to_string();
+        b.caret_char_range = Some(4..4);
+
+        let mut mode = crate::VimMode::Normal;
+        let mut last = None;
+        let prev = b.report.clone();
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, 'w');
+
+        assert_eq!(b.report, "one three");
+
+        b.undo();
+        assert_eq!(b.report, prev);
+
+        b.redo();
+        assert_eq!(b.report, "one three");
+    }
+
+    #[test]
+    fn undo_redo_cw_grouped() {
+        let mut b = ReportBuffer::new();
+        b.report = "one two three".to_string();
+        b.caret_char_range = Some(4..4);
+
+        let mut mode = crate::VimMode::Normal;
+        let mut last = None;
+        let prev = b.report.clone();
+
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, 'c');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, 'w');
+
+        // now in Insert mode; simulate typing
+        b.insert_at_caret("X");
+        b.end_undo_group();
+
+        let after = b.report.clone();
+
+        b.undo();
+        assert_eq!(b.report, prev);
+
+        b.redo();
+        assert_eq!(b.report, after);
+    }
+
+    #[test]
+    fn undo_redo_dd() {
+        let mut b = ReportBuffer::new();
+        b.report = "a\nb\nc".to_string();
+        // place caret at start of second line ('b')
+        b.caret_char_range = Some(2..2);
+
+        let mut mode = crate::VimMode::Normal;
+        let mut last = None;
+        let prev = b.report.clone();
+
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, 'd');
+
+        assert_eq!(b.report, "a\nc");
+
+        b.undo();
+        assert_eq!(b.report, prev);
+
+        b.redo();
+        assert_eq!(b.report, "a\nc");
+    }
 }
