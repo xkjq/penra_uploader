@@ -287,8 +287,15 @@ impl ReportBuffer {
     pub fn open_line_above(&mut self) {
         let (s, _e, _c) = self.move_to_line_bounds();
         let insert_pos = s.min(self.char_len());
+        // Insert a newline at the start of the current line, then move the caret
+        // to the start of the newly inserted blank line (so its line number
+        // matches the original line index).
         self.set_caret_pos(insert_pos);
         self.insert_at_caret("\n");
+        // After insertion `insert_at_caret` places the caret after the inserted
+        // text; move it back to the start of the new blank line so callers
+        // observing line numbers see the expected value.
+        self.set_caret_pos(insert_pos);
     }
 
     /// Move caret to the append (end-of-line) insertion point (used by `A`).
@@ -460,6 +467,7 @@ mod tests {
         b.open_line_above();
         let new_line = b.get_caret_line_number();
         assert_eq!(new_line, start_line); // still on the same line number because we inserted above
-        assert_eq!(b.caret_char_range.as_ref().unwrap().start, s + 1);
+        // caret should be at the start of the newly inserted blank line
+        assert_eq!(b.caret_char_range.as_ref().unwrap().start, s);
     }
 }
