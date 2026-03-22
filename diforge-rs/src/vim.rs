@@ -83,10 +83,14 @@ impl ReportBuffer {
         let chars: Vec<char> = self.report.chars().collect();
         let mut pos = self.caret_char_range.as_ref().map(|r| r.end).unwrap_or(0);
         let n = chars.len();
-        while pos < n && !chars[pos].is_alphanumeric() {
-            pos += 1;
+        // If currently on/inside a word, advance to its end first.
+        if pos < n && chars[pos].is_alphanumeric() {
+            while pos < n && chars[pos].is_alphanumeric() {
+                pos += 1;
+            }
         }
-        while pos < n && chars[pos].is_alphanumeric() {
+        // Then skip separators to land on the start of the next word.
+        while pos < n && !chars[pos].is_alphanumeric() {
             pos += 1;
         }
         self.set_caret_pos(pos);
@@ -331,5 +335,21 @@ mod tests {
         // third e: end of 'three' -> index 12
         b.move_word_end();
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, 12);
+    }
+
+    #[test]
+    fn move_word_forward_start_of_next_word() {
+        let mut b = ReportBuffer::new();
+        b.report = "one two three".to_string();
+        // start at beginning
+        b.caret_char_range = Some(0..0);
+
+        // first w: start of 'two' -> index 4
+        b.move_word_forward();
+        assert_eq!(b.caret_char_range.as_ref().unwrap().start, 4);
+
+        // second w: start of 'three' -> index 8
+        b.move_word_forward();
+        assert_eq!(b.caret_char_range.as_ref().unwrap().start, 8);
     }
 }
