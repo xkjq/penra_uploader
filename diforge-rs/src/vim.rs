@@ -970,7 +970,23 @@ impl ReportBuffer {
                 *vim_mode = crate::VimMode::Insert;
                 true
             }
-            'x' => { buffer.delete_char_at_cursor(); *last_vim_key = None; false }
+            'x' => {
+                // If in Visual mode, delete the selected range instead of a single char
+                if *vim_mode == crate::VimMode::Visual {
+                    if let Some(anchor) = visual_anchor.take() {
+                        let cur = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                        let s = anchor.min(cur);
+                        let e = anchor.max(cur).saturating_add(1).min(buffer.char_len());
+                        buffer.delete_range(s, e);
+                        *last_vim_key = None;
+                        *vim_mode = crate::VimMode::Normal;
+                        return false;
+                    }
+                }
+                buffer.delete_char_at_cursor();
+                *last_vim_key = None;
+                false
+            }
             'd' => {
                 // If we're in Visual mode, "d" should delete the visual selection.
                 if *vim_mode == crate::VimMode::Visual {
