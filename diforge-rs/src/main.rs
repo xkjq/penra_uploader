@@ -9,6 +9,7 @@ use std::path::PathBuf;
 mod speech;
 mod templates;
 mod dragon_ipc;
+mod vim;
 use speech::{create_vosk_engine, SpeechEngine};
 
 use std::ops::Range;
@@ -75,7 +76,7 @@ fn save_settings(s: &Settings) -> Result<()> {
 }
 
 struct ReportApp {
-    report: String,
+    buffer: vim::ReportBuffer,
     templates: Vec<templates::Template>,
     // speech
     engine: Box<dyn SpeechEngine>,
@@ -94,8 +95,7 @@ struct ReportApp {
     overlay_y: i32,
     overlay_w: i32,
     overlay_h: i32,
-    // last known caret/selection as char indices
-    caret_char_range: Option<Range<usize>>,
+    // (now in `buffer`) last known caret/selection as char indices
     // debug flag to show caret diagnostics
     show_caret_debug: bool,
     // manual pixel offset to correct caret X position when needed (debug tweak)
@@ -115,7 +115,6 @@ impl Default for ReportApp {
         let ipc_writers = dragon_ipc::start_listener(tx);
 
         let mut app = Self {
-            report: String::new(),
             templates: templates::load_templates(),
             engine: create_vosk_engine("models/vosk-small").unwrap_or_else(|_| create_vosk_engine("").unwrap()),
             dictating: false,
@@ -132,7 +131,7 @@ impl Default for ReportApp {
             overlay_y: 100,
             overlay_w: 600,
             overlay_h: 200,
-            caret_char_range: None,
+            buffer: vim::ReportBuffer::new(),
             show_caret_debug: false,
             caret_x_offset: 3.0,
             vim_enabled: false,
@@ -145,11 +144,11 @@ impl Default for ReportApp {
         app.apply_settings(settings);
 
         // Add default multiline text for testing if the report is empty
-        if app.report.is_empty() {
+        if app.buffer.report.is_empty() {
             let sample = "Patient: John Doe\nDOB: 1970-01-01\nStudy: CT Head\n\nFindings:\n- No acute intracranial hemorrhage.\n- Mild chronic microvascular ischemic change.\n\nImpression:\n1. No acute intracranial hemorrhage.\n2. Chronic microvascular ischemic change.\n";
-            app.report = sample.to_string();
-            let pos = app.report.chars().count();
-            app.caret_char_range = Some(pos..pos);
+            app.buffer.report = sample.to_string();
+            let pos = app.buffer.report.chars().count();
+            app.buffer.caret_char_range = Some(pos..pos);
         }
 
         app
@@ -182,201 +181,15 @@ impl ReportApp {
     }
 }
 
-impl ReportApp {
-    fn insert_at_caret(&mut self, insert: &str) {
-        // Insert `insert` into `self.report` at the current caret/selection (char indices).
-        // If there's a selection, replace it. Otherwise insert at cursor or append.
-        let (start_char, end_char) = if let Some(r) = &self.caret_char_range {
-            (r.start, r.end)
-        } else {
-            (self.report.chars().count(), self.report.chars().count())
-        };
-
-        // Convert char indices to byte indices
-        let mut cur = 0usize;
-        let mut start_byte = self.report.len();
-        let mut end_byte = self.report.len();
-        for (b, _) in self.report.char_indices() {
-            if cur == start_char {
-                start_byte = b;
-            }
-            if cur == end_char {
-                end_byte = b;
-                break;
-            }
-            cur += 1;
-        }
-        // If start/end point to end of string
-        if start_char >= self.report.chars().count() {
-            start_byte = self.report.len();
-        }
-        if end_char >= self.report.chars().count() {
-            end_byte = self.report.len();
-        }
-
-        self.report.replace_range(start_byte..end_byte, insert);
-
-        // Update caret to be after inserted text (no selection)
-        let new_char_pos = start_char + insert.chars().count();
-        self.caret_char_range = Some(new_char_pos..new_char_pos);
-    }
-
-    // --- caret movement helpers (operate on char indices) ---
-    fn char_len(&self) -> usize {
-        self.report.chars().count()
-    }
-
-    fn set_caret_pos(&mut self, pos: usize) {
-        let p = pos.min(self.char_len());
-        self.caret_char_range = Some(p..p);
-    }
-
-    fn move_caret_by(&mut self, delta: isize) {
-        let cur = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
-        let new = if delta < 0 {
-            cur.saturating_sub((-delta) as usize)
-        } else {
-            (cur + delta as usize).min(self.char_len())
-        };
-        self.set_caret_pos(new);
-    }
-
-    fn move_word_forward(&mut self) {
-        let chars: Vec<char> = self.report.chars().collect();
-        let mut pos = self.caret_char_range.as_ref().map(|r| r.end).unwrap_or(0);
-        let n = chars.len();
-        while pos < n && !chars[pos].is_alphanumeric() {
-            pos += 1;
-        }
-        while pos < n && chars[pos].is_alphanumeric() {
-            pos += 1;
-        }
-        self.set_caret_pos(pos);
-    }
-
-    fn move_word_backward(&mut self) {
-        let chars: Vec<char> = self.report.chars().collect();
-        let mut pos = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
-        if pos == 0 {
-            return;
-        }
-        // step left skipping non-word, then skip word
-        let mut i = pos;
-        while i > 0 && !chars[i - 1].is_alphanumeric() {
-            i -= 1;
-        }
-        while i > 0 && chars[i - 1].is_alphanumeric() {
-            i -= 1;
-        }
-        self.set_caret_pos(i);
-    }
-
-    fn move_word_end(&mut self) {
-        let chars: Vec<char> = self.report.chars().collect();
-        let mut pos = self.caret_char_range.as_ref().map(|r| r.end).unwrap_or(0);
-        let n = chars.len();
-        while pos < n && !chars[pos].is_alphanumeric() {
-            pos += 1;
-        }
-        while pos < n && chars[pos].is_alphanumeric() {
-            pos += 1;
-        }
-        if pos > 0 { pos -= 1; }
-        self.set_caret_pos(pos);
-    }
-
-    fn move_to_line_bounds(&mut self) -> (usize, usize, usize) {
-        // returns (line_start, line_end_exclusive, col)
-        let chars: Vec<char> = self.report.chars().collect();
-        let pos = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
-        let n = chars.len();
-        // find line start
-        let mut start = 0usize;
-        for i in (0..pos).rev() {
-            if chars[i] == '\n' {
-                start = i + 1;
-                break;
-            }
-        }
-        // find line end (exclusive)
-        let mut end = n;
-        for i in pos..n {
-            if chars[i] == '\n' {
-                end = i + 1; // include newline as part of line end
-                break;
-            }
-        }
-        let col = pos.saturating_sub(start);
-        (start, end, col)
-    }
-
-    fn move_line_up(&mut self) {
-        let chars: Vec<char> = self.report.chars().collect();
-        let pos = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
-        // collect line starts
-        let mut line_starts = Vec::new();
-        let n = chars.len();
-        line_starts.push(0usize);
-        for i in 0..n {
-            if chars[i] == '\n' && i + 1 < n {
-                line_starts.push(i + 1);
-            }
-        }
-        // find current line index
-        let mut line_idx = 0usize;
-        for (i, &s) in line_starts.iter().enumerate() {
-            if s <= pos { line_idx = i; } else { break; }
-        }
-        if line_idx == 0 { return; }
-        let (_, cur_end, col) = self.move_to_line_bounds();
-        let prev_start = line_starts[line_idx - 1];
-        // find prev line end
-        let mut prev_end = n;
-        for i in prev_start..n {
-            if chars[i] == '\n' { prev_end = i + 1; break; }
-        }
-        let target = (prev_start + col).min(prev_end.saturating_sub(1));
-        self.set_caret_pos(target);
-    }
-
-    fn move_line_down(&mut self) {
-        let chars: Vec<char> = self.report.chars().collect();
-        let pos = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
-        let mut line_starts = Vec::new();
-        let n = chars.len();
-        line_starts.push(0usize);
-        for i in 0..n {
-            if chars[i] == '\n' && i + 1 < n {
-                line_starts.push(i + 1);
-            }
-        }
-        // find current line index
-        let mut line_idx = 0usize;
-        for (i, &s) in line_starts.iter().enumerate() {
-            if s <= pos { line_idx = i; } else { break; }
-        }
-        if line_idx + 1 >= line_starts.len() { return; }
-        let (cur_start, cur_end, col) = self.move_to_line_bounds();
-        let next_start = line_starts[line_idx + 1];
-        // find next line end
-        let mut next_end = n;
-        for i in next_start..n {
-            if chars[i] == '\n' { next_end = i + 1; break; }
-        }
-        let target = (next_start + col).min(next_end.saturating_sub(1));
-        self.set_caret_pos(target);
-    }
-}
-
 impl eframe::App for ReportApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // drain any IPC messages (e.g., from Dragon helper) and insert into report
+        // drain any IPC messages (e.g., from Dragon helper) and insert into report buffer
         if let Some(rx) = &self.rx {
             while let Ok(msg) = rx.try_recv() {
-                if !self.report.is_empty() && !self.report.ends_with('\n') {
-                    self.report.push('\n');
+                if !self.buffer.report.is_empty() && !self.buffer.report.ends_with('\n') {
+                    self.buffer.report.push('\n');
                 }
-                self.report.push_str(&msg);
+                self.buffer.report.push_str(&msg);
             }
         }
         // (removed SidePanel overlay; templates render inline when requested)
@@ -396,19 +209,19 @@ impl eframe::App for ReportApp {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         if ui.button("New").clicked() {
-                            self.report.clear();
-                            self.caret_char_range = Some(0..0);
+                            self.buffer.report.clear();
+                            self.buffer.caret_char_range = Some(0..0);
                         }
                         if ui.button("Open...").clicked() {
                             if let Some(path) = rfd::FileDialog::new().pick_file() {
                                 if let Ok(txt) = fs::read_to_string(path) {
-                                    self.report = txt;
+                                    self.buffer.report = txt;
                                 }
                             }
                         }
                         if ui.button("Save...").clicked() {
                             if let Some(path) = rfd::FileDialog::new().save_file() {
-                                let _ = fs::write(path, &self.report);
+                                let _ = fs::write(path, &self.buffer.report);
                             }
                         }
                         if ui.button("Attach Dragon Overlay").clicked() {
@@ -419,14 +232,14 @@ impl eframe::App for ReportApp {
                         let templates_top = self.templates.clone();
                         for (i, t) in templates_top.iter().enumerate() {
                             if ui.small_button(format!("T{}", i + 1)).clicked() {
-                                // Insert at caret (or append)
-                                let mut body = t.body.clone();
-                                if !self.report.is_empty() && !self.report.ends_with('\n') && self.caret_char_range.is_none() {
-                                    // if no caret known, preserve previous append behavior and add newline
-                                    body = format!("\n{}", body);
+                                    // Insert at caret (or append)
+                                    let mut body = t.body.clone();
+                                    if !self.buffer.report.is_empty() && !self.buffer.report.ends_with('\n') && self.buffer.caret_char_range.is_none() {
+                                        // if no caret known, preserve previous append behavior and add newline
+                                        body = format!("\n{}", body);
+                                    }
+                                    self.buffer.insert_at_caret(&body);
                                 }
-                                self.insert_at_caret(&body);
-                            }
                         }
                     });
 
@@ -434,7 +247,10 @@ impl eframe::App for ReportApp {
 
                     ui.label("Radiology report");
                     // Show the editable report and capture TextEdit output so we can track/store the cursor.
-                    let text_edit = egui::TextEdit::multiline(&mut self.report)
+                    // If Vim emulation is enabled and we are NOT in Insert mode, prevent the TextEdit
+                    // from applying direct edits by restoring any accidental changes.
+                    let prev_report = self.buffer.report.clone();
+                    let text_edit = egui::TextEdit::multiline(&mut self.buffer.report)
                         .desired_rows(20)
                         .desired_width(left_w)
                         // only lock focus when in Insert mode so Normal mode can intercept keys
@@ -445,7 +261,14 @@ impl eframe::App for ReportApp {
                     // Update stored caret char range from the widget's reported cursor_range
                     if let Some(ccr) = output.cursor_range {
                         let sorted = ccr.as_sorted_char_range();
-                        self.caret_char_range = Some(sorted);
+                        self.buffer.caret_char_range = Some(sorted);
+                    }
+
+                    // If vim emulation is active but we're not in Insert mode, revert any
+                    // direct text changes the TextEdit may have applied (so Normal mode
+                    // keystrokes are handled by our modal logic instead).
+                    if self.vim_enabled && self.vim_mode != VimMode::Insert && self.buffer.report != prev_report {
+                        self.buffer.report = prev_report;
                     }
 
                     // Vim emulation: intercept global events when enabled
@@ -472,88 +295,32 @@ impl eframe::App for ReportApp {
                                                         self.vim_mode = VimMode::Insert;
                                                         // request focus immediately and restore cursor state
                                                         output.response.request_focus();
-                                                        if let Some(range) = &self.caret_char_range {
+                                                        if let Some(range) = &self.buffer.caret_char_range {
                                                             let start = CCursor::new(range.start);
                                                             let end = CCursor::new(range.end);
                                                             output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
                                                             output.state.clone().store(ctx, output.response.id);
                                                         } else {
                                                             // place caret at end
-                                                            let pos = self.report.chars().count();
+                                                            let pos = self.buffer.report.chars().count();
                                                             let start = CCursor::new(pos);
                                                             output.state.cursor.set_char_range(Some(CCursorRange::one(start)));
                                                             output.state.clone().store(ctx, output.response.id);
                                                         }
                                                     }
-                                                    'h' => { self.move_caret_by(-1); }
-                                                    'l' => { self.move_caret_by(1); }
-                                                    'j' => { self.move_line_down(); }
-                                                    'k' => { self.move_line_up(); }
-                                                    'w' => { self.move_word_forward(); }
-                                                    'b' => { self.move_word_backward(); }
-                                                    'e' => { self.move_word_end(); }
-                                                    '0' => { let (s, _e, _c) = self.move_to_line_bounds(); self.set_caret_pos(s); }
-                                                    '$' => { let (_s, e, _c) = self.move_to_line_bounds(); if e>0 { self.set_caret_pos(e.saturating_sub(1)); } }
-                                                'x' => {
-                                                    // delete char at cursor
-                                                    if let Some(range) = &self.caret_char_range {
-                                                        let pos = range.start;
-                                                        let total = self.report.chars().count();
-                                                        if pos < total {
-                                                            // find byte indices
-                                                            let mut cur = 0usize;
-                                                            let mut bstart = self.report.len();
-                                                            let mut bend = self.report.len();
-                                                            for (b, _) in self.report.char_indices() {
-                                                                if cur == pos {
-                                                                    bstart = b;
-                                                                }
-                                                                if cur == pos + 1 {
-                                                                    bend = b;
-                                                                    break;
-                                                                }
-                                                                cur += 1;
-                                                            }
-                                                            if bstart <= bend {
-                                                                self.report.replace_range(bstart..bend, "");
-                                                            }
-                                                        }
-                                                    }
-                                                }
+                                                    'h' => { self.buffer.move_caret_by(-1); }
+                                                    'l' => { self.buffer.move_caret_by(1); }
+                                                    'j' => { self.buffer.move_line_down(); }
+                                                    'k' => { self.buffer.move_line_up(); }
+                                                    'w' => { self.buffer.move_word_forward(); }
+                                                    'b' => { self.buffer.move_word_backward(); }
+                                                    'e' => { self.buffer.move_word_end(); }
+                                                    '0' => { let (s, _e, _c) = self.buffer.move_to_line_bounds(); self.buffer.set_caret_pos(s); }
+                                                    '$' => { let (_s, e, _c) = self.buffer.move_to_line_bounds(); if e>0 { self.buffer.set_caret_pos(e.saturating_sub(1)); } }
+                                                'x' => { self.buffer.delete_char_at_cursor(); }
                                                 'd' => {
                                                     if self.last_vim_key == Some('d') {
-                                                        // dd: delete current line
-                                                        if let Some(range) = &self.caret_char_range {
-                                                            let pos = range.start;
-                                                            let s = &self.report;
-                                                            // find line start
-                                                            let mut cur = 0usize;
-                                                            let mut line_start_byte = 0usize;
-                                                            let mut line_end_byte = s.len();
-                                                            for (b, ch) in s.char_indices() {
-                                                                if cur == pos {
-                                                                    // walk backwards to line start
-                                                                    let prefix = &s[..b];
-                                                                    if let Some(idx) = prefix.rfind('\n') {
-                                                                        line_start_byte = idx + 1;
-                                                                    } else {
-                                                                        line_start_byte = 0;
-                                                                    }
-                                                                    // find line end
-                                                                    if let Some(rest) = s[b..].find('\n') {
-                                                                        line_end_byte = b + rest + 1;
-                                                                    } else {
-                                                                        line_end_byte = s.len();
-                                                                    }
-                                                                    break;
-                                                                }
-                                                                cur += 1;
-                                                            }
-                                                            if line_start_byte < line_end_byte {
-                                                                self.report.replace_range(line_start_byte..line_end_byte, "");
-                                                                self.caret_char_range = Some(line_start_byte..line_start_byte);
-                                                            }
-                                                        }
+                                                        self.buffer.delete_current_line();
                                                         self.last_vim_key = None;
                                                     } else {
                                                         self.last_vim_key = Some('d');
@@ -579,7 +346,7 @@ impl eframe::App for ReportApp {
                     }
 
                     // If we already have a desired caret position (e.g. from an insert earlier this frame), push it into widget state
-                    if let Some(range) = &self.caret_char_range {
+                    if let Some(range) = &self.buffer.caret_char_range {
                         let start = CCursor::new(range.start);
                         let end = CCursor::new(range.end);
                         output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
@@ -590,7 +357,7 @@ impl eframe::App for ReportApp {
                     if !output.response.has_focus() {
                         // Try to use the widget-reported cursor_range, otherwise fall back to our stored `caret_char_range`.
                         let maybe_ccr = output.cursor_range.or_else(|| {
-                            self.caret_char_range.as_ref().map(|r| CCursorRange::two(CCursor::new(r.start), CCursor::new(r.end)))
+                            self.buffer.caret_char_range.as_ref().map(|r| CCursorRange::two(CCursor::new(r.start), CCursor::new(r.end)))
                         });
 
                         if let Some(ccr) = maybe_ccr {
@@ -613,7 +380,7 @@ impl eframe::App for ReportApp {
                             );
                             if self.show_caret_debug {
                                 painter.circle_filled(egui::pos2(x, y0), 4.0, egui::Color32::from_rgb(80, 200, 255));
-                                let info = format!("screen: {:.1},{:.1}  char_range: {:?}", screen_pos.x + self.caret_x_offset, screen_pos.y, self.caret_char_range);
+                                let info = format!("screen: {:.1},{:.1}  char_range: {:?}", screen_pos.x + self.caret_x_offset, screen_pos.y, self.buffer.caret_char_range);
                                 painter.text(
                                     egui::pos2(output.response.rect.min.x + 6.0, output.response.rect.min.y + 6.0),
                                     egui::Align2::LEFT_TOP,
@@ -634,7 +401,7 @@ impl eframe::App for ReportApp {
                             let h = rect.height().round() as i32;
                             let cmd = serde_json::json!({
                                 "cmd": "show_overlay",
-                                "text": self.report,
+                                "text": self.buffer.report,
                                 "x": x,
                                 "y": y,
                                 "w": w,
@@ -646,7 +413,7 @@ impl eframe::App for ReportApp {
                     }
 
                     // Show caret position below the text edit so user always sees it
-                    if let Some(range) = &self.caret_char_range {
+                    if let Some(range) = &self.buffer.caret_char_range {
                         ui.label(format!("Caret: {}{}",
                             range.end,
                             if range.start != range.end { format!(" (sel {}..{})", range.start, range.end) } else { String::new() }
@@ -760,10 +527,10 @@ impl eframe::App for ReportApp {
                                         let vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
                                         let rendered = templates::render_template(&t.body, &vars);
                                         let mut body = rendered.clone();
-                                        if !self.report.is_empty() && !self.report.ends_with('\n') && self.caret_char_range.is_none() {
-                                            body = format!("\n{}", body);
-                                        }
-                                        self.insert_at_caret(&body);
+                                                    if !self.buffer.report.is_empty() && !self.buffer.report.ends_with('\n') && self.buffer.caret_char_range.is_none() {
+                                                        body = format!("\n{}", body);
+                                                    }
+                                                    self.buffer.insert_at_caret(&body);
                                         // After inserting ensure widget state will be updated next frame by the TextEdit output handling
                                     }
                                     ui.label(title);
