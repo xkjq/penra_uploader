@@ -367,10 +367,13 @@ impl eframe::App for ReportApp {
                         // and the current caret. This drives the TextEdit's selection rendering.
                         if let Some(anchor) = self.visual_anchor {
                             let cur = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
-                            let s = anchor.min(cur);
-                            let e = anchor.max(cur);
-                            let start = CCursor::new(s);
-                            let end = CCursor::new((e).min(self.buffer.char_len()).saturating_add( (if e> s {1} else {0}) ));
+                                let s = anchor.min(cur);
+                                let e = anchor.max(cur);
+                                // Extend the shown cursor range for any non-empty selection
+                                // so the final character is included (ranges are end-exclusive).
+                                let extend = if e > s { 1 } else { 0 };
+                                let start = CCursor::new(s);
+                                let end = CCursor::new((e).min(self.buffer.char_len()).saturating_add(extend));
                             output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
                             output.state.store(ui.ctx(), output.response.id);
                         } else if let Some(range) = &self.buffer.caret_char_range {
@@ -412,12 +415,15 @@ impl eframe::App for ReportApp {
                                     let cur = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
                                     let s = anchor.min(cur);
                                     let e = anchor.max(cur);
-                                    if s < e {
+                                    // Display the selection inclusive of the final character
+                                    // for any non-empty selection.
+                                    let e_display = if e > s { e.saturating_add(1) } else { e };
+                                    if s < e_display {
                                         // Determine exact per-line glyph bounds by splitting the selected
                                         // substring on newline boundaries and mapping each segment back
                                         // to absolute char indices to query `pos_from_cursor`.
                                         let report = &self.buffer.report;
-                                        let sel = report.chars().skip(s).take(e - s).collect::<String>();
+                                        let sel = report.chars().skip(s).take(e_display.saturating_sub(s)).collect::<String>();
                                         let mut offset = 0usize;
                                         let mut abs_index = s;
                                         for (i, line) in sel.split('\n').enumerate() {

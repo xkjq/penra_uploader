@@ -977,7 +977,9 @@ impl ReportBuffer {
                     if let Some(anchor) = visual_anchor.take() {
                         let cur = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
                         let s = anchor.min(cur);
-                        let e = anchor.max(cur);
+                        // Always extend non-empty visual selections to include the
+                        // final character (ranges are end-exclusive).
+                        let mut e = anchor.max(cur).saturating_add(1).min(buffer.char_len());
                         buffer.delete_range(s, e);
                         *last_vim_key = None;
                         *vim_mode = crate::VimMode::Normal;
