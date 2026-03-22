@@ -120,6 +120,59 @@ impl ReportBuffer {
         self.report.chars().count()
     }
 
+    fn char_to_byte_index(&self, char_pos: usize) -> usize {
+        let mut cur = 0usize;
+        for (b, _) in self.report.char_indices() {
+            if cur == char_pos {
+                return b;
+            }
+            cur += 1;
+        }
+        self.report.len()
+    }
+
+    fn delete_range(&mut self, start_char: usize, end_char: usize) {
+        if start_char >= end_char { return; }
+        self.push_undo_snapshot();
+        let start_byte = self.char_to_byte_index(start_char);
+        let end_byte = self.char_to_byte_index(end_char);
+        if start_byte <= end_byte && end_byte <= self.report.len() {
+            self.report.replace_range(start_byte..end_byte, "");
+            self.caret_char_range = Some(start_char..start_char);
+        }
+    }
+
+    fn next_word_start_from(&self, pos: usize) -> usize {
+        let chars: Vec<char> = self.report.chars().collect();
+        let mut p = pos;
+        let n = chars.len();
+        if p < n && chars[p].is_alphanumeric() {
+            while p < n && chars[p].is_alphanumeric() { p += 1; }
+        }
+        while p < n && !chars[p].is_alphanumeric() { p += 1; }
+        p
+    }
+
+    fn prev_word_start_from(&self, pos: usize) -> usize {
+        let chars: Vec<char> = self.report.chars().collect();
+        if pos == 0 { return 0; }
+        let mut i = pos;
+        while i > 0 && !chars[i - 1].is_alphanumeric() { i -= 1; }
+        while i > 0 && chars[i - 1].is_alphanumeric() { i -= 1; }
+        i
+    }
+
+    fn word_end_from(&self, pos: usize) -> usize {
+        let chars: Vec<char> = self.report.chars().collect();
+        let mut p = pos;
+        let n = chars.len();
+        // advance to start of next word
+        while p < n && !chars[p].is_alphanumeric() { p += 1; }
+        // advance to end of that word
+        while p < n && chars[p].is_alphanumeric() { p += 1; }
+        if p > 0 { p - 1 } else { 0 }
+    }
+
     pub fn set_caret_pos(&mut self, pos: usize) {
         let p = pos.min(self.char_len());
         self.caret_char_range = Some(p..p);
@@ -406,27 +459,124 @@ impl ReportBuffer {
                 true
             }
             'o' => {
+                // Start grouping before creating the new line so subsequent typing
+                // becomes part of the same undo step (Vim-like behavior).
+                buffer.start_undo_group();
                 buffer.open_line_below();
                 *vim_mode = crate::VimMode::Insert;
-                buffer.start_undo_group();
                 *last_vim_key = None;
                 true
             }
             'O' => {
+                buffer.start_undo_group();
                 buffer.open_line_above();
                 *vim_mode = crate::VimMode::Insert;
-                buffer.start_undo_group();
                 *last_vim_key = None;
                 true
             }
             'u' => { buffer.undo(); *last_vim_key = None; false }
-            'h' => { buffer.move_caret_by(-1); *last_vim_key = None; false }
-            'l' => { buffer.move_caret_by(1); *last_vim_key = None; false }
+            
             'j' => { buffer.move_line_down(); *last_vim_key = None; false }
             'k' => { buffer.move_line_up(); *last_vim_key = None; false }
-            'w' => { buffer.move_word_forward(); *last_vim_key = None; false }
-            'b' => { buffer.move_word_backward(); *last_vim_key = None; false }
-            'e' => { buffer.move_word_end(); *last_vim_key = None; false }
+            'w' => {
+                if *last_vim_key == Some('d') {
+                    let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    let end = buffer.next_word_start_from(start);
+                    buffer.delete_range(start, end);
+                    *last_vim_key = None;
+                    false
+                } else if *last_vim_key == Some('c') {
+                    let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    let end = buffer.next_word_start_from(start);
+                    buffer.start_undo_group();
+                    buffer.delete_range(start, end);
+                    *last_vim_key = None;
+                    *vim_mode = crate::VimMode::Insert;
+                    true
+                } else {
+                    buffer.move_word_forward(); *last_vim_key = None; false
+                }
+            }
+            'b' => {
+                if *last_vim_key == Some('d') {
+                    let start = buffer.prev_word_start_from(buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0));
+                    let end = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    buffer.delete_range(start, end);
+                    *last_vim_key = None;
+                    false
+                } else if *last_vim_key == Some('c') {
+                    let start = buffer.prev_word_start_from(buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0));
+                    let end = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    buffer.start_undo_group();
+                    buffer.delete_range(start, end);
+                    *last_vim_key = None;
+                    *vim_mode = crate::VimMode::Insert;
+                    true
+                } else {
+                    buffer.move_word_backward(); *last_vim_key = None; false
+                }
+            }
+            'e' => {
+                if *last_vim_key == Some('d') {
+                    let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    let end_char = buffer.word_end_from(start);
+                    buffer.delete_range(start, end_char.saturating_add(1));
+                    *last_vim_key = None;
+                    false
+                } else if *last_vim_key == Some('c') {
+                    let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    let end_char = buffer.word_end_from(start);
+                    buffer.start_undo_group();
+                    buffer.delete_range(start, end_char.saturating_add(1));
+                    *last_vim_key = None;
+                    *vim_mode = crate::VimMode::Insert;
+                    true
+                } else {
+                    buffer.move_word_end(); *last_vim_key = None; false
+                }
+            }
+            // motions that can be used with operators (d, c)
+            'h' | 'l' => {
+                if *last_vim_key == Some('d') {
+                    // delete single char left/right
+                    let start = if ch == 'h' {
+                        let cur = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                        cur.saturating_sub(1)
+                    } else {
+                        buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0)
+                    };
+                    let end = if ch == 'h' {
+                        buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0)
+                    } else {
+                        (buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0) + 1).min(buffer.char_len())
+                    };
+                    buffer.delete_range(start, end);
+                    *last_vim_key = None;
+                    false
+                } else if *last_vim_key == Some('c') {
+                    // change single char and enter insert
+                    buffer.start_undo_group();
+                    let start = if ch == 'h' {
+                        let cur = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                        cur.saturating_sub(1)
+                    } else {
+                        buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0)
+                    };
+                    let end = if ch == 'h' {
+                        buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0)
+                    } else {
+                        (buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0) + 1).min(buffer.char_len())
+                    };
+                    buffer.delete_range(start, end);
+                    *last_vim_key = None;
+                    *vim_mode = crate::VimMode::Insert;
+                    true
+                } else {
+                    if ch == 'h' { buffer.move_caret_by(-1); } else { buffer.move_caret_by(1); }
+                    *last_vim_key = None;
+                    false
+                }
+            }
             'x' => { buffer.delete_char_at_cursor(); *last_vim_key = None; false }
             'd' => {
                 if *last_vim_key == Some('d') {
@@ -435,6 +585,11 @@ impl ReportBuffer {
                 } else {
                     *last_vim_key = Some('d');
                 }
+                false
+            }
+            'c' => {
+                // operator-pending: wait for next motion (handled in motion arms)
+                *last_vim_key = Some('c');
                 false
             }
             _ => { *last_vim_key = None; false }
