@@ -3,6 +3,14 @@
         "cargo build": true,
         "git checkout": true,
         "cargo test": true,
-        "cargo run": true
+        "cargo run": true,
+        "/^bash -lc \"cd diforge-rs && cargo test --quiet\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^bash -lc \"cargo test --quiet\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
     }
 }

@@ -534,6 +534,7 @@ impl ReportBuffer {
         last_vim_key: &mut Option<char>,
         last_vim_object: &mut Option<char>,
         last_vim_count: &mut Option<usize>,
+        visual_anchor: &mut Option<usize>,
         ch: char,
     ) -> bool {
         // If the user typed digits as a count prefix, accumulate them and
@@ -620,6 +621,20 @@ impl ReportBuffer {
                 true
             }
             'u' => { buffer.undo(); *last_vim_key = None; *last_vim_count = None; false }
+            'v' => {
+                // toggle Visual mode and set/clear anchor
+                if *vim_mode == crate::VimMode::Visual {
+                    *vim_mode = crate::VimMode::Normal;
+                    *visual_anchor = None;
+                } else {
+                    let pos = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    *visual_anchor = Some(pos);
+                    *vim_mode = crate::VimMode::Visual;
+                }
+                *last_vim_key = None;
+                *last_vim_count = None;
+                false
+            }
             
             'j' => {
                 // operator-pending: d/j or c/j ranges
@@ -944,6 +959,19 @@ impl ReportBuffer {
             }
             'x' => { buffer.delete_char_at_cursor(); *last_vim_key = None; false }
             'd' => {
+                // If we're in Visual mode, "d" should delete the visual selection.
+                if *vim_mode == crate::VimMode::Visual {
+                    if let Some(anchor) = visual_anchor.take() {
+                        let cur = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                        let s = anchor.min(cur);
+                        let e = anchor.max(cur);
+                        buffer.delete_range(s, e);
+                        *last_vim_key = None;
+                        *vim_mode = crate::VimMode::Normal;
+                        return false;
+                    }
+                }
+
                 if *last_vim_key == Some('d') {
                     // 'dd' or 'Ndd' deletes whole lines. Honor count if present.
                     let count = last_vim_count.take().unwrap_or(1);
@@ -1070,7 +1098,8 @@ mod tests {
         let mut last = None;
         let mut count = None;
         let mut obj: Option<char> = None;
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'a');
+        let mut anchor: Option<usize> = None;
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'a');
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, 1);
     }
 
@@ -1103,7 +1132,8 @@ mod tests {
         let mut last = None;
         let mut count = None;
         let mut obj: Option<char> = None;
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'I');
+        let mut anchor: Option<usize> = None;
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'I');
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, s);
     }
 
@@ -1124,7 +1154,8 @@ mod tests {
         let mut last = None;
         let mut count = None;
         let mut obj: Option<char> = None;
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'o');
+        let mut anchor: Option<usize> = None;
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'o');
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, insert_pos + 1);
     }
 
@@ -1156,8 +1187,9 @@ mod tests {
         let mut last = None;
         let mut count = None;
         let mut obj: Option<char> = None;
+        let mut anchor: Option<usize> = None;
         let prev = b.report.clone();
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'o');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'o');
 
         // simulate typing in Insert mode (TextEdit would normally do this)
         b.insert_at_caret("hello");
@@ -1187,9 +1219,10 @@ mod tests {
         let mut last = None;
         let mut count = None;
         let mut obj: Option<char> = None;
+        let mut anchor: Option<usize> = None;
         let prev = b.report.clone();
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'd');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'w');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'w');
 
         assert_eq!(b.report, "one three");
 
@@ -1210,10 +1243,11 @@ mod tests {
         let mut last = None;
         let mut count = None;
         let mut obj: Option<char> = None;
+        let mut anchor: Option<usize> = None;
         let prev = b.report.clone();
 
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'c');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'w');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'c');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'w');
 
         // now in Insert mode; simulate typing
         b.insert_at_caret("X");
@@ -1239,10 +1273,11 @@ mod tests {
         let mut last = None;
         let mut count = None;
         let mut obj: Option<char> = None;
+        let mut anchor: Option<usize> = None;
         let prev = b.report.clone();
 
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'd');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
 
         assert_eq!(b.report, "a\nc");
 
@@ -1263,9 +1298,10 @@ mod tests {
         let mut last = None;
         let mut count = None;
         let mut obj: Option<char> = None;
+        let mut anchor: Option<usize> = None;
         // '3h' should move left 3 chars
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, '3');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'h');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, '3');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'h');
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, 2);
     }
 
@@ -1279,9 +1315,10 @@ mod tests {
         let mut last = None;
         let mut count = None;
         let mut obj: Option<char> = None;
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, '3');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'd');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'w');
+        let mut anchor: Option<usize> = None;
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, '3');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'w');
 
         assert_eq!(b.report, "one five");
     }
@@ -1296,11 +1333,12 @@ mod tests {
         let mut last = None;
         let mut count = None;
         let mut obj: Option<char> = None;
+        let mut anchor: Option<usize> = None;
         let prev = b.report.clone();
 
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, '2');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'c');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'w');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, '2');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'c');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'w');
 
         // in Insert mode now; simulate typing
         b.insert_at_caret("X");
@@ -1326,9 +1364,10 @@ mod tests {
         let mut count = None;
         let mut obj: Option<char> = None;
 
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, '3');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'd');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'd');
+        let mut anchor: Option<usize> = None;
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, '3');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
 
         // expect lines b,c,d removed -> remaining a\ne\nf
         assert_eq!(b.report, "a\ne\nf");
@@ -1348,15 +1387,16 @@ mod tests {
 
         // d$ should delete to EOL
         let mut obj: Option<char> = None;
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'd');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, '$');
+        let mut anchor: Option<usize> = None;
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, '$');
         assert_eq!(b.report, "hello \nnext line");
 
         b.undo();
         assert_eq!(b.report, prev);
 
         // now test C (change to end of line) grouped
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'C');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'C');
         // simulate typing
         b.insert_at_caret("X");
         b.end_undo_group();
@@ -1378,11 +1418,12 @@ mod tests {
         let mut last = None;
         let mut count = None;
         let mut obj: Option<char> = None;
+        let mut anchor: Option<usize> = None;
 
         // perform 'd' 'i' 'w'
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'd');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'i');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'w');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'i');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'w');
 
         // expect only the word 'two' removed, surrounding spaces preserved
         assert_eq!(b.report, "one    three");
@@ -1399,13 +1440,42 @@ mod tests {
         let mut last = None;
         let mut count = None;
         let mut obj: Option<char> = None;
+        let mut anchor: Option<usize> = None;
 
         // perform 'd' 'a' 'w'
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'd');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'a');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'w');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'a');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'w');
 
         // expect the word and adjacent whitespace to be removed (current behavior preserves one space on each side)
         assert_eq!(b.report, "one  three");
+    }
+
+    #[test]
+    fn visual_d_deletes_selection_and_exits_visual() {
+        let mut b = ReportBuffer::new();
+        b.report = "abcdef".to_string();
+        // place caret at index 1 (on 'b')
+        b.caret_char_range = Some(1..1);
+
+        let mut mode = crate::VimMode::Normal;
+        let mut last = None;
+        let mut count = None;
+        let mut obj: Option<char> = None;
+        let mut anchor: Option<usize> = None;
+
+        // enter visual mode
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'v');
+        assert_eq!(mode, crate::VimMode::Visual);
+
+        // move right twice (two 'l' motions)
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'l');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'l');
+
+        // now delete selection with 'd' (should remove indices 1..3 -> 'b','c')
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
+
+        assert_eq!(b.report, "adef");
+        assert_eq!(mode, crate::VimMode::Normal);
     }
 }

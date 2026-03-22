@@ -108,6 +108,8 @@ struct ReportApp {
     last_vim_key: Option<char>,
     // last text-object prefix `i` or `a` when operator-pending
     last_vim_object: Option<char>,
+    // visual mode anchor (selection start) in char indices
+    visual_anchor: Option<usize>,
     // numeric prefix for vim commands (e.g., `3dw`)
     vim_count: Option<usize>,
 }
@@ -142,6 +144,7 @@ impl Default for ReportApp {
             vim_mode: VimMode::Normal,
             last_vim_key: None,
             last_vim_object: None,
+            visual_anchor: None,
             vim_count: None,
         };
 
@@ -328,8 +331,8 @@ impl eframe::App for ReportApp {
                                     }
                                     let ch = text.chars().next().unwrap();
                                     match self.vim_mode {
-                                        VimMode::Normal => {
-                                            let focus = vim::ReportBuffer::handle_normal_key(&mut self.buffer, &mut self.vim_mode, &mut self.last_vim_key, &mut self.last_vim_object, &mut self.vim_count, ch);
+                                        VimMode::Normal | VimMode::Visual => {
+                                            let focus = vim::ReportBuffer::handle_normal_key(&mut self.buffer, &mut self.vim_mode, &mut self.last_vim_key, &mut self.last_vim_object, &mut self.vim_count, &mut self.visual_anchor, ch);
                                             if focus {
                                                 output.response.request_focus();
                                                 if let Some(range) = &self.buffer.caret_char_range {
@@ -359,11 +362,30 @@ impl eframe::App for ReportApp {
                     }
 
                     // If we already have a desired caret position (e.g. from an insert earlier this frame), push it into widget state
-                    if let Some(range) = &self.buffer.caret_char_range {
-                        let start = CCursor::new(range.start);
-                        let end = CCursor::new(range.end);
-                        output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
-                        output.state.store(ui.ctx(), output.response.id);
+                    if self.vim_mode == VimMode::Visual {
+                        // When in Visual mode, prefer showing a selection between the visual anchor
+                        // and the current caret. This drives the TextEdit's selection rendering.
+                        if let Some(anchor) = self.visual_anchor {
+                            let cur = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                            let s = anchor.min(cur);
+                            let e = anchor.max(cur);
+                            let start = CCursor::new(s);
+                            let end = CCursor::new(e);
+                            output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
+                            output.state.store(ui.ctx(), output.response.id);
+                        } else if let Some(range) = &self.buffer.caret_char_range {
+                            let start = CCursor::new(range.start);
+                            let end = CCursor::new(range.end);
+                            output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
+                            output.state.store(ui.ctx(), output.response.id);
+                        }
+                    } else {
+                        if let Some(range) = &self.buffer.caret_char_range {
+                            let start = CCursor::new(range.start);
+                            let end = CCursor::new(range.end);
+                            output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
+                            output.state.store(ui.ctx(), output.response.id);
+                        }
                     }
 
                     // Draw an unfocused caret indicator so the user can see the caret when the editor is not focused.
