@@ -12,6 +12,13 @@ use speech::{create_vosk_engine, SpeechEngine};
 use std::ops::Range;
 use egui::text::{CCursor, CCursorRange};
 
+#[derive(PartialEq, Eq)]
+enum VimMode {
+    Normal,
+    Insert,
+    Visual,
+}
+
 struct ReportApp {
     report: String,
     templates: Vec<templates::Template>,
@@ -38,6 +45,12 @@ struct ReportApp {
     show_caret_debug: bool,
     // manual pixel offset to correct caret X position when needed (debug tweak)
     caret_x_offset: f32,
+    // enable modal vim-like keybindings
+    vim_enabled: bool,
+    // current vim mode
+    vim_mode: VimMode,
+    // last key pressed (for multi-key commands like dd)
+    last_vim_key: Option<char>,
 }
 
 impl Default for ReportApp {
@@ -67,6 +80,9 @@ impl Default for ReportApp {
             caret_char_range: None,
             show_caret_debug: false,
             caret_x_offset: 3.0,
+            vim_enabled: false,
+            vim_mode: VimMode::Normal,
+            last_vim_key: None,
         }
     }
 }
@@ -108,6 +124,152 @@ impl ReportApp {
         // Update caret to be after inserted text (no selection)
         let new_char_pos = start_char + insert.chars().count();
         self.caret_char_range = Some(new_char_pos..new_char_pos);
+    }
+
+    // --- caret movement helpers (operate on char indices) ---
+    fn char_len(&self) -> usize {
+        self.report.chars().count()
+    }
+
+    fn set_caret_pos(&mut self, pos: usize) {
+        let p = pos.min(self.char_len());
+        self.caret_char_range = Some(p..p);
+    }
+
+    fn move_caret_by(&mut self, delta: isize) {
+        let cur = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+        let new = if delta < 0 {
+            cur.saturating_sub((-delta) as usize)
+        } else {
+            (cur + delta as usize).min(self.char_len())
+        };
+        self.set_caret_pos(new);
+    }
+
+    fn move_word_forward(&mut self) {
+        let chars: Vec<char> = self.report.chars().collect();
+        let mut pos = self.caret_char_range.as_ref().map(|r| r.end).unwrap_or(0);
+        let n = chars.len();
+        while pos < n && !chars[pos].is_alphanumeric() {
+            pos += 1;
+        }
+        while pos < n && chars[pos].is_alphanumeric() {
+            pos += 1;
+        }
+        self.set_caret_pos(pos);
+    }
+
+    fn move_word_backward(&mut self) {
+        let chars: Vec<char> = self.report.chars().collect();
+        let mut pos = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+        if pos == 0 {
+            return;
+        }
+        // step left skipping non-word, then skip word
+        let mut i = pos;
+        while i > 0 && !chars[i - 1].is_alphanumeric() {
+            i -= 1;
+        }
+        while i > 0 && chars[i - 1].is_alphanumeric() {
+            i -= 1;
+        }
+        self.set_caret_pos(i);
+    }
+
+    fn move_word_end(&mut self) {
+        let chars: Vec<char> = self.report.chars().collect();
+        let mut pos = self.caret_char_range.as_ref().map(|r| r.end).unwrap_or(0);
+        let n = chars.len();
+        while pos < n && !chars[pos].is_alphanumeric() {
+            pos += 1;
+        }
+        while pos < n && chars[pos].is_alphanumeric() {
+            pos += 1;
+        }
+        if pos > 0 { pos -= 1; }
+        self.set_caret_pos(pos);
+    }
+
+    fn move_to_line_bounds(&mut self) -> (usize, usize, usize) {
+        // returns (line_start, line_end_exclusive, col)
+        let chars: Vec<char> = self.report.chars().collect();
+        let pos = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+        let n = chars.len();
+        // find line start
+        let mut start = 0usize;
+        for i in (0..pos).rev() {
+            if chars[i] == '\n' {
+                start = i + 1;
+                break;
+            }
+        }
+        // find line end (exclusive)
+        let mut end = n;
+        for i in pos..n {
+            if chars[i] == '\n' {
+                end = i + 1; // include newline as part of line end
+                break;
+            }
+        }
+        let col = pos.saturating_sub(start);
+        (start, end, col)
+    }
+
+    fn move_line_up(&mut self) {
+        let chars: Vec<char> = self.report.chars().collect();
+        let pos = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+        // collect line starts
+        let mut line_starts = Vec::new();
+        let n = chars.len();
+        line_starts.push(0usize);
+        for i in 0..n {
+            if chars[i] == '\n' && i + 1 < n {
+                line_starts.push(i + 1);
+            }
+        }
+        // find current line index
+        let mut line_idx = 0usize;
+        for (i, &s) in line_starts.iter().enumerate() {
+            if s <= pos { line_idx = i; } else { break; }
+        }
+        if line_idx == 0 { return; }
+        let (_, cur_end, col) = self.move_to_line_bounds();
+        let prev_start = line_starts[line_idx - 1];
+        // find prev line end
+        let mut prev_end = n;
+        for i in prev_start..n {
+            if chars[i] == '\n' { prev_end = i + 1; break; }
+        }
+        let target = (prev_start + col).min(prev_end.saturating_sub(1));
+        self.set_caret_pos(target);
+    }
+
+    fn move_line_down(&mut self) {
+        let chars: Vec<char> = self.report.chars().collect();
+        let pos = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+        let mut line_starts = Vec::new();
+        let n = chars.len();
+        line_starts.push(0usize);
+        for i in 0..n {
+            if chars[i] == '\n' && i + 1 < n {
+                line_starts.push(i + 1);
+            }
+        }
+        // find current line index
+        let mut line_idx = 0usize;
+        for (i, &s) in line_starts.iter().enumerate() {
+            if s <= pos { line_idx = i; } else { break; }
+        }
+        if line_idx + 1 >= line_starts.len() { return; }
+        let (cur_start, cur_end, col) = self.move_to_line_bounds();
+        let next_start = line_starts[line_idx + 1];
+        // find next line end
+        let mut next_end = n;
+        for i in next_start..n {
+            if chars[i] == '\n' { next_end = i + 1; break; }
+        }
+        let target = (next_start + col).min(next_end.saturating_sub(1));
+        self.set_caret_pos(target);
     }
 }
 
@@ -180,7 +342,8 @@ impl eframe::App for ReportApp {
                     let text_edit = egui::TextEdit::multiline(&mut self.report)
                         .desired_rows(20)
                         .desired_width(left_w)
-                        .lock_focus(true);
+                        // only lock focus when in Insert mode so Normal mode can intercept keys
+                        .lock_focus(self.vim_enabled && self.vim_mode == VimMode::Insert);
 
                     let mut output = text_edit.show(ui);
 
@@ -188,6 +351,136 @@ impl eframe::App for ReportApp {
                     if let Some(ccr) = output.cursor_range {
                         let sorted = ccr.as_sorted_char_range();
                         self.caret_char_range = Some(sorted);
+                    }
+
+                    // Vim emulation: intercept global events when enabled
+                    if self.vim_enabled {
+                        use egui::Event;
+
+                        let events = ctx.input(|i| i.events.clone());
+                        for ev in events.iter() {
+                            match ev {
+                                Event::Key { key: egui::Key::Escape, pressed: true, .. } => {
+                                    // Escape always returns to Normal mode
+                                    self.vim_mode = VimMode::Normal;
+                                    self.last_vim_key = None;
+                                }
+                                Event::Text(text) => {
+                                    if text.is_empty() {
+                                        continue;
+                                    }
+                                    let ch = text.chars().next().unwrap();
+                                    match self.vim_mode {
+                                        VimMode::Normal => {
+                                            match ch {
+                                                    'i' => {
+                                                        self.vim_mode = VimMode::Insert;
+                                                        // request focus immediately and restore cursor state
+                                                        output.response.request_focus();
+                                                        if let Some(range) = &self.caret_char_range {
+                                                            let start = CCursor::new(range.start);
+                                                            let end = CCursor::new(range.end);
+                                                            output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
+                                                            output.state.clone().store(ctx, output.response.id);
+                                                        } else {
+                                                            // place caret at end
+                                                            let pos = self.report.chars().count();
+                                                            let start = CCursor::new(pos);
+                                                            output.state.cursor.set_char_range(Some(CCursorRange::one(start)));
+                                                            output.state.clone().store(ctx, output.response.id);
+                                                        }
+                                                    }
+                                                    'h' => { self.move_caret_by(-1); }
+                                                    'l' => { self.move_caret_by(1); }
+                                                    'j' => { self.move_line_down(); }
+                                                    'k' => { self.move_line_up(); }
+                                                    'w' => { self.move_word_forward(); }
+                                                    'b' => { self.move_word_backward(); }
+                                                    'e' => { self.move_word_end(); }
+                                                    '0' => { let (s, _e, _c) = self.move_to_line_bounds(); self.set_caret_pos(s); }
+                                                    '$' => { let (_s, e, _c) = self.move_to_line_bounds(); if e>0 { self.set_caret_pos(e.saturating_sub(1)); } }
+                                                'x' => {
+                                                    // delete char at cursor
+                                                    if let Some(range) = &self.caret_char_range {
+                                                        let pos = range.start;
+                                                        let total = self.report.chars().count();
+                                                        if pos < total {
+                                                            // find byte indices
+                                                            let mut cur = 0usize;
+                                                            let mut bstart = self.report.len();
+                                                            let mut bend = self.report.len();
+                                                            for (b, _) in self.report.char_indices() {
+                                                                if cur == pos {
+                                                                    bstart = b;
+                                                                }
+                                                                if cur == pos + 1 {
+                                                                    bend = b;
+                                                                    break;
+                                                                }
+                                                                cur += 1;
+                                                            }
+                                                            if bstart <= bend {
+                                                                self.report.replace_range(bstart..bend, "");
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                'd' => {
+                                                    if self.last_vim_key == Some('d') {
+                                                        // dd: delete current line
+                                                        if let Some(range) = &self.caret_char_range {
+                                                            let pos = range.start;
+                                                            let s = &self.report;
+                                                            // find line start
+                                                            let mut cur = 0usize;
+                                                            let mut line_start_byte = 0usize;
+                                                            let mut line_end_byte = s.len();
+                                                            for (b, ch) in s.char_indices() {
+                                                                if cur == pos {
+                                                                    // walk backwards to line start
+                                                                    let prefix = &s[..b];
+                                                                    if let Some(idx) = prefix.rfind('\n') {
+                                                                        line_start_byte = idx + 1;
+                                                                    } else {
+                                                                        line_start_byte = 0;
+                                                                    }
+                                                                    // find line end
+                                                                    if let Some(rest) = s[b..].find('\n') {
+                                                                        line_end_byte = b + rest + 1;
+                                                                    } else {
+                                                                        line_end_byte = s.len();
+                                                                    }
+                                                                    break;
+                                                                }
+                                                                cur += 1;
+                                                            }
+                                                            if line_start_byte < line_end_byte {
+                                                                self.report.replace_range(line_start_byte..line_end_byte, "");
+                                                                self.caret_char_range = Some(line_start_byte..line_start_byte);
+                                                            }
+                                                        }
+                                                        self.last_vim_key = None;
+                                                    } else {
+                                                        self.last_vim_key = Some('d');
+                                                    }
+                                                }
+                                                _ => {
+                                                    // unhandled normal-mode key
+                                                    self.last_vim_key = None;
+                                                }
+                                            }
+                                        }
+                                        VimMode::Insert => {
+                                            // in Insert mode, normal text events are handled by TextEdit; we only intercept Escape above
+                                        }
+                                        VimMode::Visual => {
+                                            // not implemented yet
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                     }
 
                     // If we already have a desired caret position (e.g. from an insert earlier this frame), push it into widget state
@@ -267,7 +560,22 @@ impl eframe::App for ReportApp {
                         ui.label("Caret: -");
                     }
 
-                    ui.checkbox(&mut self.show_caret_debug, "Debug caret pos");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.show_caret_debug, "Debug caret pos");
+                        let vim_resp = ui.checkbox(&mut self.vim_enabled, "Vim emulation");
+                        if vim_resp.changed() {
+                            if self.vim_enabled {
+                                self.vim_mode = VimMode::Normal;
+                                self.last_vim_key = None;
+                            }
+                        }
+                        let mode_label = match self.vim_mode {
+                            VimMode::Normal => "Normal",
+                            VimMode::Insert => "Insert",
+                            VimMode::Visual => "Visual",
+                        };
+                        ui.label(format!("Mode: {}", mode_label));
+                    });
                     if self.show_caret_debug {
                         ui.add(egui::Slider::new(&mut self.caret_x_offset, -40.0..=40.0).text("Caret X offset"));
                     }
