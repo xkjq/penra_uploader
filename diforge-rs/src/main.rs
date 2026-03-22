@@ -326,14 +326,8 @@ impl eframe::App for ReportApp {
                                                         }
                                                     }
                                                     'A' => {
-                                                        // append at end of line: compute insertion point just before newline if present
-                                                        let (_s, e, _c) = self.buffer.move_to_line_bounds();
-                                                        let target = if e > 0 {
-                                                            // check previous char
-                                                            let prev = self.buffer.report.chars().nth(e - 1);
-                                                            if prev == Some('\n') { e.saturating_sub(1) } else { e }
-                                                        } else { e };
-                                                        self.buffer.set_caret_pos(target);
+                                                        // append at end of line: use shared helper
+                                                        self.buffer.append_at_end_of_line();
                                                         self.vim_mode = VimMode::Insert;
                                                         output.response.request_focus();
                                                         if let Some(range) = &self.buffer.caret_char_range {
@@ -357,14 +351,8 @@ impl eframe::App for ReportApp {
                                                         }
                                                     }
                                                     'o' => {
-                                                        // open new line below: insert newline at end-of-line insertion point
-                                                        let (_s, e, _c) = self.buffer.move_to_line_bounds();
-                                                        let insert_pos = if e > 0 {
-                                                            let prev = self.buffer.report.chars().nth(e - 1);
-                                                            if prev == Some('\n') { e.saturating_sub(1) } else { e }
-                                                        } else { e };
-                                                        self.buffer.set_caret_pos(insert_pos);
-                                                        self.buffer.insert_at_caret("\n");
+                                                        // open new line below: use shared helper
+                                                        self.buffer.open_line_below();
                                                         self.vim_mode = VimMode::Insert;
                                                         output.response.request_focus();
                                                         if let Some(range) = &self.buffer.caret_char_range {
@@ -375,14 +363,8 @@ impl eframe::App for ReportApp {
                                                         }
                                                     }
                                                     'O' => {
-                                                        // open new line above: insert newline at start of current line
-                                                        let (s, _e, _c) = self.buffer.move_to_line_bounds();
-                                                        let insert_pos = s.min(self.buffer.char_len());
-                                                        self.buffer.set_caret_pos(insert_pos);
-                                                        self.buffer.insert_at_caret("\n");
-                                                        // ensure caret is at the start of the newly inserted line
-                                                        let new_pos = insert_pos + 1.min(self.buffer.char_len().saturating_sub(insert_pos));
-                                                        self.buffer.set_caret_pos(new_pos);
+                                                        // open new line above: use shared helper
+                                                        self.buffer.open_line_above();
                                                         self.vim_mode = VimMode::Insert;
                                                         output.response.request_focus();
                                                         if let Some(range) = &self.buffer.caret_char_range {

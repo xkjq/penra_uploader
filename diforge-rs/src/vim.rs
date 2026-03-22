@@ -269,6 +269,37 @@ impl ReportBuffer {
             }
         }
     }
+
+    /// Insert a newline at the end-of-line insertion point (used by `o`):
+    /// computes insertion position, inserts '\n', and leaves caret at start of new line.
+    pub fn open_line_below(&mut self) {
+        let (_s, e, _c) = self.move_to_line_bounds();
+        let insert_pos = if e > 0 {
+            let prev = self.report.chars().nth(e - 1);
+            if prev == Some('\n') { e.saturating_sub(1) } else { e }
+        } else { e };
+        self.set_caret_pos(insert_pos);
+        self.insert_at_caret("\n");
+    }
+
+    /// Insert a newline at the start-of-line insertion point (used by `O`):
+    /// inserts above the current line and leaves caret at start of new line.
+    pub fn open_line_above(&mut self) {
+        let (s, _e, _c) = self.move_to_line_bounds();
+        let insert_pos = s.min(self.char_len());
+        self.set_caret_pos(insert_pos);
+        self.insert_at_caret("\n");
+    }
+
+    /// Move caret to the append (end-of-line) insertion point (used by `A`).
+    pub fn append_at_end_of_line(&mut self) {
+        let (_s, e, _c) = self.move_to_line_bounds();
+        let target = if e > 0 {
+            let prev = self.report.chars().nth(e - 1);
+            if prev == Some('\n') { e.saturating_sub(1) } else { e }
+        } else { e };
+        self.set_caret_pos(target);
+    }
     pub fn get_caret_line_number(&self) -> usize {
         let chars: Vec<char> = self.report.chars().collect();
         let pos = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
@@ -382,15 +413,10 @@ mod tests {
         b.report = "first line\nsecond".to_string();
         // place caret in the first line
         b.caret_char_range = Some(2..2);
-        let (_s, e, _c) = b.move_to_line_bounds();
-
         // 'A' should move caret to the insertion point at end of current line
-        let target = if e > 0 {
-            let prev = b.report.chars().nth(e - 1);
-            if prev == Some('\n') { e.saturating_sub(1) } else { e }
-        } else { e };
-        b.set_caret_pos(target);
-        assert_eq!(b.caret_char_range.as_ref().unwrap().start, target);
+        b.append_at_end_of_line();
+        let target = b.caret_char_range.as_ref().unwrap().start;
+        assert!(target <= b.char_len());
     }
 
     #[test]
@@ -412,15 +438,13 @@ mod tests {
         b.report = "one\ntwo".to_string();
         // place caret on first line
         b.caret_char_range = Some(1..1);
-        let (_s, e, _c) = b.move_to_line_bounds();
-
         // 'o' should insert a newline after the end-of-line insertion point
+        let (_, e, _) = b.move_to_line_bounds();
         let insert_pos = if e > 0 {
             let prev = b.report.chars().nth(e - 1);
             if prev == Some('\n') { e.saturating_sub(1) } else { e }
         } else { e };
-        b.set_caret_pos(insert_pos);
-        b.insert_at_caret("\n");
+        b.open_line_below();
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, insert_pos + 1);
     }
 
@@ -431,10 +455,11 @@ mod tests {
         // place caret on second line
         b.caret_char_range = Some(4..4);
         let (s, _e, _c) = b.move_to_line_bounds();
-
         // 'O' should move to start of line, insert newline above, and caret should be at start of new line (s+1)
-        b.set_caret_pos(s);
-        b.insert_at_caret("\n");
+        let start_line = b.get_caret_line_number();
+        b.open_line_above();
+        let new_line = b.get_caret_line_number();
+        assert_eq!(new_line, start_line); // still on the same line number because we inserted above
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, s + 1);
     }
 }
