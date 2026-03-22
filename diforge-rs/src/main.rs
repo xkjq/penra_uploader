@@ -430,17 +430,22 @@ impl eframe::App for ReportApp {
                                             let end_cursor = CCursor::new(line_end);
                                             let start_pos = output.galley.pos_from_cursor(start_cursor);
                                             let mut end_pos = output.galley.pos_from_cursor(end_cursor);
-                                            // If the computed end rect has nearly zero width (can happen
-                                            // when selecting backwards to the anchor), try using the
-                                            // previous character's cursor rect as the right edge.
-                                            if line_len > 0 && (end_pos.max.x - start_pos.min.x).abs() < 0.5 {
+                                            // Also compute the previous glyph rect and use the maximum
+                                            // right edge to ensure the last character is included
+                                            let prev_pos_opt = if line_len > 0 {
                                                 let prev_idx = line_end.saturating_sub(1);
-                                                let prev_pos = output.galley.pos_from_cursor(CCursor::new(prev_idx));
-                                                // Use the previous glyph's max as the end position
-                                                end_pos = prev_pos;
-                                            }
+                                                Some(output.galley.pos_from_cursor(CCursor::new(prev_idx)))
+                                            } else { None };
+
                                             let start_screen = output.response.rect.min + start_pos.min.to_vec2();
-                                            let end_screen = output.response.rect.min + end_pos.max.to_vec2();
+                                            let mut end_screen_x = output.response.rect.min.x + end_pos.max.x;
+                                            if let Some(prev_pos) = prev_pos_opt {
+                                                let prev_x = output.response.rect.min.x + prev_pos.max.x;
+                                                if prev_x > end_screen_x {
+                                                    end_screen_x = prev_x;
+                                                }
+                                            }
+                                            let end_screen = egui::pos2(end_screen_x, output.response.rect.min.y);
 
                                             // derive a per-line height from the glyph extents
                                             let line_h = (start_pos.max.y - start_pos.min.y).abs().max(14.0_f32).min(48.0_f32);
