@@ -276,17 +276,35 @@ impl eframe::App for ReportApp {
                         self.buffer.report = prev_report;
                     }
 
-                    // Vim emulation: intercept global events when enabled
-                    if self.vim_enabled {
-                        use egui::Event;
+                    use egui::Event;
 
-                        let events = ctx.input(|i| i.events.clone());
+                    // Capture events once and use them both for global handling and
+                    // vim-specific handling below. Make undo/redo available even
+                    // when Vim emulation is disabled by handling Ctrl-Z / Ctrl-Y
+                    // here unconditionally.
+                    let events = ctx.input(|i| i.events.clone());
+
+                    for ev in events.iter() {
+                        if let Event::Key { key, pressed: true, modifiers, .. } = ev {
+                            if modifiers.ctrl {
+                                match key {
+                                    egui::Key::Z => { self.buffer.undo(); }
+                                    egui::Key::Y | egui::Key::R => { self.buffer.redo(); }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+
+                    // Vim-only handling: Escape and text input handling for modal editing
+                    if self.vim_enabled {
                         for ev in events.iter() {
                             match ev {
                                 Event::Key { key: egui::Key::Escape, pressed: true, .. } => {
-                                    // Escape always returns to Normal mode
+                                    // Escape always returns to Normal mode; end any insert grouping
                                     self.vim_mode = VimMode::Normal;
                                     self.last_vim_key = None;
+                                    self.buffer.end_undo_group();
                                 }
                                 Event::Text(text) => {
                                     if text.is_empty() {

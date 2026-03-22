@@ -17,6 +17,11 @@ impl Default for VimMode {
 pub struct ReportBuffer {
     pub report: String,
     pub caret_char_range: Option<Range<usize>>,
+    // undo/redo stacks store previous buffer states
+    history: Vec<(String, Option<Range<usize>>)>,
+    redo: Vec<(String, Option<Range<usize>>)>,
+    // when true, modifications are grouped into a single undo step
+    in_undo_group: bool,
 }
 
 impl ReportBuffer {
@@ -24,10 +29,61 @@ impl ReportBuffer {
         Self {
             report: String::new(),
             caret_char_range: None,
+            history: Vec::new(),
+            redo: Vec::new(),
+            in_undo_group: false,
+        }
+    }
+
+    fn snapshot(&self) -> (String, Option<Range<usize>>) {
+        (self.report.clone(), self.caret_char_range.clone())
+    }
+
+    fn restore_snapshot(&mut self, snap: (String, Option<Range<usize>>)) {
+        self.report = snap.0;
+        self.caret_char_range = snap.1;
+    }
+
+    /// Start grouping subsequent edits into a single undo step.
+    pub fn start_undo_group(&mut self) {
+        if !self.in_undo_group {
+            self.history.push(self.snapshot());
+            self.redo.clear();
+            self.in_undo_group = true;
+        }
+    }
+
+    /// End grouping edits.
+    pub fn end_undo_group(&mut self) {
+        self.in_undo_group = false;
+    }
+
+    /// Push an undo snapshot unless we're currently grouping edits.
+    fn push_undo_snapshot(&mut self) {
+        if !self.in_undo_group {
+            self.history.push(self.snapshot());
+            self.redo.clear();
+        }
+    }
+
+    pub fn undo(&mut self) {
+        if let Some(prev) = self.history.pop() {
+            let cur = self.snapshot();
+            self.redo.push(cur);
+            self.restore_snapshot(prev);
+        }
+    }
+
+    pub fn redo(&mut self) {
+        if let Some(next) = self.redo.pop() {
+            let cur = self.snapshot();
+            self.history.push(cur);
+            self.restore_snapshot(next);
         }
     }
 
     pub fn insert_at_caret(&mut self, insert: &str) {
+        self.push_undo_snapshot();
         let (start_char, end_char) = if let Some(r) = &self.caret_char_range {
             (r.start, r.end)
         } else {
@@ -219,6 +275,7 @@ impl ReportBuffer {
             let pos = range.start;
             let total = self.report.chars().count();
             if pos < total {
+                self.push_undo_snapshot();
                 let mut cur = 0usize;
                 let mut bstart = self.report.len();
                 let mut bend = self.report.len();
@@ -264,6 +321,7 @@ impl ReportBuffer {
                 cur += 1;
             }
             if line_start_byte < line_end_byte {
+                self.push_undo_snapshot();
                 self.report.replace_range(line_start_byte..line_end_byte, "");
                 self.caret_char_range = Some(line_start_byte..line_start_byte);
             }
@@ -279,6 +337,7 @@ impl ReportBuffer {
             if prev == Some('\n') { e.saturating_sub(1) } else { e }
         } else { e };
         self.set_caret_pos(insert_pos);
+        self.push_undo_snapshot();
         self.insert_at_caret("\n");
     }
 
@@ -291,6 +350,7 @@ impl ReportBuffer {
         // to the start of the newly inserted blank line (so its line number
         // matches the original line index).
         self.set_caret_pos(insert_pos);
+        self.push_undo_snapshot();
         self.insert_at_caret("\n");
         // After insertion `insert_at_caret` places the caret after the inserted
         // text; move it back to the start of the new blank line so callers
@@ -319,18 +379,21 @@ impl ReportBuffer {
         match ch {
             'i' => {
                 *vim_mode = crate::VimMode::Insert;
+                buffer.start_undo_group();
                 *last_vim_key = None;
                 true
             }
             'a' => {
                 buffer.move_caret_by(1);
                 *vim_mode = crate::VimMode::Insert;
+                buffer.start_undo_group();
                 *last_vim_key = None;
                 true
             }
             'A' => {
                 buffer.append_at_end_of_line();
                 *vim_mode = crate::VimMode::Insert;
+                buffer.start_undo_group();
                 *last_vim_key = None;
                 true
             }
@@ -338,21 +401,25 @@ impl ReportBuffer {
                 let (s, _e, _c) = buffer.move_to_line_bounds();
                 buffer.set_caret_pos(s);
                 *vim_mode = crate::VimMode::Insert;
+                buffer.start_undo_group();
                 *last_vim_key = None;
                 true
             }
             'o' => {
                 buffer.open_line_below();
                 *vim_mode = crate::VimMode::Insert;
+                buffer.start_undo_group();
                 *last_vim_key = None;
                 true
             }
             'O' => {
                 buffer.open_line_above();
                 *vim_mode = crate::VimMode::Insert;
+                buffer.start_undo_group();
                 *last_vim_key = None;
                 true
             }
+            'u' => { buffer.undo(); *last_vim_key = None; false }
             'h' => { buffer.move_caret_by(-1); *last_vim_key = None; false }
             'l' => { buffer.move_caret_by(1); *last_vim_key = None; false }
             'j' => { buffer.move_line_down(); *last_vim_key = None; false }
