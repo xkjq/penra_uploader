@@ -373,16 +373,22 @@ impl eframe::App for ReportApp {
                             // Convert to screen coords: widget rect min + galley_pos offset
                             // Note: `galley_pos` is already positioned relative to the widget; avoid double-adding `output.galley_pos`.
                             let screen_pos = output.response.rect.min + galley_pos.min.to_vec2();
-                            // Draw a visible caret line, clamped to the TextEdit rect
+                            // Draw a visible caret as a filled rectangle the width of a character.
                             let caret_height = 18.0_f32;
                             let painter = ui.painter();
-                            let x = (screen_pos.x + self.caret_x_offset).clamp(output.response.rect.min.x, output.response.rect.max.x - 1.0);
+                            // Use the galley cursor rect width as a best-effort char width; fallback to 8.0
+                            let mut char_w = (galley_pos.max.x - galley_pos.min.x).abs();
+                            if char_w <= 0.1 {
+                                char_w = 8.0;
+                            }
+                            // Nudge the caret slightly right for visual alignment
+                            let nudge = 2.0_f32;
+                            let x = (screen_pos.x + self.caret_x_offset + nudge).clamp(output.response.rect.min.x, output.response.rect.max.x - 1.0);
                             let y0 = screen_pos.y.clamp(output.response.rect.min.y, output.response.rect.max.y - caret_height);
                             let y1 = y0 + caret_height;
-                            painter.line_segment(
-                                [egui::pos2(x, y0), egui::pos2(x, y1)],
-                                egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 80, 80)),
-                            );
+                            let x2 = (x + char_w).min(output.response.rect.max.x - 1.0);
+                            let rect = egui::Rect::from_min_max(egui::pos2(x, y0), egui::pos2(x2, y1));
+                            painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(255, 80, 80));
                             if self.show_caret_debug {
                                 painter.circle_filled(egui::pos2(x, y0), 4.0, egui::Color32::from_rgb(80, 200, 255));
                                 let info = format!("screen: {:.1},{:.1}  char_range: {:?}", screen_pos.x + self.caret_x_offset, screen_pos.y, self.buffer.caret_char_range);
