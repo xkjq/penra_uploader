@@ -403,9 +403,35 @@ impl eframe::App for ReportApp {
                             // Convert to screen coords: widget rect min + galley_pos offset
                             // Note: `galley_pos` is already positioned relative to the widget; avoid double-adding `output.galley_pos`.
                             let screen_pos = output.response.rect.min + galley_pos.min.to_vec2();
+                            // Prepare painter for selection/caret drawing
+                            let painter = ui.painter();
+
+                            // If Visual mode is active and we have an anchor, draw a selection background
+                            if self.vim_mode == VimMode::Visual {
+                                if let Some(anchor) = self.visual_anchor {
+                                    let cur = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                                    let s = anchor.min(cur);
+                                    let e = anchor.max(cur);
+                                    if s < e {
+                                        let start_cursor = CCursor::new(s);
+                                        let end_cursor = CCursor::new(e);
+                                        let start_pos = output.galley.pos_from_cursor(start_cursor);
+                                        let end_pos = output.galley.pos_from_cursor(end_cursor);
+                                        // convert to screen coords
+                                        let start_screen = output.response.rect.min + start_pos.min.to_vec2();
+                                        let end_screen = output.response.rect.min + end_pos.max.to_vec2();
+                                        // restrict to widget bounds
+                                        let x0 = start_screen.x.clamp(output.response.rect.min.x, output.response.rect.max.x);
+                                        let x1 = end_screen.x.clamp(output.response.rect.min.x, output.response.rect.max.x);
+                                        let y0 = start_screen.y.clamp(output.response.rect.min.y, output.response.rect.max.y);
+                                        let y1 = (y0 + 18.0_f32).min(output.response.rect.max.y);
+                                        let sel_rect = egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1));
+                                        painter.rect_filled(sel_rect, 0.0, egui::Color32::from_rgba_unmultiplied(120, 160, 255, 140));
+                                    }
+                                }
+                            }
                             // Draw a visible caret as a filled rectangle the width of a character.
                             let caret_height = 18.0_f32;
-                            let painter = ui.painter();
                             // Use the galley cursor rect width as a best-effort char width; fallback to 8.0
                             let mut char_w = (galley_pos.max.x - galley_pos.min.x).abs();
                             if char_w <= 0.1 {
