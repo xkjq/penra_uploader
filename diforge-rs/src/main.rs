@@ -370,7 +370,7 @@ impl eframe::App for ReportApp {
                             let s = anchor.min(cur);
                             let e = anchor.max(cur);
                             let start = CCursor::new(s);
-                            let end = CCursor::new(e);
+                            let end = CCursor::new((e).min(self.buffer.char_len()).saturating_add( (if e> s {1} else {0}) ));
                             output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
                             output.state.store(ui.ctx(), output.response.id);
                         } else if let Some(range) = &self.buffer.caret_char_range {
