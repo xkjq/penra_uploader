@@ -1,6 +1,7 @@
 {
     "chat.tools.terminal.autoApprove": {
         "cargo build": true,
-        "git checkout": true
+        "git checkout": true,
+        "cargo test": true
     }
 }

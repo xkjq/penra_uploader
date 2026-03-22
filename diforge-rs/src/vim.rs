@@ -259,3 +259,51 @@ impl ReportBuffer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn move_word_end_from_middle_of_word() {
+        let mut b = ReportBuffer::new();
+        b.report = "hello world".to_string();
+        // place caret after first char (inside 'hello')
+        b.caret_char_range = Some(1..1);
+        b.move_word_end();
+        let pos = b.caret_char_range.unwrap().start;
+        // expect to land on the 'o' of 'hello' (index 4)
+        assert_eq!(pos, 4);
+    }
+
+    #[test]
+    fn move_word_end_from_end_of_word_advances_to_next_word_end() {
+        let mut b = ReportBuffer::new();
+        b.report = "hello world".to_string();
+        // place caret at end of 'hello' (index 5, after 'o')
+        b.caret_char_range = Some(5..5);
+        b.move_word_end();
+        let pos = b.caret_char_range.unwrap().start;
+        // expect to land on 'd' of 'world' (index 10)
+        assert_eq!(pos, 10);
+    }
+
+    #[test]
+    fn move_word_end_with_punctuation() {
+        let mut b = ReportBuffer::new();
+        b.report = "abc, def.".to_string();
+        // caret after 'c' (index 3) -- on punctuation, `e` should move to next word end
+        b.caret_char_range = Some(3..3);
+        b.move_word_end();
+        let pos = b.caret_char_range.unwrap().start;
+        // Vim moves to the end of the next word (index 7)
+        assert_eq!(pos, 7);
+
+        // now move from just after comma (index 4) to end of next word
+        b.caret_char_range = Some(4..4);
+        b.move_word_end();
+        let pos2 = b.caret_char_range.unwrap().start;
+        // expect to land on 'f' (index 7)
+        assert_eq!(pos2, 7);
+    }
+}
