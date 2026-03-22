@@ -250,11 +250,16 @@ impl eframe::App for ReportApp {
                     // If Vim emulation is enabled and we are NOT in Insert mode, prevent the TextEdit
                     // from applying direct edits by restoring any accidental changes.
                     let prev_report = self.buffer.report.clone();
-                    let text_edit = egui::TextEdit::multiline(&mut self.buffer.report)
+                    let mut text_edit = egui::TextEdit::multiline(&mut self.buffer.report)
                         .desired_rows(20)
                         .desired_width(left_w)
                         // only lock focus when in Insert mode so Normal mode can intercept keys
                         .lock_focus(self.vim_enabled && self.vim_mode == VimMode::Insert);
+
+                    // Use monospace font when Vim emulation is active for consistent fixed-width behavior
+                    if self.vim_enabled {
+                        text_edit = text_edit.font(egui::TextStyle::Monospace);
+                    }
 
                     let mut output = text_edit.show(ui);
 
