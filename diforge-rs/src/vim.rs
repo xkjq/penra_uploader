@@ -331,7 +331,7 @@ mod tests {
         // place caret after first char (inside 'hello')
         b.caret_char_range = Some(1..1);
         b.move_word_end();
-        let pos = b.caret_char_range.unwrap().start;
+        let pos = b.caret_char_range.as_ref().unwrap().start;
         // expect to land on the 'o' of 'hello' (index 4)
         assert_eq!(pos, 4);
     }
@@ -343,7 +343,7 @@ mod tests {
         // place caret at end of 'hello' (index 5, after 'o')
         b.caret_char_range = Some(5..5);
         b.move_word_end();
-        let pos = b.caret_char_range.unwrap().start;
+        let pos = b.caret_char_range.as_ref().unwrap().start;
         // expect to land on 'd' of 'world' (index 10)
         assert_eq!(pos, 10);
     }
@@ -362,7 +362,7 @@ mod tests {
         // now move from just after comma (index 4) to end of next word
         b.caret_char_range = Some(4..4);
         b.move_word_end();
-        let pos2 = b.caret_char_range.unwrap().start;
+        let pos2 = b.caret_char_range.as_ref().unwrap().start;
         // expect to land on 'f' (index 7)
         assert_eq!(pos2, 7);
     }
@@ -421,9 +421,13 @@ mod tests {
         // place caret in the first line
         b.caret_char_range = Some(2..2);
         // 'A' should move caret to the insertion point at end of current line
+        let (_s, e, _c) = b.move_to_line_bounds();
+        let expected = if e > 0 {
+            let prev = b.report.chars().nth(e - 1);
+            if prev == Some('\n') { e.saturating_sub(1) } else { e }
+        } else { e };
         b.append_at_end_of_line();
-        let target = b.caret_char_range.as_ref().unwrap().start;
-        assert!(target <= b.char_len());
+        assert_eq!(b.caret_char_range.as_ref().unwrap().start, expected);
     }
 
     #[test]
