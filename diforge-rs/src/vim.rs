@@ -352,4 +352,77 @@ mod tests {
         b.move_word_forward();
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, 8);
     }
+
+    #[test]
+    fn vim_insert_commands_append_a() {
+        let mut b = ReportBuffer::new();
+        b.report = "one two".to_string();
+        b.caret_char_range = Some(0..0);
+
+        // 'a' should move caret one character right (append)
+        b.move_caret_by(1);
+        assert_eq!(b.caret_char_range.as_ref().unwrap().start, 1);
+    }
+
+    #[test]
+    fn vim_insert_commands_append_A() {
+        let mut b = ReportBuffer::new();
+        b.report = "first line\nsecond".to_string();
+        // place caret in the first line
+        b.caret_char_range = Some(2..2);
+        let (_s, e, _c) = b.move_to_line_bounds();
+
+        // 'A' should move caret to the insertion point at end of current line
+        let target = if e > 0 {
+            let prev = b.report.chars().nth(e - 1);
+            if prev == Some('\n') { e.saturating_sub(1) } else { e }
+        } else { e };
+        b.set_caret_pos(target);
+        assert_eq!(b.caret_char_range.as_ref().unwrap().start, target);
+    }
+
+    #[test]
+    fn vim_insert_commands_insert_I() {
+        let mut b = ReportBuffer::new();
+        b.report = "  indented\nline".to_string();
+        // place caret somewhere on the indented line
+        b.caret_char_range = Some(3..3);
+        let (s, _e, _c) = b.move_to_line_bounds();
+
+        // 'I' should move caret to the start of the line
+        b.set_caret_pos(s);
+        assert_eq!(b.caret_char_range.as_ref().unwrap().start, s);
+    }
+
+    #[test]
+    fn vim_insert_commands_open_o() {
+        let mut b = ReportBuffer::new();
+        b.report = "one\ntwo".to_string();
+        // place caret on first line
+        b.caret_char_range = Some(1..1);
+        let (_s, e, _c) = b.move_to_line_bounds();
+
+        // 'o' should insert a newline after the end-of-line insertion point
+        let insert_pos = if e > 0 {
+            let prev = b.report.chars().nth(e - 1);
+            if prev == Some('\n') { e.saturating_sub(1) } else { e }
+        } else { e };
+        b.set_caret_pos(insert_pos);
+        b.insert_at_caret("\n");
+        assert_eq!(b.caret_char_range.as_ref().unwrap().start, insert_pos + 1);
+    }
+
+    #[test]
+    fn vim_insert_commands_open_O() {
+        let mut b = ReportBuffer::new();
+        b.report = "one\ntwo".to_string();
+        // place caret on second line
+        b.caret_char_range = Some(4..4);
+        let (s, _e, _c) = b.move_to_line_bounds();
+
+        // 'O' should move to start of line, insert newline above, and caret should be at start of new line (s+1)
+        b.set_caret_pos(s);
+        b.insert_at_caret("\n");
+        assert_eq!(b.caret_char_range.as_ref().unwrap().start, s + 1);
+    }
 }

@@ -326,9 +326,14 @@ impl eframe::App for ReportApp {
                                                         }
                                                     }
                                                     'A' => {
-                                                        // append at end of line
+                                                        // append at end of line: compute insertion point just before newline if present
                                                         let (_s, e, _c) = self.buffer.move_to_line_bounds();
-                                                        self.buffer.set_caret_pos(e);
+                                                        let target = if e > 0 {
+                                                            // check previous char
+                                                            let prev = self.buffer.report.chars().nth(e - 1);
+                                                            if prev == Some('\n') { e.saturating_sub(1) } else { e }
+                                                        } else { e };
+                                                        self.buffer.set_caret_pos(target);
                                                         self.vim_mode = VimMode::Insert;
                                                         output.response.request_focus();
                                                         if let Some(range) = &self.buffer.caret_char_range {
@@ -352,9 +357,13 @@ impl eframe::App for ReportApp {
                                                         }
                                                     }
                                                     'o' => {
-                                                        // open new line below
+                                                        // open new line below: insert newline at end-of-line insertion point
                                                         let (_s, e, _c) = self.buffer.move_to_line_bounds();
-                                                        self.buffer.set_caret_pos(e);
+                                                        let insert_pos = if e > 0 {
+                                                            let prev = self.buffer.report.chars().nth(e - 1);
+                                                            if prev == Some('\n') { e.saturating_sub(1) } else { e }
+                                                        } else { e };
+                                                        self.buffer.set_caret_pos(insert_pos);
                                                         self.buffer.insert_at_caret("\n");
                                                         self.vim_mode = VimMode::Insert;
                                                         output.response.request_focus();
@@ -366,11 +375,11 @@ impl eframe::App for ReportApp {
                                                         }
                                                     }
                                                     'O' => {
-                                                        // open new line above
+                                                        // open new line above: insert newline at start of current line
                                                         let (s, _e, _c) = self.buffer.move_to_line_bounds();
                                                         self.buffer.set_caret_pos(s);
                                                         self.buffer.insert_at_caret("\n");
-                                                        // caret should remain at start of the newly inserted line
+                                                        // caret will be placed at start of the newly inserted line (s + 1)
                                                         self.vim_mode = VimMode::Insert;
                                                         output.response.request_focus();
                                                         if let Some(range) = &self.buffer.caret_char_range {
