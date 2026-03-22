@@ -525,7 +525,10 @@ mod tests {
             let prev = b.report.chars().nth(e - 1);
             if prev == Some('\n') { e.saturating_sub(1) } else { e }
         } else { e };
-        b.open_line_below();
+        // Use the shared Normal-mode handler so tests match runtime behavior
+        let mut mode = crate::VimMode::Normal;
+        let mut last = None;
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, 'o');
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, insert_pos + 1);
     }
 
