@@ -507,15 +507,21 @@ impl ReportBuffer {
         ch: char,
     ) -> bool {
         // If the user typed digits as a count prefix, accumulate them and
-        // wait for the next command.
+        // wait for the next command. Special-case: a lone leading '0' with
+        // no previous count is treated as the `0` motion (start of line),
+        // not as a numeric prefix.
         if ch.is_ascii_digit() {
-            let d = ch.to_digit(10).unwrap() as usize;
-            if let Some(prev) = last_vim_count.take() {
-                *last_vim_count = Some(prev * 10 + d);
+            if ch == '0' && last_vim_count.is_none() {
+                // fall through to handle '0' as a motion
             } else {
-                *last_vim_count = Some(d);
+                let d = ch.to_digit(10).unwrap() as usize;
+                if let Some(prev) = last_vim_count.take() {
+                    *last_vim_count = Some(prev * 10 + d);
+                } else {
+                    *last_vim_count = Some(d);
+                }
+                return false;
             }
-            return false;
         }
         match ch {
             'i' => {
@@ -748,15 +754,113 @@ impl ReportBuffer {
                 }
             }
             'G' => {
-                // 'G' goes to end of file, or to specified line if a count is present
-                if let Some(n) = last_vim_count.take() {
-                    buffer.goto_line_start(n);
+                // operator-pending: dG/cG delete/change to specified line or EOF
+                if *last_vim_key == Some('d') {
+                    let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    if let Some(n) = last_vim_count.take() {
+                        // delete to start of line n
+                        let mut target = 0usize;
+                        // goto_line_start uses 1-based lines
+                        buffer.goto_line_start(n);
+                        target = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                        buffer.delete_range(start, target);
+                    } else {
+                        // delete to EOF
+                        let end = buffer.char_len();
+                        buffer.delete_range(start, end);
+                    }
+                    *last_vim_key = None;
+                    false
+                } else if *last_vim_key == Some('c') {
+                    let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    if let Some(n) = last_vim_count.take() {
+                        buffer.goto_line_start(n);
+                        let target = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                        buffer.start_undo_group();
+                        buffer.delete_range(start, target);
+                    } else {
+                        let end = buffer.char_len();
+                        buffer.start_undo_group();
+                        buffer.delete_range(start, end);
+                    }
+                    *last_vim_key = None;
+                    *vim_mode = crate::VimMode::Insert;
+                    true
                 } else {
-                    buffer.goto_end_of_file();
+                    // 'G' goes to end of file, or to specified line if a count is present
+                    if let Some(n) = last_vim_count.take() {
+                        buffer.goto_line_start(n);
+                    } else {
+                        buffer.goto_end_of_file();
+                    }
+                    *last_vim_key = None;
+                    *last_vim_count = None;
+                    false
                 }
+            }
+            '$' => {
+                // end-of-line motion; can be used with d/c
+                let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                let (_s, e, _c) = buffer.move_to_line_bounds();
+                // compute end-of-line char index (exclude newline)
+                let end_char = if e > 0 {
+                    if buffer.report.chars().nth(e - 1) == Some('\n') { e.saturating_sub(1) } else { e }
+                } else { e };
+                if *last_vim_key == Some('d') {
+                    buffer.delete_range(start, end_char);
+                    *last_vim_key = None;
+                    false
+                } else if *last_vim_key == Some('c') {
+                    buffer.start_undo_group();
+                    buffer.delete_range(start, end_char);
+                    *last_vim_key = None;
+                    *vim_mode = crate::VimMode::Insert;
+                    true
+                } else {
+                    buffer.set_caret_pos(end_char);
+                    *last_vim_key = None;
+                    false
+                }
+            }
+            '0' => {
+                // move to start of line; if operator pending, delete/change to start
+                let cur = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                let (line_start, _e, _c) = buffer.move_to_line_bounds();
+                if *last_vim_key == Some('d') {
+                    buffer.delete_range(line_start, cur);
+                    *last_vim_key = None;
+                    false
+                } else if *last_vim_key == Some('c') {
+                    buffer.start_undo_group();
+                    buffer.delete_range(line_start, cur);
+                    *last_vim_key = None;
+                    *vim_mode = crate::VimMode::Insert;
+                    true
+                } else {
+                    buffer.set_caret_pos(line_start);
+                    *last_vim_key = None;
+                    false
+                }
+            }
+            'D' => {
+                // delete to end of line
+                let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                let (_s, e, _c) = buffer.move_to_line_bounds();
+                let end_char = if e > 0 { if buffer.report.chars().nth(e - 1) == Some('\n') { e.saturating_sub(1) } else { e } } else { e };
+                buffer.delete_range(start, end_char);
                 *last_vim_key = None;
-                *last_vim_count = None;
                 false
+            }
+            'C' => {
+                // change to end of line (enter Insert)
+                let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                let (_s, e, _c) = buffer.move_to_line_bounds();
+                let end_char = if e > 0 { if buffer.report.chars().nth(e - 1) == Some('\n') { e.saturating_sub(1) } else { e } } else { e };
+                buffer.start_undo_group();
+                buffer.delete_range(start, end_char);
+                *last_vim_key = None;
+                *vim_mode = crate::VimMode::Insert;
+                true
             }
             'x' => { buffer.delete_char_at_cursor(); *last_vim_key = None; false }
             'd' => {
@@ -1137,5 +1241,37 @@ mod tests {
 
         // expect lines b,c,d removed -> remaining a\ne\nf
         assert_eq!(b.report, "a\ne\nf");
+    }
+
+    #[test]
+    fn undo_redo_dollar_and_c_dollar() {
+        let mut b = ReportBuffer::new();
+        b.report = "hello world\nnext line".to_string();
+        // place caret at 'w' of world (index 6)
+        b.caret_char_range = Some(6..6);
+
+        let mut mode = crate::VimMode::Normal;
+        let mut last = None;
+        let mut count = None;
+        let prev = b.report.clone();
+
+        // d$ should delete to EOL
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, '$');
+        assert_eq!(b.report, "hello \nnext line");
+
+        b.undo();
+        assert_eq!(b.report, prev);
+
+        // now test C (change to end of line) grouped
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'C');
+        // simulate typing
+        b.insert_at_caret("X");
+        b.end_undo_group();
+        let after = b.report.clone();
+        b.undo();
+        assert_eq!(b.report, prev);
+        b.redo();
+        assert_eq!(b.report, after);
     }
 }
