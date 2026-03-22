@@ -112,10 +112,16 @@ impl ReportBuffer {
         let chars: Vec<char> = self.report.chars().collect();
         let mut pos = self.caret_char_range.as_ref().map(|r| r.end).unwrap_or(0);
         let n = chars.len();
-        // If we're already at the end of a word (previous char is alnum and
-        // current char is non-alnum or we're at buffer end), advance so we find
-        // the *next* word end (Vim's `e` behavior).
-        if pos > 0 && chars[pos - 1].is_alphanumeric() && (pos == n || !chars[pos].is_alphanumeric()) {
+        // If we're already at the end of a word (either the caret is on the
+        // last character of a word, or it's immediately after a word), advance
+        // one position so we find the *next* word end (Vim's `e` behavior).
+        let at_end_of_word = if pos < n {
+            chars[pos].is_alphanumeric() && (pos + 1 == n || !chars[pos + 1].is_alphanumeric())
+        } else {
+            false
+        };
+        let after_word = pos > 0 && (pos == n || !chars[pos].is_alphanumeric()) && chars[pos - 1].is_alphanumeric();
+        if at_end_of_word || after_word {
             pos = pos.saturating_add(1);
         }
 
@@ -305,5 +311,25 @@ mod tests {
         let pos2 = b.caret_char_range.unwrap().start;
         // expect to land on 'f' (index 7)
         assert_eq!(pos2, 7);
+    }
+
+    #[test]
+    fn move_word_end_multiple_times() {
+        let mut b = ReportBuffer::new();
+        b.report = "one two three".to_string();
+        // start at beginning
+        b.caret_char_range = Some(0..0);
+
+        // first e: end of 'one' -> index 2
+        b.move_word_end();
+        assert_eq!(b.caret_char_range.as_ref().unwrap().start, 2);
+
+        // second e: end of 'two' -> index 6
+        b.move_word_end();
+        assert_eq!(b.caret_char_range.as_ref().unwrap().start, 6);
+
+        // third e: end of 'three' -> index 12
+        b.move_word_end();
+        assert_eq!(b.caret_char_range.as_ref().unwrap().start, 12);
     }
 }
