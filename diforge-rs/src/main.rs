@@ -313,6 +313,73 @@ impl eframe::App for ReportApp {
                                                             output.state.clone().store(ctx, output.response.id);
                                                         }
                                                     }
+                                                    'a' => {
+                                                        // append: move right one then enter insert
+                                                        self.buffer.move_caret_by(1);
+                                                        self.vim_mode = VimMode::Insert;
+                                                        output.response.request_focus();
+                                                        if let Some(range) = &self.buffer.caret_char_range {
+                                                            let start = CCursor::new(range.start);
+                                                            let end = CCursor::new(range.end);
+                                                            output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
+                                                            output.state.clone().store(ctx, output.response.id);
+                                                        }
+                                                    }
+                                                    'A' => {
+                                                        // append at end of line
+                                                        let (_s, e, _c) = self.buffer.move_to_line_bounds();
+                                                        self.buffer.set_caret_pos(e);
+                                                        self.vim_mode = VimMode::Insert;
+                                                        output.response.request_focus();
+                                                        if let Some(range) = &self.buffer.caret_char_range {
+                                                            let start = CCursor::new(range.start);
+                                                            let end = CCursor::new(range.end);
+                                                            output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
+                                                            output.state.clone().store(ctx, output.response.id);
+                                                        }
+                                                    }
+                                                    'I' => {
+                                                        // insert at start of line
+                                                        let (s, _e, _c) = self.buffer.move_to_line_bounds();
+                                                        self.buffer.set_caret_pos(s);
+                                                        self.vim_mode = VimMode::Insert;
+                                                        output.response.request_focus();
+                                                        if let Some(range) = &self.buffer.caret_char_range {
+                                                            let start = CCursor::new(range.start);
+                                                            let end = CCursor::new(range.end);
+                                                            output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
+                                                            output.state.clone().store(ctx, output.response.id);
+                                                        }
+                                                    }
+                                                    'o' => {
+                                                        // open new line below
+                                                        let (_s, e, _c) = self.buffer.move_to_line_bounds();
+                                                        self.buffer.set_caret_pos(e);
+                                                        self.buffer.insert_at_caret("\n");
+                                                        self.vim_mode = VimMode::Insert;
+                                                        output.response.request_focus();
+                                                        if let Some(range) = &self.buffer.caret_char_range {
+                                                            let start = CCursor::new(range.start);
+                                                            let end = CCursor::new(range.end);
+                                                            output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
+                                                            output.state.clone().store(ctx, output.response.id);
+                                                        }
+                                                    }
+                                                    'O' => {
+                                                        // open new line above
+                                                        let (s, _e, _c) = self.buffer.move_to_line_bounds();
+                                                        self.buffer.set_caret_pos(s);
+                                                        self.buffer.insert_at_caret("\n");
+                                                        // caret should remain at start of the newly inserted line
+                                                        self.vim_mode = VimMode::Insert;
+                                                        output.response.request_focus();
+                                                        if let Some(range) = &self.buffer.caret_char_range {
+                                                            let start = CCursor::new(range.start);
+                                                            let end = CCursor::new(range.end);
+                                                            output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
+                                                            output.state.clone().store(ctx, output.response.id);
+                                                        }
+                                                    }
                                                     'h' => { self.buffer.move_caret_by(-1); }
                                                     'l' => { self.buffer.move_caret_by(1); }
                                                     'j' => { self.buffer.move_line_down(); }
