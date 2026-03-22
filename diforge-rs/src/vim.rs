@@ -112,6 +112,13 @@ impl ReportBuffer {
         let chars: Vec<char> = self.report.chars().collect();
         let mut pos = self.caret_char_range.as_ref().map(|r| r.end).unwrap_or(0);
         let n = chars.len();
+        // If we're already at the end of a word (previous char is alnum and
+        // current char is non-alnum or we're at buffer end), advance so we find
+        // the *next* word end (Vim's `e` behavior).
+        if pos > 0 && chars[pos - 1].is_alphanumeric() && (pos == n || !chars[pos].is_alphanumeric()) {
+            pos = pos.saturating_add(1);
+        }
+
         while pos < n && !chars[pos].is_alphanumeric() {
             pos += 1;
         }
