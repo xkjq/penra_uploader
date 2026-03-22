@@ -173,6 +173,35 @@ impl ReportBuffer {
         if p > 0 { p - 1 } else { 0 }
     }
 
+    /// Determine the start (inclusive) and end (exclusive) char indices of
+    /// the word that contains `pos` or is nearest after it. Returns None if
+    /// no word found.
+    fn current_word_bounds(&self, pos: usize) -> Option<(usize, usize)> {
+        let chars: Vec<char> = self.report.chars().collect();
+        let n = chars.len();
+        if n == 0 { return None; }
+        let mut p = pos;
+        if p >= n {
+            p = n.saturating_sub(1);
+        }
+        // If on a non-alnum and previous is alnum, consider previous char
+        if !chars[p].is_alphanumeric() && p > 0 && chars[p - 1].is_alphanumeric() {
+            p -= 1;
+        }
+        // If still not on a word, try to find next word
+        if !chars[p].is_alphanumeric() {
+            let s = self.next_word_start_from(p);
+            if s >= n { return None; }
+            p = s;
+        }
+        // p is inside a word
+        let mut start = p;
+        while start > 0 && chars[start - 1].is_alphanumeric() { start -= 1; }
+        let mut end = p;
+        while end < n && chars[end].is_alphanumeric() { end += 1; }
+        Some((start, end))
+    }
+
     pub fn set_caret_pos(&mut self, pos: usize) {
         let p = pos.min(self.char_len());
         self.caret_char_range = Some(p..p);
@@ -503,6 +532,7 @@ impl ReportBuffer {
         buffer: &mut ReportBuffer,
         vim_mode: &mut crate::VimMode,
         last_vim_key: &mut Option<char>,
+        last_vim_object: &mut Option<char>,
         last_vim_count: &mut Option<usize>,
         ch: char,
     ) -> bool {
@@ -525,6 +555,14 @@ impl ReportBuffer {
         }
         match ch {
             'i' => {
+                // If this follows an operator (e.g., 'd' or 'c') then treat
+                // this as the start of operator+textobject (e.g., 'diw').
+                if let Some(op) = last_vim_key.clone() {
+                    if op == 'd' || op == 'c' {
+                        *last_vim_object = Some('i');
+                        return false;
+                    }
+                }
                 *vim_mode = crate::VimMode::Insert;
                 buffer.start_undo_group();
                 *last_vim_key = None;
@@ -532,6 +570,13 @@ impl ReportBuffer {
                 true
             }
             'a' => {
+                // operator + 'a' as text-object prefix
+                if let Some(op) = last_vim_key.clone() {
+                    if op == 'd' || op == 'c' {
+                        *last_vim_object = Some('a');
+                        return false;
+                    }
+                }
                 buffer.move_caret_by(1);
                 *vim_mode = crate::VimMode::Insert;
                 buffer.start_undo_group();
@@ -629,6 +674,7 @@ impl ReportBuffer {
                 }
             }
             'w' => {
+                // operator 'd' (delete words)
                 if *last_vim_key == Some('d') {
                     let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
                     let mut end = start;
@@ -638,8 +684,11 @@ impl ReportBuffer {
                     }
                     buffer.delete_range(start, end);
                     *last_vim_key = None;
-                    false
-                } else if *last_vim_key == Some('c') {
+                    return false;
+                }
+
+                // operator 'c' (change words)
+                if *last_vim_key == Some('c') {
                     let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
                     let mut end = start;
                     let op_count = last_vim_count.take().unwrap_or(1);
@@ -650,12 +699,43 @@ impl ReportBuffer {
                     buffer.delete_range(start, end);
                     *last_vim_key = None;
                     *vim_mode = crate::VimMode::Insert;
-                    true
-                } else {
-                    let repeats = last_vim_count.take().unwrap_or(1);
-                    for _ in 0..repeats { buffer.move_word_forward(); }
-                    *last_vim_key = None; false
+                    return true;
                 }
+
+                // text-object handling (i/a + w)
+                if last_vim_object.is_some() {
+                    if let Some(obj) = last_vim_object.take() {
+                        if obj == 'i' || obj == 'a' {
+                            let cur = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                            if let Some((start_char, end_char)) = buffer.current_word_bounds(cur) {
+                                let mut s = start_char;
+                                let mut e = end_char;
+                                if obj == 'a' {
+                                    let chars: Vec<char> = buffer.report.chars().collect();
+                                    while s > 0 && chars[s - 1].is_whitespace() { s -= 1; }
+                                    while e < chars.len() && chars[e].is_whitespace() { e += 1; }
+                                }
+                                if *last_vim_key == Some('d') {
+                                    buffer.delete_range(s, e);
+                                    *last_vim_key = None;
+                                    return false;
+                                }
+                                if *last_vim_key == Some('c') {
+                                    buffer.start_undo_group();
+                                    buffer.delete_range(s, e);
+                                    *last_vim_key = None;
+                                    *vim_mode = crate::VimMode::Insert;
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // default: move by words
+                let repeats = last_vim_count.take().unwrap_or(1);
+                for _ in 0..repeats { buffer.move_word_forward(); }
+                *last_vim_key = None; false
             }
             'b' => {
                 if *last_vim_key == Some('d') {
@@ -989,7 +1069,8 @@ mod tests {
         let mut mode = crate::VimMode::Normal;
         let mut last = None;
         let mut count = None;
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'a');
+        let mut obj: Option<char> = None;
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'a');
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, 1);
     }
 
@@ -1021,7 +1102,8 @@ mod tests {
         let mut mode = crate::VimMode::Normal;
         let mut last = None;
         let mut count = None;
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'I');
+        let mut obj: Option<char> = None;
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'I');
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, s);
     }
 
@@ -1041,7 +1123,8 @@ mod tests {
         let mut mode = crate::VimMode::Normal;
         let mut last = None;
         let mut count = None;
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'o');
+        let mut obj: Option<char> = None;
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'o');
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, insert_pos + 1);
     }
 
@@ -1072,8 +1155,9 @@ mod tests {
         let mut mode = crate::VimMode::Normal;
         let mut last = None;
         let mut count = None;
+        let mut obj: Option<char> = None;
         let prev = b.report.clone();
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'o');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'o');
 
         // simulate typing in Insert mode (TextEdit would normally do this)
         b.insert_at_caret("hello");
@@ -1102,9 +1186,10 @@ mod tests {
         let mut mode = crate::VimMode::Normal;
         let mut last = None;
         let mut count = None;
+        let mut obj: Option<char> = None;
         let prev = b.report.clone();
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'd');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'w');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'w');
 
         assert_eq!(b.report, "one three");
 
@@ -1124,10 +1209,11 @@ mod tests {
         let mut mode = crate::VimMode::Normal;
         let mut last = None;
         let mut count = None;
+        let mut obj: Option<char> = None;
         let prev = b.report.clone();
 
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'c');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'w');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'c');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'w');
 
         // now in Insert mode; simulate typing
         b.insert_at_caret("X");
@@ -1152,10 +1238,11 @@ mod tests {
         let mut mode = crate::VimMode::Normal;
         let mut last = None;
         let mut count = None;
+        let mut obj: Option<char> = None;
         let prev = b.report.clone();
 
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'd');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'd');
 
         assert_eq!(b.report, "a\nc");
 
@@ -1175,9 +1262,10 @@ mod tests {
         let mut mode = crate::VimMode::Normal;
         let mut last = None;
         let mut count = None;
+        let mut obj: Option<char> = None;
         // '3h' should move left 3 chars
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, '3');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'h');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, '3');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'h');
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, 2);
     }
 
@@ -1190,9 +1278,10 @@ mod tests {
         let mut mode = crate::VimMode::Normal;
         let mut last = None;
         let mut count = None;
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, '3');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'd');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'w');
+        let mut obj: Option<char> = None;
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, '3');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'w');
 
         assert_eq!(b.report, "one five");
     }
@@ -1206,11 +1295,12 @@ mod tests {
         let mut mode = crate::VimMode::Normal;
         let mut last = None;
         let mut count = None;
+        let mut obj: Option<char> = None;
         let prev = b.report.clone();
 
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, '2');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'c');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'w');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, '2');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'c');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'w');
 
         // in Insert mode now; simulate typing
         b.insert_at_caret("X");
@@ -1234,10 +1324,11 @@ mod tests {
         let mut mode = crate::VimMode::Normal;
         let mut last = None;
         let mut count = None;
+        let mut obj: Option<char> = None;
 
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, '3');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'd');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, '3');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'd');
 
         // expect lines b,c,d removed -> remaining a\ne\nf
         assert_eq!(b.report, "a\ne\nf");
@@ -1256,15 +1347,16 @@ mod tests {
         let prev = b.report.clone();
 
         // d$ should delete to EOL
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'd');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, '$');
+        let mut obj: Option<char> = None;
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, '$');
         assert_eq!(b.report, "hello \nnext line");
 
         b.undo();
         assert_eq!(b.report, prev);
 
         // now test C (change to end of line) grouped
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut count, 'C');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'C');
         // simulate typing
         b.insert_at_caret("X");
         b.end_undo_group();
