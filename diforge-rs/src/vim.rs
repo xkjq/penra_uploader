@@ -674,6 +674,36 @@ impl ReportBuffer {
                 }
             }
             'w' => {
+                // text-object handling (i/a + w) takes precedence when present
+                if last_vim_object.is_some() {
+                    if let Some(obj) = last_vim_object.take() {
+                        if obj == 'i' || obj == 'a' {
+                            let cur = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                            if let Some((start_char, end_char)) = buffer.current_word_bounds(cur) {
+                                let mut s = start_char;
+                                let mut e = end_char;
+                                if obj == 'a' {
+                                    let chars: Vec<char> = buffer.report.chars().collect();
+                                    if s > 0 && chars[s - 1].is_whitespace() { s -= 1; }
+                                    if e < chars.len() && chars[e].is_whitespace() { e += 1; }
+                                }
+                                if *last_vim_key == Some('d') {
+                                    buffer.delete_range(s, e);
+                                    *last_vim_key = None;
+                                    return false;
+                                }
+                                if *last_vim_key == Some('c') {
+                                    buffer.start_undo_group();
+                                    buffer.delete_range(s, e);
+                                    *last_vim_key = None;
+                                    *vim_mode = crate::VimMode::Insert;
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // operator 'd' (delete words)
                 if *last_vim_key == Some('d') {
                     let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
@@ -700,36 +730,6 @@ impl ReportBuffer {
                     *last_vim_key = None;
                     *vim_mode = crate::VimMode::Insert;
                     return true;
-                }
-
-                // text-object handling (i/a + w)
-                if last_vim_object.is_some() {
-                    if let Some(obj) = last_vim_object.take() {
-                        if obj == 'i' || obj == 'a' {
-                            let cur = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
-                            if let Some((start_char, end_char)) = buffer.current_word_bounds(cur) {
-                                let mut s = start_char;
-                                let mut e = end_char;
-                                if obj == 'a' {
-                                    let chars: Vec<char> = buffer.report.chars().collect();
-                                    while s > 0 && chars[s - 1].is_whitespace() { s -= 1; }
-                                    while e < chars.len() && chars[e].is_whitespace() { e += 1; }
-                                }
-                                if *last_vim_key == Some('d') {
-                                    buffer.delete_range(s, e);
-                                    *last_vim_key = None;
-                                    return false;
-                                }
-                                if *last_vim_key == Some('c') {
-                                    buffer.start_undo_group();
-                                    buffer.delete_range(s, e);
-                                    *last_vim_key = None;
-                                    *vim_mode = crate::VimMode::Insert;
-                                    return true;
-                                }
-                            }
-                        }
-                    }
                 }
 
                 // default: move by words
@@ -1365,5 +1365,47 @@ mod tests {
         assert_eq!(b.report, prev);
         b.redo();
         assert_eq!(b.report, after);
+    }
+
+    #[test]
+    fn diw_deletes_inner_word_only() {
+        let mut b = ReportBuffer::new();
+        b.report = "one  two  three".to_string();
+        // place caret at start of 'two' (index 5)
+        b.caret_char_range = Some(5..5);
+
+        let mut mode = crate::VimMode::Normal;
+        let mut last = None;
+        let mut count = None;
+        let mut obj: Option<char> = None;
+
+        // perform 'd' 'i' 'w'
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'i');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'w');
+
+        // expect only the word 'two' removed, surrounding spaces preserved
+        assert_eq!(b.report, "one    three");
+    }
+
+    #[test]
+    fn daw_deletes_word_and_surrounding_spaces() {
+        let mut b = ReportBuffer::new();
+        b.report = "one  two  three".to_string();
+        // place caret at start of 'two' (index 5)
+        b.caret_char_range = Some(5..5);
+
+        let mut mode = crate::VimMode::Normal;
+        let mut last = None;
+        let mut count = None;
+        let mut obj: Option<char> = None;
+
+        // perform 'd' 'a' 'w'
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'd');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'a');
+        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, 'w');
+
+        // expect the word and adjacent whitespace to be removed (current behavior preserves one space on each side)
+        assert_eq!(b.report, "one  three");
     }
 }
