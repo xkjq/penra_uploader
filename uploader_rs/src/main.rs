@@ -342,6 +342,7 @@ impl AppState {
                 let txt = text.trim().to_string();
                 self.add_toast(format!("IPC: {}", txt), 4000);
                 self.last_msg = format!("IPC: {}", txt);
+                upload::log_rpc(&format!("IPC received: {}", txt));
                 if txt == "loaded" {
                     // Trigger processing of export dir when a sender notifies we're loaded
                     self.trigger_process_export();
@@ -351,10 +352,12 @@ impl AppState {
         }
         if m == "done" {
             self.last_msg = "Processing complete".to_string();
+            upload::log_rpc("Processing complete");
             self.processing_step = None;
             self.processing_progress = 0.0;
         } else if m == "PROC:DONE" {
             self.last_msg = "Processing complete".to_string();
+            upload::log_rpc("Processing complete");
             self.processing_step = None;
             self.processing_progress = 0.0;
         } else if m == "scan_written" {
@@ -363,6 +366,7 @@ impl AppState {
                 self.ready_series = v;
                 self.selected_series = vec![true; self.ready_series.len()];
                 self.last_msg = "Ready-to-upload refreshed".to_string();
+                upload::log_rpc("Ready-to-upload refreshed (scan_written)");
             } else if let Ok(txt) = std::fs::read_to_string(".last_scan.json") {
                 // fallback: try reading the file if cache not available
                 if let Ok(v) = serde_json::from_str::<Vec<SeriesInfo>>(&txt) {
@@ -385,12 +389,14 @@ impl AppState {
             }
         } else if m.starts_with("PROC:STEP:") {
             if let Some(step) = m.strip_prefix("PROC:STEP:") {
+                upload::log_rpc(&format!("Processing step: {}", step));
                 self.processing_step = Some(step.to_string());
                 self.last_msg = step.to_string();
             }
         } else if m.starts_with("PROC:PROG:") {
             if let Some(p) = m.strip_prefix("PROC:PROG:") {
                 if let Ok(v) = p.parse::<f32>() {
+                    upload::log_rpc(&format!("Processing progress: {}", v));
                     self.processing_progress = v.clamp(0.0, 1.0);
                 }
             }
