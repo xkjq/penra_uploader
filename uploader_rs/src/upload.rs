@@ -730,15 +730,19 @@ pub fn scan_for_upload_quick(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender
     let total_files = files.len();
     if let Some(ref s) = tx {
         let _ = s.send("PROC:STEP:Quick listing files".to_string());
+        // send initial zero progress
         let _ = s.send(format!("PROC:PROG:{}", 0.0));
     }
 
     // Group under NO_SERIES with empty hashes and no duplicate flags.
+    // Avoid calling `metadata` per file and avoid per-file progress updates; only
+    // emit periodic progress to keep the UI responsive.
     let mut series_map: HashMap<String, Vec<(PathBuf, String)>> = HashMap::new();
+    let report_interval = std::cmp::max(1, total_files / 10); // ~10 updates
     for (i, p) in files.iter().enumerate() {
         let _ = series_map.entry("NO_SERIES".to_string()).or_default().push((p.clone(), "".to_string()));
         if let Some(ref s) = tx {
-            if total_files > 0 {
+            if (i % report_interval == 0) || (i + 1 == total_files) {
                 let prog = ((i + 1) as f32 / total_files as f32).clamp(0.0, 1.0);
                 let _ = s.send(format!("PROC:PROG:{}", prog));
             }
@@ -750,9 +754,7 @@ pub fn scan_for_upload_quick(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender
         let mut entries: Vec<FileEntry> = Vec::new();
         let mut total_bytes: u64 = 0;
         for (p, _h) in &items {
-            if let Ok(md) = std::fs::metadata(p) {
-                total_bytes = total_bytes.saturating_add(md.len());
-            }
+            // avoid stat() to keep this fast; file sizes are non-critical for delete-only flows
             entries.push(FileEntry { path: p.clone(), hash: "".to_string(), is_duplicate: false });
         }
 
