@@ -14,7 +14,6 @@ use std::sync::mpsc::Sender as MpscSender;
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use tracing::Level;
-use tracing::Level;
 
 static SCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -311,7 +310,7 @@ pub fn token_username() -> Option<String> {
         let client = match make_client(Some(&t)) {
             Ok(c) => c,
             Err(e) => {
-                log_rpc(&format!("make_client failed: {}", e));
+                log_rpc_error(&format!("make_client failed: {}", e));
                 return None;
             }
         };
@@ -319,9 +318,9 @@ pub fn token_username() -> Option<String> {
             let status = r.status();
             if let Ok(body) = r.text() {
                 if let Some(pf) = save_body_to_file(&body) {
-                    log_rpc(&format!("Response {}: {} BODY_FILE:{}", token_check, status, pf.display()));
+                    log_rpc_debug(&format!("Response {}: {} BODY_FILE:{}", token_check, status, pf.display()));
                 } else {
-                    log_rpc(&format!("Response {}: {} body: (failed to save body)", token_check, status));
+                    log_rpc_warn(&format!("Response {}: {} body: (failed to save body)", token_check, status));
                 }
                 if status.is_success() {
                     if let Ok(j) = serde_json::from_str::<serde_json::Value>(&body) {
@@ -331,7 +330,7 @@ pub fn token_username() -> Option<String> {
                     }
                 }
             } else {
-                log_rpc(&format!("Response {}: {} (failed to read body)", token_check, status));
+                log_rpc_warn(&format!("Response {}: {} (failed to read body)", token_check, status));
             }
         }
     }
@@ -467,9 +466,9 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
                     let status = resp.status();
                     if let Ok(body) = resp.text() {
                         if let Some(pf) = save_body_to_file(&body) {
-                            log_rpc(&format!("Response {}: {} BODY_FILE:{}", endpoint, status, pf.display()));
+                            log_rpc_debug(&format!("Response {}: {} BODY_FILE:{}", endpoint, status, pf.display()));
                         } else {
-                            log_rpc(&format!("Response {}: {} body: (failed to save body)", endpoint, status));
+                            log_rpc_warn(&format!("Response {}: {} body: (failed to save body)", endpoint, status));
                         }
                         if status.is_success() {
                             if let Ok(jsonv) = serde_json::from_str::<serde_json::Value>(&body) {
@@ -484,9 +483,9 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
                                                     for (p, f) in &chunk_pairs {
                                                         if f == fname {
                                                             if std::fs::remove_file(p).is_ok() {
-                                                                log_rpc(&format!("Deleted uploaded file: {}", p.display()));
+                                                                log_rpc_debug(&format!("Deleted uploaded file: {}", p.display()));
                                                             } else {
-                                                                log_rpc(&format!("Failed to delete uploaded file: {}", p.display()));
+                                                                log_rpc_warn(&format!("Failed to delete uploaded file: {}", p.display()));
                                                             }
                                                             break;
                                                         }
@@ -506,9 +505,9 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
                                                     for (p, f) in &chunk_pairs {
                                                         if f == fname {
                                                             if std::fs::remove_file(p).is_ok() {
-                                                                log_rpc(&format!("Deleted duplicate local file: {}", p.display()));
+                                                                log_rpc_debug(&format!("Deleted duplicate local file: {}", p.display()));
                                                             } else {
-                                                                log_rpc(&format!("Failed to delete duplicate local file: {}", p.display()));
+                                                                log_rpc_warn(&format!("Failed to delete duplicate local file: {}", p.display()));
                                                             }
                                                             break;
                                                         }
@@ -529,10 +528,10 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
                             break;
                         }
                     } else {
-                        log_rpc(&format!("Response {}: {} (failed to read body)", endpoint, status));
+                        log_rpc_warn(&format!("Response {}: {} (failed to read body)", endpoint, status));
                     }
                 }
-                Err(e) => { log_rpc(&format!("Request error {}: {}", endpoint, e)); }
+                Err(e) => { log_rpc_error(&format!("Request error {}: {}", endpoint, e)); }
             }
         }
 
@@ -649,9 +648,9 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
             let status = r.status();
             if let Ok(body) = r.text() {
                 if let Some(pf) = save_body_to_file(&body) {
-                    log_rpc(&format!("Response {}: {} BODY_FILE:{}", hash_check_url, status, pf.display()));
+                    log_rpc_debug(&format!("Response {}: {} BODY_FILE:{}", hash_check_url, status, pf.display()));
                 } else {
-                    log_rpc(&format!("Response {}: {} body: (failed to save body)", hash_check_url, status));
+                    log_rpc_warn(&format!("Response {}: {} body: (failed to save body)", hash_check_url, status));
                 }
                 if status.is_success() {
                     if let Ok(map) = serde_json::from_str::<serde_json::Value>(&body) {
@@ -682,7 +681,7 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
                     }
                 }
             } else {
-                log_rpc(&format!("Response {}: {} (failed to read body)", hash_check_url, status));
+                log_rpc_warn(&format!("Response {}: {} (failed to read body)", hash_check_url, status));
             }
         }
     }
