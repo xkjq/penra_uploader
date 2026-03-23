@@ -63,6 +63,27 @@ pub fn base_site_url() -> String {
     "https://www.penracourses.org.uk".to_string()
 }
 
+/// Collect files recursively under `dir` and return a Vec of PathBuf.
+/// This is a simple stack-based traversal that avoids external deps.
+pub fn collect_files_recursive(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut stack: Vec<PathBuf> = Vec::new();
+    stack.push(dir.to_path_buf());
+    while let Some(cur) = stack.pop() {
+        if let Ok(rd) = std::fs::read_dir(&cur) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_file() {
+                    files.push(p);
+                } else if p.is_dir() {
+                    stack.push(p);
+                }
+            }
+        }
+    }
+    files
+}
+
 fn config_file_path() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let cfg = home.join(".uploader");
@@ -519,22 +540,20 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
 
 /// Scan an anonymised directory for files ready to upload, grouped by DICOM SeriesInstanceUID.
 pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>) -> Result<Vec<SeriesInfo>, String> {
+    // Collect files recursively under anon_dir
     let mut files: Vec<PathBuf> = Vec::new();
-    let rd = std::fs::read_dir(anon_dir).map_err(|e| format!("read_dir failed: {}", e))?;
-    for e in rd.flatten() {
-        let p = e.path();
+    let all = collect_files_recursive(anon_dir);
+    for p in all.into_iter() {
         if p.is_file() {
             // Accept files that either have a .dcm extension or can be opened as DICOM
             let mut accept = false;
             if p.extension().map(|ex| ex.eq_ignore_ascii_case("dcm")).unwrap_or(false) {
                 accept = true;
             } else {
-                // try opening as DICOM; if it succeeds, include
                 if open_file(&p).is_ok() {
                     accept = true;
                 }
             }
-
             if accept {
                 files.push(p);
             }
@@ -715,13 +734,12 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
 /// a single `NO_SERIES` series and hashes are computed from file bytes for
 /// duplicate prechecks with the server.
 pub fn scan_for_upload_quick(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>) -> Result<Vec<SeriesInfo>, String> {
-    // List-only quick scan: enumerate files and report sizes. Do NOT read
+    // List-only quick scan: enumerate files recursively and report sizes. Do NOT read
     // file contents, compute hashes, or call the server. This is intended for
     // fast operations (like Remove all) where we only need a stable file list.
     let mut files: Vec<PathBuf> = Vec::new();
-    let rd = std::fs::read_dir(anon_dir).map_err(|e| format!("read_dir failed: {}", e))?;
-    for e in rd.flatten() {
-        let p = e.path();
+    let all = collect_files_recursive(anon_dir);
+    for p in all.into_iter() {
         if p.is_file() {
             files.push(p);
         }

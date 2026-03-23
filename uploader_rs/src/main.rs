@@ -236,18 +236,17 @@ impl AppState {
         let seed_clone = self.seed.clone();
 
         thread::spawn(move || {
-            // collect .dcm files first so we can report progress
-            let mut dcm_files: Vec<std::path::PathBuf> = Vec::new();
-            if let Ok(entries) = fs::read_dir(&export) {
-                for ent in entries.flatten() {
-                    let p = ent.path();
-                    if p.extension().map(|e| e == "dcm").unwrap_or(false) {
-                        dcm_files.push(p);
-                    }
-                }
-            } else {
-                let _ = tx.send("No export dir or read error".to_string());
-            }
+                        // collect .dcm files recursively so subfolders (e.g. InSightExport) are included
+                        let mut dcm_files: Vec<std::path::PathBuf> = Vec::new();
+                        let all = upload::collect_files_recursive(&export);
+                        for p in all.into_iter() {
+                            if p.extension().map(|e| e == "dcm").unwrap_or(false) {
+                                dcm_files.push(p);
+                            }
+                        }
+                        if dcm_files.is_empty() {
+                            let _ = tx.send("No export dir or no .dcm files found".to_string());
+                        }
 
             let total = dcm_files.len();
             if total > 0 {
@@ -1410,18 +1409,16 @@ fn main() {
             }
         });
 
-        // Initial scan for existing anonymised files to show ready-to-upload series
+        // Kick off initial scan in background so the GUI can appear immediately.
         let anon_dir = app.anon_dir();
-        match scan_for_upload(&anon_dir, Some(tx.clone())) {
-            Ok(series) => {
-                app.ready_series = series;
-                app.selected_series = vec![true; app.ready_series.len()];
-                app.last_msg = format!("Loaded {} series from {}", app.ready_series.len(), anon_dir.display());
+        app.last_msg = format!("Starting initial scan: {}", anon_dir.display());
+        let tx_scan = tx.clone();
+        thread::spawn(move || {
+            // scan_for_upload will send SCAN:SET messages via the provided tx
+            if let Err(e) = scan_for_upload(&anon_dir, Some(tx_scan.clone())) {
+                let _ = tx_scan.send(format!("Initial scan failed: {}", e));
             }
-            Err(e) => {
-                app.last_msg = format!("Initial scan failed: {}", e);
-            }
-        }
+        });
 
         Ok(Box::new(app))
     }));
