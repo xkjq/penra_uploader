@@ -711,6 +711,9 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
 /// a single `NO_SERIES` series and hashes are computed from file bytes for
 /// duplicate prechecks with the server.
 pub fn scan_for_upload_quick(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>) -> Result<Vec<SeriesInfo>, String> {
+    // List-only quick scan: enumerate files and report sizes. Do NOT read
+    // file contents, compute hashes, or call the server. This is intended for
+    // fast operations (like Remove all) where we only need a stable file list.
     let mut files: Vec<PathBuf> = Vec::new();
     let rd = std::fs::read_dir(anon_dir).map_err(|e| format!("read_dir failed: {}", e))?;
     for e in rd.flatten() {
@@ -726,23 +729,14 @@ pub fn scan_for_upload_quick(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender
 
     let total_files = files.len();
     if let Some(ref s) = tx {
-        let _ = s.send("PROC:STEP:Quick scanning files".to_string());
+        let _ = s.send("PROC:STEP:Quick listing files".to_string());
         let _ = s.send(format!("PROC:PROG:{}", 0.0));
     }
 
-    let mut hash_list: Vec<String> = Vec::new();
+    // Group under NO_SERIES with empty hashes and no duplicate flags.
     let mut series_map: HashMap<String, Vec<(PathBuf, String)>> = HashMap::new();
-
     for (i, p) in files.iter().enumerate() {
-        let mut h_opt: Option<String> = None;
-        if let Ok(bytes) = std::fs::read(p) {
-            h_opt = Some(blake3::hash(&bytes).to_hex().to_string());
-        }
-        let h = h_opt.clone().unwrap_or_else(|| "".to_string());
-        if h_opt.is_some() { hash_list.push(h.clone()); }
-        // fast scan cannot determine SeriesInstanceUID; group under NO_SERIES
-        series_map.entry("NO_SERIES".to_string()).or_default().push((p.clone(), h));
-
+        let _ = series_map.entry("NO_SERIES".to_string()).or_default().push((p.clone(), "".to_string()));
         if let Some(ref s) = tx {
             if total_files > 0 {
                 let prog = ((i + 1) as f32 / total_files as f32).clamp(0.0, 1.0);
@@ -751,74 +745,21 @@ pub fn scan_for_upload_quick(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender
         }
     }
 
-    // precheck duplicates via server (same as full scan)
-    let mut duplicate_hashes: HashSet<String> = HashSet::new();
-    let mut duplicate_series_urls: HashMap<String, Vec<String>> = HashMap::new();
-    if !hash_list.is_empty() {
-        let client = make_client(load_api_token().as_deref()).map_err(|e| e)?;
-        let base = base_site_url();
-        let hash_check_url = format!("{}{}", base, "/api/atlas/check_image_hashes/");
-        log_rpc(&format!("POST {} with {} hashes", hash_check_url, hash_list.len()));
-        if let Ok(r) = client.post(&hash_check_url).json(&hash_list).send() {
-            let status = r.status();
-            if let Ok(body) = r.text() {
-                if let Some(pf) = save_body_to_file(&body) {
-                    log_rpc(&format!("Response {}: {} BODY_FILE:{}", hash_check_url, status, pf.display()));
-                } else {
-                    log_rpc(&format!("Response {}: {} body: (failed to save body)", hash_check_url, status));
-                }
-                if status.is_success() {
-                    if let Ok(map) = serde_json::from_str::<serde_json::Value>(&body) {
-                        if let Some(obj) = map.as_object() {
-                            for (hash_val, info) in obj.iter() {
-                                if info.is_object() {
-                                    if let Some(id) = info.get("id") {
-                                        if json_value_truthy(id) {
-                                            duplicate_hashes.insert(hash_val.clone());
-                                            if let Some(urlv) = info.get("url") {
-                                                if let Some(urls) = urlv.as_str() {
-                                                    let full = if urls.starts_with("http") {
-                                                        urls.to_string()
-                                                    } else if urls.starts_with('/') {
-                                                        format!("{}{}", base.trim_end_matches('/'), urls)
-                                                    } else {
-                                                        format!("{}/{}", base.trim_end_matches('/'), urls)
-                                                    };
-                                                    duplicate_series_urls.entry(hash_val.clone()).or_default().push(full);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // build SeriesInfo - limited metadata (no DICOM parsing)
     let mut out: Vec<SeriesInfo> = Vec::new();
     for (series_uid, items) in series_map.into_iter() {
         let mut entries: Vec<FileEntry> = Vec::new();
-        let mut urls: Vec<String> = Vec::new();
         let mut total_bytes: u64 = 0;
-        for (p, h) in &items {
-            let is_dup = duplicate_hashes.contains(h);
-            if let Some(u) = duplicate_series_urls.get(h) {
-                for s in u { urls.push(s.clone()); }
-            }
+        for (p, _h) in &items {
             if let Ok(md) = std::fs::metadata(p) {
                 total_bytes = total_bytes.saturating_add(md.len());
             }
-            entries.push(FileEntry { path: p.clone(), hash: h.clone(), is_duplicate: is_dup });
+            entries.push(FileEntry { path: p.clone(), hash: "".to_string(), is_duplicate: false });
         }
 
         out.push(SeriesInfo {
             series_uid,
             files: entries,
-            duplicate_series_urls: urls,
+            duplicate_series_urls: Vec::new(),
             patient_name: None,
             examination: None,
             patient_id: None,
