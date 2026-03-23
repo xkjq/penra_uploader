@@ -1497,15 +1497,14 @@ fn main() {
         });
 
         // Kick off initial scan in background so the GUI can appear immediately.
+        // Use `request_scan` so the parsed result is stored and a `scan_written`
+        // notification is sent for the UI to pick up the ready-series.
         let anon_dir = app.anon_dir();
         app.last_msg = format!("Starting initial scan: {}", anon_dir.display());
         let tx_scan = tx.clone();
-        thread::spawn(move || {
-            // scan_for_upload will send SCAN:SET messages via the provided tx
-            if let Err(e) = scan_for_upload(&anon_dir, Some(tx_scan.clone())) {
-                let _ = tx_scan.send(format!("Initial scan failed: {}", e));
-            }
-        });
+        if let Err(e) = request_scan(&anon_dir, Some(tx_scan.clone())) {
+            let _ = tx_scan.send(format!("Initial scan request failed: {}", e));
+        }
 
         Ok(Box::new(app))
     }));
