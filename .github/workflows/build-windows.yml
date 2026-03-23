@@ -1,11 +1,16 @@
 name: Build Windows artifacts
 
 on:
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
+  #push:
+  #  branches: [ main, master ]
+  #pull_request:
+  #  branches: [ main, master ]
   workflow_dispatch:
+    inputs:
+      target:
+        description: 'Build target: msvc (default) or all'
+        required: false
+        default: 'msvc'
 
 jobs:
   build-msvc:
