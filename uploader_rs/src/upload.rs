@@ -14,6 +14,7 @@ use std::sync::mpsc::Sender as MpscSender;
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use tracing::Level;
+use tracing::Level;
 
 static SCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -259,8 +260,15 @@ pub fn log_rpc(msg: &str) {
     tracing::info!(message = %msg);
 }
 
+/// Emit an RPC-style log at a dynamic `Level`.
 pub fn log_rpc_level(level: Level, msg: &str) {
-    tracing::event!(level, message = %msg);
+    match level {
+        Level::TRACE => tracing::trace!(message = %msg),
+        Level::DEBUG => tracing::debug!(message = %msg),
+        Level::INFO => tracing::info!(message = %msg),
+        Level::WARN => tracing::warn!(message = %msg),
+        Level::ERROR => tracing::error!(message = %msg),
+    }
 }
 
 pub fn log_rpc_debug(msg: &str) { log_rpc_level(Level::DEBUG, msg); }
