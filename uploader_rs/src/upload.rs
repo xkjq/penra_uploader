@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender as MpscSender;
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
+use tracing::Level;
 
 static SCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -257,6 +258,14 @@ pub fn log_rpc(msg: &str) {
     // backwards compatibility with callers.
     tracing::info!(message = %msg);
 }
+
+pub fn log_rpc_level(level: Level, msg: &str) {
+    tracing::event!(level, message = %msg);
+}
+
+pub fn log_rpc_debug(msg: &str) { log_rpc_level(Level::DEBUG, msg); }
+pub fn log_rpc_warn(msg: &str)  { log_rpc_level(Level::WARN, msg); }
+pub fn log_rpc_error(msg: &str) { log_rpc_level(Level::ERROR, msg); }
 
 fn bodies_dir() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));

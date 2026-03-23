@@ -20,6 +20,12 @@ use std::io::{Read, Write};
 use fs2::FileExt;
 use chrono::Utc;
 use std::time::{Instant, Duration};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::reload;
+use once_cell::sync::OnceCell;
+use tracing_subscriber::prelude::*;
+
+static FILTER_RELOADER: OnceCell<Box<dyn Fn(EnvFilter) -> Result<(), String> + Send + Sync>> = OnceCell::new();
 
 fn human_size(bytes: u64) -> String {
     if bytes >= 1_000_000 {
@@ -67,6 +73,7 @@ struct AppState {
     selected_files_for_meta: HashSet<String>,
     metadata_select_mode: bool,
     log_window_open: bool,
+    log_level: String,
     confirm_remove_all: bool,
     // when set, the app should exit (message explains why)
     exit_requested: Option<String>,
@@ -143,6 +150,7 @@ impl Default for AppState {
             exit_requested: None,
             exit_at: None,
             toasts: Vec::new(),
+            log_level: std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
         }
     }
 }
@@ -1043,6 +1051,34 @@ impl eframe::App for AppState {
                         self.last_msg = "Cleared logs".to_string();
                     }
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Log level:");
+                    let mut current = self.log_level.clone();
+                    egui::ComboBox::from_id_source("log_level_combo").selected_text(&current).show_ui(ui, |ui| {
+                        for &lvl in &["trace", "debug", "info", "warn", "error"] {
+                            if ui.selectable_value(&mut current, lvl.to_string(), lvl).clicked() {
+                                // selection handled below
+                            }
+                        }
+                    });
+                    if current != self.log_level {
+                        self.log_level = current.clone();
+                    }
+                    if ui.small_button("Apply").clicked() {
+                        match FILTER_RELOADER.get() {
+                            Some(f) => {
+                                let new_filter = EnvFilter::new(self.log_level.clone());
+                                match f(new_filter) {
+                                    Ok(_) => self.last_msg = format!("Log level set to {}", self.log_level),
+                                    Err(e) => self.last_msg = format!("Failed to set log level: {}", e),
+                                }
+                            }
+                            None => {
+                                self.last_msg = "Log reload handle not initialized".to_string();
+                            }
+                        }
+                    }
+                });
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label(format!("Export dir: {}", self.export_dir.display()));
@@ -1277,12 +1313,16 @@ fn main() {
         std::process::exit(1);
     });
     let (non_blocking, guard) = tracing_appender::non_blocking(file);
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let (filter_layer, handle) = reload::Layer::new(env_filter);
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
-        .with_target(false)
-        .init();
+        .with_target(false);
+    tracing_subscriber::registry().with(filter_layer).with(fmt_layer).init();
+    let reloader = Box::new(move |f: EnvFilter| -> Result<(), String> {
+        handle.reload(f).map_err(|e| format!("{:?}", e))
+    });
+    let _ = FILTER_RELOADER.set(reloader);
     // keep guard alive for lifetime of program so logs flush correctly
     let _log_guard = guard;
 
