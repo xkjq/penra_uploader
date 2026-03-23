@@ -11,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender as MpscSender;
+use once_cell::sync::Lazy;
+use std::sync::Mutex;
 
 static SCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 
@@ -590,7 +592,9 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
 
         // report incremental progress
         if let Some(ref s) = tx {
-            if total_files > 0 {
+            // throttle progress updates to ~10 updates
+            let report_interval = std::cmp::max(1, total_files / 10);
+            if (i % report_interval == 0) || (i + 1 == total_files) {
                 let prog = ((i + 1) as f32 / total_files as f32).clamp(0.0, 1.0);
                 let _ = s.send(format!("PROC:PROG:{}", prog));
             }
@@ -752,7 +756,7 @@ pub fn scan_for_upload_quick(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender
     let mut out: Vec<SeriesInfo> = Vec::new();
     for (series_uid, items) in series_map.into_iter() {
         let mut entries: Vec<FileEntry> = Vec::new();
-        let mut total_bytes: u64 = 0;
+        let total_bytes: u64 = 0;
         for (p, _h) in &items {
             // avoid stat() to keep this fast; file sizes are non-critical for delete-only flows
             entries.push(FileEntry { path: p.clone(), hash: "".to_string(), is_duplicate: false });
@@ -789,6 +793,8 @@ pub fn request_scan(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>
             }
             match scan_for_upload(&anon_dir, tx.clone()) {
                 Ok(series) => {
+                    // store parsed series in-memory for quick UI pickup
+                    store_last_scan(series.clone());
                     if let Ok(json) = serde_json::to_string(&series) {
                         let _ = std::fs::write(".last_scan.json", json);
                         if let Some(ref s) = tx {
@@ -814,6 +820,24 @@ pub fn request_scan(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>
         }
         Ok(())
     }
+}
+
+// In-memory cache for the last parsed scan result. This lets background
+// scanning threads parse the JSON and store the Vec<SeriesInfo> so the UI can
+// quickly clone it without performing large deserializations on the UI thread.
+static LAST_SCAN: Lazy<Mutex<Option<Vec<SeriesInfo>>>> = Lazy::new(|| Mutex::new(None));
+
+pub fn store_last_scan(series: Vec<SeriesInfo>) {
+    if let Ok(mut g) = LAST_SCAN.lock() {
+        *g = Some(series);
+    }
+}
+
+pub fn get_last_scan() -> Option<Vec<SeriesInfo>> {
+    if let Ok(g) = LAST_SCAN.lock() {
+        return g.clone();
+    }
+    None
 }
 
 #[cfg(test)]

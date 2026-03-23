@@ -217,7 +217,13 @@ impl AppState {
             self.processing_step = None;
             self.processing_progress = 0.0;
         } else if m == "scan_written" {
-            if let Ok(txt) = std::fs::read_to_string(".last_scan.json") {
+            // retrieve the parsed scan result stored by the background thread
+            if let Some(v) = upload::get_last_scan() {
+                self.ready_series = v;
+                self.selected_series = vec![true; self.ready_series.len()];
+                self.last_msg = "Ready-to-upload refreshed".to_string();
+            } else if let Ok(txt) = std::fs::read_to_string(".last_scan.json") {
+                // fallback: try reading the file if cache not available
                 if let Ok(v) = serde_json::from_str::<Vec<SeriesInfo>>(&txt) {
                     self.ready_series = v;
                     self.selected_series = vec![true; self.ready_series.len()];
@@ -361,8 +367,11 @@ impl eframe::App for AppState {
                                     }
                                 }
                                 let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
-                                let prog = done as f32 / (total_copy as f32);
-                                let _ = tx.send(format!("PROC:PROG:{}", prog));
+                                let report_interval = std::cmp::max(1, total_copy / 50);
+                                if (done % report_interval == 0) || (done == total_copy) {
+                                    let prog = done as f32 / (total_copy as f32);
+                                    let _ = tx.send(format!("PROC:PROG:{}", prog));
+                                }
                             });
                         }
 
@@ -483,8 +492,11 @@ impl eframe::App for AppState {
                                                 }
                                             }
                                             let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
-                                            let prog = done as f32 / (total_copy as f32);
-                                            let _ = tx.send(format!("PROC:PROG:{}", prog));
+                                            let report_interval = std::cmp::max(1, total_copy / 50);
+                                            if (done % report_interval == 0) || (done == total_copy) {
+                                                let prog = done as f32 / (total_copy as f32);
+                                                let _ = tx.send(format!("PROC:PROG:{}", prog));
+                                            }
                                         });
 
                                         // after processing, refresh ready-to-upload by scanning anon dir
@@ -523,7 +535,7 @@ impl eframe::App for AppState {
                 
 
                 if ui.button("Refresh ready-to-upload").clicked() {
-                    let anon_dir = self.export_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
+                    let _anon_dir = self.export_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
                         let anon_dir = self.anon_dir();
                     let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
                     thread::spawn(move || {
@@ -536,11 +548,13 @@ impl eframe::App for AppState {
             });
             
             ui.separator();
-            if let Some(rx) = &self.rx {
-                match rx.try_recv() {
-                    Ok(m) => { self.handle_message(&m); }
-                    Err(_) => {}
+            // Temporarily take ownership of the receiver so `handle_message` can
+            // mutably borrow `self` while we drain pending messages.
+            if let Some(rx) = self.rx.take() {
+                while let Ok(m) = rx.try_recv() {
+                    self.handle_message(&m);
                 }
+                self.rx = Some(rx);
             }
 
             if !self.processed.is_empty() {
@@ -599,6 +613,8 @@ impl eframe::App for AppState {
                                                     let _ = tx.send(format!("PROC:PROG:{}", 0.0));
                                                 }
                                                 let mut processed_dup = 0usize;
+                                                // throttle duplicate-removal progress updates to ~50 updates
+                                                let dup_report_interval = std::cmp::max(1, total_dup / 50);
                                                 for s in &series {
                                                     for f in &s.files {
                                                         if f.is_duplicate {
@@ -610,8 +626,10 @@ impl eframe::App for AppState {
                                                             }
                                                             processed_dup = processed_dup.saturating_add(1);
                                                             if total_dup > 0 {
-                                                                let prog = (processed_dup as f32 / total_dup as f32).clamp(0.0, 1.0);
-                                                                let _ = tx.send(format!("PROC:PROG:{}", prog));
+                                                                if (processed_dup % dup_report_interval == 0) || (processed_dup == total_dup) {
+                                                                    let prog = (processed_dup as f32 / total_dup as f32).clamp(0.0, 1.0);
+                                                                    let _ = tx.send(format!("PROC:PROG:{}", prog));
+                                                                }
                                                             }
                                                         }
                                                     }
@@ -981,6 +999,8 @@ impl eframe::App for AppState {
                                             let _ = tx.send(format!("PROC:PROG:{}", 0.0));
                                         }
                                         let mut processed_files = 0usize;
+                                        // throttle remove-all progress updates to ~50 updates
+                                        let remove_report_interval = std::cmp::max(1, total_files / 50);
                                         for s in &series {
                                             for f in &s.files {
                                                 if std::fs::remove_file(&f.path).is_ok() {
@@ -991,8 +1011,10 @@ impl eframe::App for AppState {
                                                 }
                                                 processed_files = processed_files.saturating_add(1);
                                                 if total_files > 0 {
-                                                    let prog = (processed_files as f32 / total_files as f32).clamp(0.0, 1.0);
-                                                    let _ = tx.send(format!("PROC:PROG:{}", prog));
+                                                    if (processed_files % remove_report_interval == 0) || (processed_files == total_files) {
+                                                        let prog = (processed_files as f32 / total_files as f32).clamp(0.0, 1.0);
+                                                        let _ = tx.send(format!("PROC:PROG:{}", prog));
+                                                    }
                                                 }
                                             }
                                         }
@@ -1266,7 +1288,11 @@ fn main() {
                                             },
                                         }
                                         let frac = (i as f32 + 1.0) / (total as f32);
-                                        let _ = tx2.send(format!("PROC:PROG:{}", frac));
+                                        // throttle copy progress updates
+                                        let report_interval = std::cmp::max(1, total / 50);
+                                        if ((i + 1) % report_interval == 0) || (i + 1 == total) {
+                                            let _ = tx2.send(format!("PROC:PROG:{}", frac));
+                                        }
                                     }
 
                                     // Collect processing files and anonymize in parallel
@@ -1298,8 +1324,11 @@ fn main() {
                                                 }
                                             }
                                             let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
-                                            let frac = done as f32 / (total_copy as f32);
-                                            let _ = tx2.send(format!("PROC:PROG:{}", frac));
+                                            let report_interval = std::cmp::max(1, total_copy / 50);
+                                            if (done % report_interval == 0) || (done == total_copy) {
+                                                let frac = done as f32 / (total_copy as f32);
+                                                let _ = tx2.send(format!("PROC:PROG:{}", frac));
+                                            }
                                         });
                                     }
 
