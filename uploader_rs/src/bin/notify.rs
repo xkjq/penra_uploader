@@ -1,14 +1,17 @@
-use nng::{Protocol, Socket};
+use interprocess::local_socket::LocalSocketStream;
+use std::io::Write;
 
 fn main() {
-    let socket = Socket::new(Protocol::Pair0).expect("failed to create socket");
-    match socket.dial("tcp://127.0.0.1:9976") {
-        Ok(_) => {
-            let _ = socket.send(&b"loaded"[..]);
+    // Attempt to connect to the per-user IPC socket and send 'loaded'.
+    let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| format!("pid{}", std::process::id()));
+    let ipc_name = format!("uploader_rs_{}", user);
+    match LocalSocketStream::connect(&ipc_name) {
+        Ok(mut s) => {
+            let _ = s.write_all(b"loaded");
             println!("sent loaded");
         }
         Err(e) => {
-            eprintln!("failed to dial: {:?}", e);
+            eprintln!("failed to connect to ipc socket: {:?}", e);
         }
     }
 }

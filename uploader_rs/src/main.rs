@@ -15,7 +15,9 @@ use rayon::prelude::*;
 use blake3;
 use std::fs;
 use rfd::FileDialog;
-use nng::{Protocol, Socket};
+use interprocess::local_socket::{LocalSocketListener, LocalSocketStream};
+use std::io::{Read, Write};
+use fs2::FileExt;
 use chrono::Utc;
 use std::time::{Instant, Duration};
 
@@ -248,11 +250,11 @@ impl AppState {
                 }
             }
         }
-        if m.starts_with("NNG:RECV:") {
-            if let Some(text) = m.strip_prefix("NNG:RECV:") {
+        if m.starts_with("IPC:RECV:") {
+            if let Some(text) = m.strip_prefix("IPC:RECV:") {
                 let txt = text.trim().to_string();
-                self.add_toast(format!("NNG: {}", txt), 4000);
-                self.last_msg = format!("NNG: {}", txt);
+                self.add_toast(format!("IPC: {}", txt), 4000);
+                self.last_msg = format!("IPC: {}", txt);
                 return;
             }
         }
@@ -424,14 +426,17 @@ impl eframe::App for AppState {
                         }
 
                         if notify_flag {
-                            if let Ok(s) = Socket::new(Protocol::Pair0) {
-                                if s.dial("tcp://127.0.0.1:9976").is_ok() {
-                                    let _ = tx.send("Sent NNG 'loaded'".to_string());
+                            // notify any running instance via local socket
+                            let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| format!("pid{}", std::process::id()));
+                            let ipc_name = format!("uploader_rs_{}", user);
+                            if let Ok(mut s) = LocalSocketStream::connect(ipc_name.as_str()) {
+                                if s.write_all(b"loaded").is_ok() {
+                                    let _ = tx.send("Sent IPC 'loaded'".to_string());
                                 } else {
-                                    let _ = tx.send("Failed to dial NNG socket".to_string());
+                                    let _ = tx.send("Failed to write to IPC socket".to_string());
                                 }
                             } else {
-                                let _ = tx.send("Failed to create NNG socket".to_string());
+                                let _ = tx.send("Failed to connect to IPC socket".to_string());
                             }
                         }
 
@@ -1223,11 +1228,15 @@ impl eframe::App for AppState {
                 ui.vertical(|ui| {
                     for (msg, exp) in &self.toasts {
                         let remaining = exp.saturating_duration_since(now);
-                        let secs = remaining.as_secs_f32();
+                        let _secs = remaining.as_secs_f32();
                         let label = format!("{}", msg);
-                        ui.group(|ui| {
-                            ui.label(label);
-                        });
+                        // Draw a rounded colored frame with white text to make toasts stand out
+                        egui::Frame::default()
+                            .fill(egui::Color32::from_rgb(30, 144, 255)) // DodgerBlue background
+                            .rounding(egui::Rounding::same(6))
+                            .show(ui, |ui| {
+                                ui.colored_label(egui::Color32::WHITE, label);
+                            });
                         ui.add_space(6.0);
                     }
                 });
@@ -1276,34 +1285,28 @@ fn main() {
             }
         }
     }
-            // Pre-GUI: synchronous NNG bind check. If we cannot bind, assume another
-            // instance (or system issue) and exit early to avoid loading a duplicate GUI.
-            match Socket::new(Protocol::Pair0) {
-                Ok(sock) => {
-                    if let Err(e) = sock.listen("tcp://127.0.0.1:9976") {
-                        // If bind fails because the socket is already in use, try to notify
-                        // the running instance by dialing and sending a small 'loaded' ping.
-                        eprintln!("NNG bind failed at startup: {:?}", e);
-                        if let Ok(dial) = Socket::new(Protocol::Pair0) {
-                            if dial.dial("tcp://127.0.0.1:9976").is_ok() {
-                                let _ = dial.send(&b"loaded"[..]);
-                                // exit after notifying existing instance
-                                std::process::exit(0);
-                            }
+            // Pre-GUI: single-instance check using a per-user lockfile and a
+            // local socket name. If another instance is running, connect to its
+            // socket and send a short 'loaded' notification, then exit.
+            let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| format!("pid{}", std::process::id()));
+            let ipc_name = format!("uploader_rs_{}", user);
+            let lock_path = std::env::temp_dir().join(format!("uploader_rs_{}.lock", user));
+            // open (and keep) the lock file for the lifetime of the process
+            let lockfile = match std::fs::OpenOptions::new().create(true).write(true).open(&lock_path) {
+                Ok(f) => {
+                    if let Err(_) = f.try_lock_exclusive() {
+                        // lock failed -> another instance likely running; notify it and exit
+                        if let Ok(mut stream) = LocalSocketStream::connect(ipc_name.as_str()) {
+                            let _ = stream.write_all(b"loaded");
                         }
-                        // if we couldn't notify, exit with error
-                        std::process::exit(1);
+                        std::process::exit(0);
                     }
-                    // drop socket to free address for the real listener thread
-                    drop(sock);
+                    Some(f)
                 }
-                Err(e) => {
-                    eprintln!("NNG socket creation failed at startup: {:?}", e);
-                    std::process::exit(1);
-                }
-            }
+                Err(e) => { eprintln!("Failed to create lockfile {}: {:?}", lock_path.display(), e); std::process::exit(1); }
+            };
     let native_options = NativeOptions::default();
-    let _ = eframe::run_native("Uploader (Rust)", native_options, Box::new(|_cc| {
+    let _ = eframe::run_native("Uploader (Rust)", native_options, Box::new(move |_cc| {
         // create app and a channel for background notifications (NNG and tasks)
         let mut app = AppState::default();
         // ensure log file exists for debug output
@@ -1314,162 +1317,85 @@ fn main() {
 
         
 
-        // Spawn NNG listener thread to accept notifications from exporter app.
-        // Binds to tcp://127.0.0.1:9976 and forwards received messages to the GUI via `tx`.
+        // Spawn IPC listener thread to accept notifications from exporter app.
+        // Binds to a per-user local socket and forwards received messages to the GUI via `tx`.
         let tx_clone = tx.clone();
         let export_dir_clone = app.export_dir.clone();
         let anon_dir_clone = app.anon_dir();
-        let seed_for_nng = app.seed.clone();
+        let seed_for_ipc = app.seed.clone();
+        let ipc_name_clone = ipc_name.clone();
         thread::spawn(move || {
-            match Socket::new(Protocol::Pair0) {
-                Ok(s) => {
-                    // try to listen; if it fails, report and do not enter recv loop
-                    match s.listen("tcp://127.0.0.1:9976") {
-                        Err(e) => {
-                            let _ = tx_clone.send(format!("NNG_BIND_FAIL:{:?}", e));
-                        }
-                        Ok(()) => {
-                            let _ = tx_clone.send("NNG listener bound on tcp://127.0.0.1:9976".to_string());
-                            loop {
-                                match s.recv() {
-                                    Ok(msg) => {
-                                        let text = match std::str::from_utf8(&msg) {
-                                            Ok(t) => t.to_string(),
-                                            Err(_) => format!("<bin:{} bytes>", msg.len()),
-                                        };
-                                        let _ = tx_clone.send(format!("NNG:RECV:{}", text));
-                                        // Kick off processing: copy-export-then-anonymize in background
-                                        let tx2 = tx_clone.clone();
-                                        let export_dir2 = export_dir_clone.clone();
-                                        let anon_dir2 = anon_dir_clone.clone();
-                                        let seed2 = seed_for_nng.clone();
-                                        thread::spawn(move || {
-                                            // create a processing dir so we don't race with exporter clearing export
-                                            let proc_base = export_dir2.parent().map(|p| p.join("processing")).unwrap_or_else(|| PathBuf::from("processing"));
-                                            let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S").to_string();
-                                            let proc_dir = proc_base.join(ts);
-                                            let _ = std::fs::create_dir_all(&proc_dir);
-                                            let _ = tx2.send("PROC:STEP:Copying export files".to_string());
-                                            // collect files
-                                            let mut files: Vec<PathBuf> = Vec::new();
-                                            if let Ok(entries) = std::fs::read_dir(&export_dir2) {
-                                                for e in entries.flatten() {
-                                                    let p = e.path();
-                                                    if p.is_file() {
-                                                        if p.extension().map(|s| s.to_string_lossy().eq_ignore_ascii_case("dcm")).unwrap_or(false) {
-                                                            files.push(p);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            let total = files.len();
-                                            if total == 0 {
-                                                let _ = tx2.send("PROC:STEP:No files to process".to_string());
-                                                let _ = tx2.send("PROC:DONE".to_string());
-                                                return;
-                                            }
-                                            for (i, p) in files.iter().enumerate() {
-                                                let fname = p.file_name().unwrap_or_default().to_os_string();
-                                                let dest = proc_dir.join(&fname);
-                                                // prefer moving (rename) to avoid copying large files; fallback to copy+remove
-                                                match std::fs::rename(&p, &dest) {
-                                                    Ok(_) => {
-                                                        let _ = tx2.send(format!("Moved {} -> {}", p.display(), dest.display()));
-                                                    }
-                                                    Err(_) => match std::fs::copy(&p, &dest) {
-                                                        Ok(_) => {
-                                                            let _ = std::fs::remove_file(&p);
-                                                            let _ = tx2.send(format!("Copied+removed {} -> {}", p.display(), dest.display()));
-                                                        }
-                                                        Err(e) => {
-                                                            let _ = tx2.send(format!("Failed to move {}: {}", p.display(), e));
-                                                        }
-                                                    },
-                                                }
-                                                let frac = (i as f32 + 1.0) / (total as f32);
-                                                // throttle copy progress updates
-                                                let report_interval = std::cmp::max(1, total / 50);
-                                                if ((i + 1) % report_interval == 0) || (i + 1 == total) {
-                                                    let _ = tx2.send(format!("PROC:PROG:{}", frac));
-                                                }
-                                            }
-
-                                            // Collect processing files and anonymize in parallel
-                                            let proc_paths: Vec<PathBuf> = std::fs::read_dir(&proc_dir).unwrap_or_else(|_| std::fs::read_dir(&export_dir2).unwrap()).flatten()
-                                                .map(|e| e.path())
-                                                .filter(|src| src.extension().map(|s| s.to_string_lossy().eq_ignore_ascii_case("dcm")).unwrap_or(false))
-                                                .collect();
-                                            let total_proc = proc_paths.len();
-                                            if total_proc == 0 {
-                                                let _ = tx2.send("PROC:STEP:No files to process".to_string());
-                                            } else {
-                                                let _ = tx2.send("PROC:STEP:Anonymizing copied files".to_string());
-                                                let processed_count = Arc::new(AtomicUsize::new(0));
-                                                let total_copy = total_proc;
-                                                proc_paths.par_iter().for_each(|src| {
-                                                    let tx2 = tx2.clone();
-                                                    let processed_count = processed_count.clone();
-                                                    let seed = seed2.clone();
-                                                    match anonymize_file(src, &anon_dir2, true, false, false, seed.as_deref()) {
-                                                        Ok(out) => {
-                                                            let _ = tx2.send(format!("Anonymized: {}", out.display()));
-                                                            // remove the source file from processing dir when anonymization succeeded
-                                                            if std::fs::remove_file(src).is_ok() {
-                                                                let _ = tx2.send(format!("Removed processed file: {}", src.display()));
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            let _ = tx2.send(format!("Anon failed {}: {}", src.display(), e));
-                                                        }
-                                                    }
-                                                    let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
-                                                    let report_interval = std::cmp::max(1, total_copy / 50);
-                                                    if (done % report_interval == 0) || (done == total_copy) {
-                                                        let frac = done as f32 / (total_copy as f32);
-                                                        let _ = tx2.send(format!("PROC:PROG:{}", frac));
-                                                    }
-                                                });
-                                            }
-
-                                            // after processing, refresh ready-to-upload by scanning anon dir
-                                            let _ = tx2.send("PROC:STEP:Refreshing ready-to-upload".to_string());
-                                            if let Err(e) = request_scan(&anon_dir2, Some(tx2.clone())) {
-                                                let _ = tx2.send(format!("Post-process scan failed: {}", e));
-                                            }
-
-                                            // attempt to remove the processing directory if it's now empty
-                                            match std::fs::read_dir(&proc_dir) {
-                                                Ok(mut rd) => {
-                                                    if rd.next().is_none() {
-                                                        if std::fs::remove_dir(&proc_dir).is_ok() {
-                                                            let _ = tx2.send(format!("Removed empty processing dir: {}", proc_dir.display()));
-                                                        }
-                                                    } else {
-                                                        let _ = tx2.send(format!("Processing dir not empty: {}", proc_dir.display()));
-                                                    }
-                                                }
-                                                Err(_) => {
-                                                    // if we can't read it, try remove_dir and ignore errors
-                                                    let _ = std::fs::remove_dir(&proc_dir);
-                                                }
-                                            }
-
-                                            let _ = tx2.send("PROC:DONE".to_string());
-                                        });
-                                        // reply ack
-                                        let _ = s.send(&b"ack"[..]);
-                                    }
-                                    Err(e) => {
-                                        let _ = tx_clone.send(format!("NNG recv error: {:?}", e));
-                                        std::thread::sleep(std::time::Duration::from_millis(200));
+            use std::io::ErrorKind;
+            // Attempt to bind; if address is in use, try to connect to see if another
+            // process owns it. If connection fails, on Unix try removing a stale
+            // socket file and retry bind once.
+            match LocalSocketListener::bind(ipc_name_clone.as_str()) {
+                Ok(listener) => {
+                    let _ = tx_clone.send(format!("IPC listener bound: {}", ipc_name_clone));
+                    loop {
+                        match listener.accept() {
+                            Ok(mut conn) => {
+                                let mut buf = Vec::new();
+                                if conn.read_to_end(&mut buf).is_ok() {
+                                    if let Ok(text) = String::from_utf8(buf) {
+                                        let _ = tx_clone.send(format!("IPC:RECV:{}", text));
                                     }
                                 }
+                            }
+                            Err(e) => {
+                                let _ = tx_clone.send(format!("IPC accept error: {:?}", e));
+                                std::thread::sleep(std::time::Duration::from_millis(200));
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    let _ = tx_clone.send(format!("Failed to create NNG socket: {:?}", e));
+                    if e.kind() == ErrorKind::AddrInUse {
+                        // Someone is bound to this name. Try connecting — if connect
+                        // succeeds, another live process owns it; otherwise, we may
+                        // have a stale socket file to clean up (Unix).
+                        match LocalSocketStream::connect(ipc_name_clone.as_str()) {
+                            Ok(_) => {
+                                let _ = tx_clone.send(format!("IPC listener already running: {}", ipc_name_clone));
+                            }
+                            Err(_) => {
+                                // Attempt cleanup on Unix and retry bind once
+                                #[cfg(unix)]
+                                {
+                                    let path = std::path::Path::new(&ipc_name_clone);
+                                    if path.exists() {
+                                        let _ = std::fs::remove_file(path);
+                                    }
+                                }
+                                match LocalSocketListener::bind(ipc_name_clone.as_str()) {
+                                    Ok(listener) => {
+                                        let _ = tx_clone.send(format!("IPC listener rebound after cleanup: {}", ipc_name_clone));
+                                        loop {
+                                            match listener.accept() {
+                                                Ok(mut conn) => {
+                                                    let mut buf = Vec::new();
+                                                    if conn.read_to_end(&mut buf).is_ok() {
+                                                        if let Ok(text) = String::from_utf8(buf) {
+                                                            let _ = tx_clone.send(format!("IPC:RECV:{}", text));
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    let _ = tx_clone.send(format!("IPC accept error: {:?}", e));
+                                                    std::thread::sleep(std::time::Duration::from_millis(200));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e2) => {
+                                        let _ = tx_clone.send(format!("IPC bind failed after cleanup: {:?}", e2));
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let _ = tx_clone.send(format!("IPC bind failed: {:?}", e));
+                    }
                 }
             }
         });

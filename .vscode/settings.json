@@ -11,6 +11,10 @@
         "/^bash -lc \"cargo test --quiet\"$/": {
             "approve": true,
             "matchCommandLine": true
+        },
+        "/^python3 /home/ross/uploader/\\.scripts/check_delims\\.py$/": {
+            "approve": true,
+            "matchCommandLine": true
         }
     }
 }
