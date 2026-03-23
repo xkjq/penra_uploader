@@ -17,6 +17,7 @@ use std::fs;
 use rfd::FileDialog;
 use nng::{Protocol, Socket};
 use chrono::Utc;
+use std::time::{Instant, Duration};
 
 fn human_size(bytes: u64) -> String {
     if bytes >= 1_000_000 {
@@ -65,6 +66,12 @@ struct AppState {
     metadata_select_mode: bool,
     log_window_open: bool,
     confirm_remove_all: bool,
+    // when set, the app should exit (message explains why)
+    exit_requested: Option<String>,
+    // time to exit after showing toast (if any)
+    exit_at: Option<Instant>,
+    // in-app toast messages (message, expire_at)
+    toasts: Vec<(String, Instant)>,
 }
 
 impl Default for AppState {
@@ -131,11 +138,19 @@ impl Default for AppState {
             log_window_open: false,
             login_open: upload::token_username().is_none(),
             confirm_remove_all: false,
+            exit_requested: None,
+            exit_at: None,
+            toasts: Vec::new(),
         }
     }
 }
 
 impl AppState {
+    fn add_toast(&mut self, msg: String, duration_ms: u64) {
+        let expire = Instant::now() + Duration::from_millis(duration_ms);
+        self.toasts.push((msg, expire));
+    }
+
     fn spawn_login(&mut self, user: String, pass: String) {
         let tx = match &self.tx {
             Some(t) => t.clone(),
@@ -208,6 +223,17 @@ impl AppState {
     // Handle an incoming message string (extracted from the UI update loop).
     // Extracted so tests can exercise UI state transitions without running egui.
     fn handle_message(&mut self, m: &str) {
+        if m.starts_with("FATAL:NNG_BIND:") {
+            if let Some(msg) = m.strip_prefix("FATAL:NNG_BIND:") {
+                let text = format!("Critical: NNG bind failed: {}", msg);
+                self.exit_requested = Some(text.clone());
+                self.last_msg = text.clone();
+                // show a toast and schedule exit in 4 seconds so user sees it
+                self.add_toast(text, 4000);
+                self.exit_at = Some(Instant::now() + Duration::from_secs(4));
+                return;
+            }
+        }
         if m.starts_with("SCAN:SET:") {
             if let Some(b64) = m.strip_prefix("SCAN:SET:") {
                 if let Ok(json) = base64::decode(b64) {
@@ -569,6 +595,13 @@ impl eframe::App for AppState {
                     self.handle_message(&m);
                 }
                 self.rx = Some(rx);
+            }
+
+            // If a fatal exit was requested (e.g., NNG bind failure), exit after the scheduled delay.
+            if let Some(at) = self.exit_at {
+                if Instant::now() >= at {
+                    std::process::exit(1);
+                }
             }
 
             if !self.processed.is_empty() {
@@ -1173,6 +1206,25 @@ impl eframe::App for AppState {
                 });
             }
         });
+
+        // Render toasts in a top-right area and drop expired ones.
+        let now = Instant::now();
+        self.toasts.retain(|(_m, exp)| *exp > now);
+        if !self.toasts.is_empty() {
+            egui::Area::new("toasts_area".into()).anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0)).show(ctx, |ui| {
+                ui.vertical(|ui| {
+                    for (msg, exp) in &self.toasts {
+                        let remaining = exp.saturating_duration_since(now);
+                        let secs = remaining.as_secs_f32();
+                        let label = format!("{}", msg);
+                        ui.group(|ui| {
+                            ui.label(label);
+                        });
+                        ui.add_space(6.0);
+                    }
+                });
+            });
+        }
     }
 }
 
@@ -1249,7 +1301,19 @@ fn main() {
             match Socket::new(Protocol::Pair0) {
                 Ok(s) => {
                     if let Err(e) = s.listen("tcp://127.0.0.1:9976") {
-                        let _ = tx_clone.send(format!("NNG bind failed: {:?}", e));
+                        // Send a fatal message so the GUI shows notification and exits.
+                        let _ = tx_clone.send(format!("FATAL:NNG_BIND:{:?}", e));
+                        // Also attempt to notify exporters as a fallback (best-effort).
+                        if let Ok(dial_sock) = Socket::new(Protocol::Pair0) {
+                            if dial_sock.dial("tcp://127.0.0.1:9976").is_ok() {
+                                let _ = dial_sock.send(&b"loaded"[..]);
+                                let _ = tx_clone.send("Sent NNG 'loaded' (bind failed)".to_string());
+                            } else {
+                                let _ = tx_clone.send("Failed to dial NNG socket after bind failure".to_string());
+                            }
+                        } else {
+                            let _ = tx_clone.send("Failed to create NNG socket after bind failure".to_string());
+                        }
                         return;
                     }
                     let _ = tx_clone.send("NNG listener bound on tcp://127.0.0.1:9976".to_string());
