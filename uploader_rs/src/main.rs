@@ -236,6 +236,14 @@ impl AppState {
         let seed_clone = self.seed.clone();
 
         thread::spawn(move || {
+                        // ensure export and anon directories exist (create if missing)
+                        if let Err(e) = fs::create_dir_all(&export) {
+                            let _ = tx.send(format!("Failed to create export dir {}: {}", export.display(), e));
+                        }
+                        if let Err(e) = fs::create_dir_all(&anon_dir) {
+                            let _ = tx.send(format!("Failed to create anon dir {}: {}", anon_dir.display(), e));
+                        }
+
                         // collect .dcm files recursively so subfolders (e.g. InSightExport) are included
                         let mut dcm_files: Vec<std::path::PathBuf> = Vec::new();
                         let all = upload::collect_files_recursive(&export);
@@ -1255,6 +1263,23 @@ impl eframe::App for AppState {
 }
 
 fn main() {
+    // Initialize structured logging (writes to ~/.uploader/request_log.txt).
+    // Uses `RUST_LOG` env var for filter (defaults to info).
+    let log_path = upload::log_file_path();
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(&log_path).unwrap_or_else(|e| {
+        eprintln!("Failed to open log file {}: {:?}", log_path.display(), e);
+        std::process::exit(1);
+    });
+    let (non_blocking, guard) = tracing_appender::non_blocking(file);
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(non_blocking)
+        .with_target(false)
+        .init();
+    // keep guard alive for lifetime of program so logs flush correctly
+    let _log_guard = guard;
+
     // Configure rayon threadpool for anonymization tasks. Priority order:
     // 1. `ANON_THREADS` env var
     // 2. saved config `parallelism` in ~/.uploader/config.json
@@ -1266,7 +1291,7 @@ fn main() {
             if n > 1 { n.saturating_sub(1) } else { 1 }
         });
     if let Err(e) = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global() {
-        eprintln!("Failed to configure global rayon thread pool: {:?}", e);
+        tracing::error!("Failed to configure global rayon thread pool: {:?}", e);
     }
     // if started with --meta-view, run the separate metadata viewer window and exit
     let args: Vec<String> = std::env::args().collect();
@@ -1289,7 +1314,7 @@ fn main() {
                 std::process::exit(0);
             }
             Err(e) => {
-                eprintln!("ERROR:{}", e);
+                tracing::error!("ERROR:{}", e);
                 std::process::exit(2);
             }
         }
@@ -1312,7 +1337,7 @@ fn main() {
                     }
                     Some(f)
                 }
-                Err(e) => { eprintln!("Failed to create lockfile {}: {:?}", lock_path.display(), e); std::process::exit(1); }
+                Err(e) => { tracing::error!("Failed to create lockfile {}: {:?}", lock_path.display(), e); std::process::exit(1); }
             };
     let native_options = NativeOptions::default();
     let _ = eframe::run_native("Uploader (Rust)", native_options, Box::new(move |_cc| {
