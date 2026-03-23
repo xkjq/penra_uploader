@@ -28,7 +28,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tracing-appender = "0.2"
 image = "0.24"
-
 # local crates
 dicor_rs = { package = "dicor-rs", path = "../dicor-rs" }
 dicom_viewer = { path = "../dicom_viewer" }

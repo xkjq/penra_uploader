@@ -3,6 +3,7 @@ use egui::CentralPanel;
 use dicor_rs::anonymize_file;
 mod upload;
 mod assets;
+mod install;
 use upload::{upload_anon_dir, UploadResult, scan_for_upload, request_scan, SeriesInfo, FileEntry};
 use dicom_viewer::{read_metadata, read_metadata_all};
 use divue_rs::run_meta_viewer;
@@ -1413,6 +1414,12 @@ fn main() {
     }
     // Set an explicit app id so desktop environments can match a .desktop file and show taskbar icons.
     native_options.viewport.app_id = Some("uploader_rs".to_string());
+
+    // On Linux, install the user-local icon and .desktop file (best-effort).
+    #[cfg(target_os = "linux")]
+    {
+        install::install_desktop_icon_and_file();
+    }
     let _ = eframe::run_native("Uploader (Rust)", native_options, Box::new(move |cc| {
         // create app and a channel for background notifications (NNG and tasks)
         let mut app = AppState::default();
