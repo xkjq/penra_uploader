@@ -1276,6 +1276,32 @@ fn main() {
             }
         }
     }
+            // Pre-GUI: synchronous NNG bind check. If we cannot bind, assume another
+            // instance (or system issue) and exit early to avoid loading a duplicate GUI.
+            match Socket::new(Protocol::Pair0) {
+                Ok(sock) => {
+                    if let Err(e) = sock.listen("tcp://127.0.0.1:9976") {
+                        // If bind fails because the socket is already in use, try to notify
+                        // the running instance by dialing and sending a small 'loaded' ping.
+                        eprintln!("NNG bind failed at startup: {:?}", e);
+                        if let Ok(dial) = Socket::new(Protocol::Pair0) {
+                            if dial.dial("tcp://127.0.0.1:9976").is_ok() {
+                                let _ = dial.send(&b"loaded"[..]);
+                                // exit after notifying existing instance
+                                std::process::exit(0);
+                            }
+                        }
+                        // if we couldn't notify, exit with error
+                        std::process::exit(1);
+                    }
+                    // drop socket to free address for the real listener thread
+                    drop(sock);
+                }
+                Err(e) => {
+                    eprintln!("NNG socket creation failed at startup: {:?}", e);
+                    std::process::exit(1);
+                }
+            }
     let native_options = NativeOptions::default();
     let _ = eframe::run_native("Uploader (Rust)", native_options, Box::new(|_cc| {
         // create app and a channel for background notifications (NNG and tasks)
@@ -1285,6 +1311,168 @@ fn main() {
         let (tx, rx) = mpsc::channel::<String>();
         app.rx = Some(rx);
         app.tx = Some(tx.clone());
+
+        
+
+        // Spawn NNG listener thread to accept notifications from exporter app.
+        // Binds to tcp://127.0.0.1:9976 and forwards received messages to the GUI via `tx`.
+        let tx_clone = tx.clone();
+        let export_dir_clone = app.export_dir.clone();
+        let anon_dir_clone = app.anon_dir();
+        let seed_for_nng = app.seed.clone();
+        thread::spawn(move || {
+            match Socket::new(Protocol::Pair0) {
+                Ok(s) => {
+                    // try to listen; if it fails, report and do not enter recv loop
+                    match s.listen("tcp://127.0.0.1:9976") {
+                        Err(e) => {
+                            let _ = tx_clone.send(format!("NNG_BIND_FAIL:{:?}", e));
+                        }
+                        Ok(()) => {
+                            let _ = tx_clone.send("NNG listener bound on tcp://127.0.0.1:9976".to_string());
+                            loop {
+                                match s.recv() {
+                                    Ok(msg) => {
+                                        let text = match std::str::from_utf8(&msg) {
+                                            Ok(t) => t.to_string(),
+                                            Err(_) => format!("<bin:{} bytes>", msg.len()),
+                                        };
+                                        let _ = tx_clone.send(format!("NNG:RECV:{}", text));
+                                        // Kick off processing: copy-export-then-anonymize in background
+                                        let tx2 = tx_clone.clone();
+                                        let export_dir2 = export_dir_clone.clone();
+                                        let anon_dir2 = anon_dir_clone.clone();
+                                        let seed2 = seed_for_nng.clone();
+                                        thread::spawn(move || {
+                                            // create a processing dir so we don't race with exporter clearing export
+                                            let proc_base = export_dir2.parent().map(|p| p.join("processing")).unwrap_or_else(|| PathBuf::from("processing"));
+                                            let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S").to_string();
+                                            let proc_dir = proc_base.join(ts);
+                                            let _ = std::fs::create_dir_all(&proc_dir);
+                                            let _ = tx2.send("PROC:STEP:Copying export files".to_string());
+                                            // collect files
+                                            let mut files: Vec<PathBuf> = Vec::new();
+                                            if let Ok(entries) = std::fs::read_dir(&export_dir2) {
+                                                for e in entries.flatten() {
+                                                    let p = e.path();
+                                                    if p.is_file() {
+                                                        if p.extension().map(|s| s.to_string_lossy().eq_ignore_ascii_case("dcm")).unwrap_or(false) {
+                                                            files.push(p);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            let total = files.len();
+                                            if total == 0 {
+                                                let _ = tx2.send("PROC:STEP:No files to process".to_string());
+                                                let _ = tx2.send("PROC:DONE".to_string());
+                                                return;
+                                            }
+                                            for (i, p) in files.iter().enumerate() {
+                                                let fname = p.file_name().unwrap_or_default().to_os_string();
+                                                let dest = proc_dir.join(&fname);
+                                                // prefer moving (rename) to avoid copying large files; fallback to copy+remove
+                                                match std::fs::rename(&p, &dest) {
+                                                    Ok(_) => {
+                                                        let _ = tx2.send(format!("Moved {} -> {}", p.display(), dest.display()));
+                                                    }
+                                                    Err(_) => match std::fs::copy(&p, &dest) {
+                                                        Ok(_) => {
+                                                            let _ = std::fs::remove_file(&p);
+                                                            let _ = tx2.send(format!("Copied+removed {} -> {}", p.display(), dest.display()));
+                                                        }
+                                                        Err(e) => {
+                                                            let _ = tx2.send(format!("Failed to move {}: {}", p.display(), e));
+                                                        }
+                                                    },
+                                                }
+                                                let frac = (i as f32 + 1.0) / (total as f32);
+                                                // throttle copy progress updates
+                                                let report_interval = std::cmp::max(1, total / 50);
+                                                if ((i + 1) % report_interval == 0) || (i + 1 == total) {
+                                                    let _ = tx2.send(format!("PROC:PROG:{}", frac));
+                                                }
+                                            }
+
+                                            // Collect processing files and anonymize in parallel
+                                            let proc_paths: Vec<PathBuf> = std::fs::read_dir(&proc_dir).unwrap_or_else(|_| std::fs::read_dir(&export_dir2).unwrap()).flatten()
+                                                .map(|e| e.path())
+                                                .filter(|src| src.extension().map(|s| s.to_string_lossy().eq_ignore_ascii_case("dcm")).unwrap_or(false))
+                                                .collect();
+                                            let total_proc = proc_paths.len();
+                                            if total_proc == 0 {
+                                                let _ = tx2.send("PROC:STEP:No files to process".to_string());
+                                            } else {
+                                                let _ = tx2.send("PROC:STEP:Anonymizing copied files".to_string());
+                                                let processed_count = Arc::new(AtomicUsize::new(0));
+                                                let total_copy = total_proc;
+                                                proc_paths.par_iter().for_each(|src| {
+                                                    let tx2 = tx2.clone();
+                                                    let processed_count = processed_count.clone();
+                                                    let seed = seed2.clone();
+                                                    match anonymize_file(src, &anon_dir2, true, false, false, seed.as_deref()) {
+                                                        Ok(out) => {
+                                                            let _ = tx2.send(format!("Anonymized: {}", out.display()));
+                                                            // remove the source file from processing dir when anonymization succeeded
+                                                            if std::fs::remove_file(src).is_ok() {
+                                                                let _ = tx2.send(format!("Removed processed file: {}", src.display()));
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            let _ = tx2.send(format!("Anon failed {}: {}", src.display(), e));
+                                                        }
+                                                    }
+                                                    let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
+                                                    let report_interval = std::cmp::max(1, total_copy / 50);
+                                                    if (done % report_interval == 0) || (done == total_copy) {
+                                                        let frac = done as f32 / (total_copy as f32);
+                                                        let _ = tx2.send(format!("PROC:PROG:{}", frac));
+                                                    }
+                                                });
+                                            }
+
+                                            // after processing, refresh ready-to-upload by scanning anon dir
+                                            let _ = tx2.send("PROC:STEP:Refreshing ready-to-upload".to_string());
+                                            if let Err(e) = request_scan(&anon_dir2, Some(tx2.clone())) {
+                                                let _ = tx2.send(format!("Post-process scan failed: {}", e));
+                                            }
+
+                                            // attempt to remove the processing directory if it's now empty
+                                            match std::fs::read_dir(&proc_dir) {
+                                                Ok(mut rd) => {
+                                                    if rd.next().is_none() {
+                                                        if std::fs::remove_dir(&proc_dir).is_ok() {
+                                                            let _ = tx2.send(format!("Removed empty processing dir: {}", proc_dir.display()));
+                                                        }
+                                                    } else {
+                                                        let _ = tx2.send(format!("Processing dir not empty: {}", proc_dir.display()));
+                                                    }
+                                                }
+                                                Err(_) => {
+                                                    // if we can't read it, try remove_dir and ignore errors
+                                                    let _ = std::fs::remove_dir(&proc_dir);
+                                                }
+                                            }
+
+                                            let _ = tx2.send("PROC:DONE".to_string());
+                                        });
+                                        // reply ack
+                                        let _ = s.send(&b"ack"[..]);
+                                    }
+                                    Err(e) => {
+                                        let _ = tx_clone.send(format!("NNG recv error: {:?}", e));
+                                        std::thread::sleep(std::time::Duration::from_millis(200));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx_clone.send(format!("Failed to create NNG socket: {:?}", e));
+                }
+            }
+        });
 
         // Initial scan for existing anonymised files to show ready-to-upload series
         let anon_dir = app.anon_dir();
@@ -1298,175 +1486,6 @@ fn main() {
                 app.last_msg = format!("Initial scan failed: {}", e);
             }
         }
-
-        // Spawn NNG listener thread to accept notifications from exporter app.
-        // Binds to tcp://127.0.0.1:9976 and forwards received messages to the GUI via `tx`.
-        let tx_clone = tx.clone();
-        let export_dir_clone = app.export_dir.clone();
-        let anon_dir_clone = app.anon_dir();
-        let seed_for_nng = app.seed.clone();
-        thread::spawn(move || {
-            match Socket::new(Protocol::Pair0) {
-                Ok(s) => {
-                    if let Err(e) = s.listen("tcp://127.0.0.1:9976") {
-                        // Send a fatal message so the GUI shows notification and exits.
-                        let _ = tx_clone.send(format!("FATAL:NNG_BIND:{:?}", e));
-                        // Also attempt to notify exporters as a fallback (best-effort).
-                        if let Ok(dial_sock) = Socket::new(Protocol::Pair0) {
-                            if dial_sock.dial("tcp://127.0.0.1:9976").is_ok() {
-                                let _ = dial_sock.send(&b"loaded"[..]);
-                                let _ = tx_clone.send("Sent NNG 'loaded' (bind failed)".to_string());
-                            } else {
-                                let _ = tx_clone.send("Failed to dial NNG socket after bind failure".to_string());
-                            }
-                        } else {
-                            let _ = tx_clone.send("Failed to create NNG socket after bind failure".to_string());
-                        }
-                        return;
-                    }
-                    let _ = tx_clone.send("NNG listener bound on tcp://127.0.0.1:9976".to_string());
-                    loop {
-                        match s.recv() {
-                            Ok(msg) => {
-                                // try interpret as utf8, fallback to hex
-                                let text = match std::str::from_utf8(&msg) {
-                                    Ok(t) => t.to_string(),
-                                    Err(_) => format!("<bin:{} bytes>", msg.len()),
-                                };
-                                let _ = tx_clone.send(format!("NNG:RECV:{}", text));
-                                // Kick off processing: copy-export-then-anonymize in background
-                                let tx2 = tx_clone.clone();
-                                let export_dir2 = export_dir_clone.clone();
-                                let anon_dir2 = anon_dir_clone.clone();
-                                let seed2 = seed_for_nng.clone();
-                                thread::spawn(move || {
-                                    // create a processing dir so we don't race with exporter clearing export
-                                    let proc_base = export_dir2.parent().map(|p| p.join("processing")).unwrap_or_else(|| PathBuf::from("processing"));
-                                    let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S").to_string();
-                                    let proc_dir = proc_base.join(ts);
-                                    let _ = std::fs::create_dir_all(&proc_dir);
-                                    let _ = tx2.send("PROC:STEP:Copying export files".to_string());
-                                    // collect files
-                                    let mut files: Vec<PathBuf> = Vec::new();
-                                    if let Ok(entries) = std::fs::read_dir(&export_dir2) {
-                                        for e in entries.flatten() {
-                                            let p = e.path();
-                                            if p.is_file() {
-                                                if p.extension().map(|s| s.to_string_lossy().eq_ignore_ascii_case("dcm")).unwrap_or(false) {
-                                                    files.push(p);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    let total = files.len();
-                                    if total == 0 {
-                                        let _ = tx2.send("PROC:STEP:No files to process".to_string());
-                                        let _ = tx2.send("PROC:DONE".to_string());
-                                        return;
-                                    }
-                                    for (i, p) in files.iter().enumerate() {
-                                        let fname = p.file_name().unwrap_or_default().to_os_string();
-                                        let dest = proc_dir.join(&fname);
-                                        // prefer moving (rename) to avoid copying large files; fallback to copy+remove
-                                        match std::fs::rename(&p, &dest) {
-                                            Ok(_) => {
-                                                let _ = tx2.send(format!("Moved {} -> {}", p.display(), dest.display()));
-                                            }
-                                            Err(_) => match std::fs::copy(&p, &dest) {
-                                                Ok(_) => {
-                                                    let _ = std::fs::remove_file(&p);
-                                                    let _ = tx2.send(format!("Copied+removed {} -> {}", p.display(), dest.display()));
-                                                }
-                                                Err(e) => {
-                                                    let _ = tx2.send(format!("Failed to move {}: {}", p.display(), e));
-                                                }
-                                            },
-                                        }
-                                        let frac = (i as f32 + 1.0) / (total as f32);
-                                        // throttle copy progress updates
-                                        let report_interval = std::cmp::max(1, total / 50);
-                                        if ((i + 1) % report_interval == 0) || (i + 1 == total) {
-                                            let _ = tx2.send(format!("PROC:PROG:{}", frac));
-                                        }
-                                    }
-
-                                    // Collect processing files and anonymize in parallel
-                                    let proc_paths: Vec<PathBuf> = std::fs::read_dir(&proc_dir).unwrap_or_else(|_| std::fs::read_dir(&export_dir2).unwrap()).flatten()
-                                        .map(|e| e.path())
-                                        .filter(|src| src.extension().map(|s| s.to_string_lossy().eq_ignore_ascii_case("dcm")).unwrap_or(false))
-                                        .collect();
-                                    let total_proc = proc_paths.len();
-                                    if total_proc == 0 {
-                                        let _ = tx2.send("PROC:STEP:No files to process".to_string());
-                                    } else {
-                                        let _ = tx2.send("PROC:STEP:Anonymizing copied files".to_string());
-                                        let processed_count = Arc::new(AtomicUsize::new(0));
-                                        let total_copy = total_proc;
-                                        proc_paths.par_iter().for_each(|src| {
-                                            let tx2 = tx2.clone();
-                                            let processed_count = processed_count.clone();
-                                            let seed = seed2.clone();
-                                            match anonymize_file(src, &anon_dir2, true, false, false, seed.as_deref()) {
-                                                Ok(out) => {
-                                                    let _ = tx2.send(format!("Anonymized: {}", out.display()));
-                                                    // remove the source file from processing dir when anonymization succeeded
-                                                    if std::fs::remove_file(src).is_ok() {
-                                                        let _ = tx2.send(format!("Removed processed file: {}", src.display()));
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    let _ = tx2.send(format!("Anon failed {}: {}", src.display(), e));
-                                                }
-                                            }
-                                            let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
-                                            let report_interval = std::cmp::max(1, total_copy / 50);
-                                            if (done % report_interval == 0) || (done == total_copy) {
-                                                let frac = done as f32 / (total_copy as f32);
-                                                let _ = tx2.send(format!("PROC:PROG:{}", frac));
-                                            }
-                                        });
-                                    }
-
-                                    // after processing, refresh ready-to-upload by scanning anon dir
-                                    let _ = tx2.send("PROC:STEP:Refreshing ready-to-upload".to_string());
-                                    if let Err(e) = request_scan(&anon_dir2, Some(tx2.clone())) {
-                                        let _ = tx2.send(format!("Post-process scan failed: {}", e));
-                                    }
-
-                                    // attempt to remove the processing directory if it's now empty
-                                    match std::fs::read_dir(&proc_dir) {
-                                        Ok(mut rd) => {
-                                            if rd.next().is_none() {
-                                                if std::fs::remove_dir(&proc_dir).is_ok() {
-                                                    let _ = tx2.send(format!("Removed empty processing dir: {}", proc_dir.display()));
-                                                }
-                                            } else {
-                                                let _ = tx2.send(format!("Processing dir not empty: {}", proc_dir.display()));
-                                            }
-                                        }
-                                        Err(_) => {
-                                            // if we can't read it, try remove_dir and ignore errors
-                                            let _ = std::fs::remove_dir(&proc_dir);
-                                        }
-                                    }
-
-                                    let _ = tx2.send("PROC:DONE".to_string());
-                                });
-                                // reply ack
-                                let _ = s.send(&b"ack"[..]);
-                            }
-                            Err(e) => {
-                                let _ = tx_clone.send(format!("NNG recv error: {:?}", e));
-                                std::thread::sleep(std::time::Duration::from_millis(200));
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = tx_clone.send(format!("Failed to create NNG socket: {:?}", e));
-                }
-            }
-        });
 
         Ok(Box::new(app))
     }));
