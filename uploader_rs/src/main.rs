@@ -150,7 +150,7 @@ impl Default for AppState {
             exit_requested: None,
             exit_at: None,
             toasts: Vec::new(),
-            log_level: std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
+            log_level: std::env::var("RUST_LOG").ok().or_else(|| upload::load_log_level()).unwrap_or_else(|| "info".to_string()),
         }
     }
 }
@@ -350,7 +350,7 @@ impl AppState {
                 let txt = text.trim().to_string();
                 self.add_toast(format!("IPC: {}", txt), 4000);
                 self.last_msg = format!("IPC: {}", txt);
-                upload::log_rpc(&format!("IPC received: {}", txt));
+                upload::log_rpc_debug(&format!("IPC received: {}", txt));
                 if txt == "loaded" {
                     // Trigger processing of export dir when a sender notifies we're loaded
                     self.trigger_process_export();
@@ -374,7 +374,7 @@ impl AppState {
                 self.ready_series = v;
                 self.selected_series = vec![true; self.ready_series.len()];
                 self.last_msg = "Ready-to-upload refreshed".to_string();
-                upload::log_rpc("Ready-to-upload refreshed (scan_written)");
+                upload::log_rpc_debug("Ready-to-upload refreshed (scan_written)");
             } else if let Ok(txt) = std::fs::read_to_string(".last_scan.json") {
                 // fallback: try reading the file if cache not available
                 if let Ok(v) = serde_json::from_str::<Vec<SeriesInfo>>(&txt) {
@@ -397,14 +397,14 @@ impl AppState {
             }
         } else if m.starts_with("PROC:STEP:") {
             if let Some(step) = m.strip_prefix("PROC:STEP:") {
-                upload::log_rpc(&format!("Processing step: {}", step));
+                upload::log_rpc_debug(&format!("Processing step: {}", step));
                 self.processing_step = Some(step.to_string());
                 self.last_msg = step.to_string();
             }
         } else if m.starts_with("PROC:PROG:") {
             if let Some(p) = m.strip_prefix("PROC:PROG:") {
                 if let Ok(v) = p.parse::<f32>() {
-                    upload::log_rpc(&format!("Processing progress: {}", v));
+                    upload::log_rpc_debug(&format!("Processing progress: {}", v));
                     self.processing_progress = v.clamp(0.0, 1.0);
                 }
             }
@@ -710,10 +710,10 @@ impl eframe::App for AppState {
                                                     for f in &s.files {
                                                         if f.is_duplicate {
                                                             if std::fs::remove_file(&f.path).is_ok() {
-                                                                upload::log_rpc(&format!("Deleted duplicate file: {}", f.path.display()));
+                                                                upload::log_rpc_debug(&format!("Deleted duplicate file: {}", f.path.display()));
                                                                 deleted += 1;
                                                             } else {
-                                                                upload::log_rpc(&format!("Failed to delete duplicate file: {}", f.path.display()));
+                                                                upload::log_rpc_warn(&format!("Failed to delete duplicate file: {}", f.path.display()));
                                                             }
                                                             processed_dup = processed_dup.saturating_add(1);
                                                             if total_dup > 0 {
@@ -1069,7 +1069,13 @@ impl eframe::App for AppState {
                             Some(f) => {
                                 let new_filter = EnvFilter::new(self.log_level.clone());
                                 match f(new_filter) {
-                                    Ok(_) => self.last_msg = format!("Log level set to {}", self.log_level),
+                                    Ok(_) => {
+                                        if upload::save_log_level(&self.log_level) {
+                                            self.last_msg = format!("Log level set to {}", self.log_level);
+                                        } else {
+                                            self.last_msg = format!("Log level set but failed to save: {}", self.log_level);
+                                        }
+                                    }
                                     Err(e) => self.last_msg = format!("Failed to set log level: {}", e),
                                 }
                             }
@@ -1128,10 +1134,10 @@ impl eframe::App for AppState {
                                         for s in &series {
                                             for f in &s.files {
                                                 if std::fs::remove_file(&f.path).is_ok() {
-                                                    upload::log_rpc(&format!("Removed file: {}", f.path.display()));
+                                                    upload::log_rpc_debug(&format!("Removed file: {}", f.path.display()));
                                                     removed += 1;
                                                 } else {
-                                                    upload::log_rpc(&format!("Failed to remove file: {}", f.path.display()));
+                                                    upload::log_rpc_warn(&format!("Failed to remove file: {}", f.path.display()));
                                                 }
                                                 processed_files = processed_files.saturating_add(1);
                                                 if total_files > 0 {
@@ -1313,7 +1319,16 @@ fn main() {
         std::process::exit(1);
     });
     let (non_blocking, guard) = tracing_appender::non_blocking(file);
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = match EnvFilter::try_from_default_env() {
+        Ok(f) => f,
+        Err(_) => {
+            if let Some(lvl) = upload::load_log_level() {
+                EnvFilter::new(lvl)
+            } else {
+                EnvFilter::new("info")
+            }
+        }
+    };
     let (filter_layer, handle) = reload::Layer::new(env_filter);
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
@@ -1385,6 +1400,7 @@ fn main() {
                 }
                 Err(e) => { tracing::error!("Failed to create lockfile {}: {:?}", lock_path.display(), e); std::process::exit(1); }
             };
+    tracing::info!("Uploader (Rust) starting");
     let native_options = NativeOptions::default();
     let _ = eframe::run_native("Uploader (Rust)", native_options, Box::new(move |_cc| {
         // create app and a channel for background notifications (NNG and tasks)
@@ -1493,4 +1509,6 @@ fn main() {
 
         Ok(Box::new(app))
     }));
+
+    tracing::info!("Uploader (Rust) shutting down");
 }

@@ -259,6 +259,38 @@ pub fn log_rpc(msg: &str) {
     tracing::info!(message = %msg);
 }
 
+pub fn load_log_level() -> Option<String> {
+    let p = config_file_path();
+    if p.exists() {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                if let Some(l) = v.get("log_level").and_then(|x| x.as_str()) {
+                    return Some(l.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn save_log_level(level: &str) -> bool {
+    let p = config_file_path();
+    let mut map = serde_json::Map::new();
+    if p.exists() {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                if let Some(o) = v.as_object() {
+                    for (k, val) in o {
+                        map.insert(k.clone(), val.clone());
+                    }
+                }
+            }
+        }
+    }
+    map.insert("log_level".to_string(), serde_json::Value::String(level.to_string()));
+    std::fs::write(p, serde_json::Value::Object(map).to_string()).is_ok()
+}
+
 /// Emit an RPC-style log at a dynamic `Level`.
 pub fn log_rpc_level(level: Level, msg: &str) {
     match level {
