@@ -259,10 +259,14 @@ impl eframe::App for AppState {
         }
 
         CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Uploader (Rust)");
-
-            
-
+            ui.horizontal(|ui| {
+                ui.heading("Uploader (Rust)");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.processing_step.is_some() {
+                        ui.add(egui::ProgressBar::new(self.processing_progress).show_percentage());
+                    }
+                });
+            });
 
             egui::CollapsingHeader::new("Login").default_open(self.login_open).show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -302,7 +306,6 @@ impl eframe::App for AppState {
             ui.collapsing("Processing", |ui| {
                 if let Some(step) = &self.processing_step {
                     ui.label(format!("Step: {}", step));
-                    ui.add(egui::ProgressBar::new(self.processing_progress).show_percentage());
                 }
                     if ui.button("Process export (anonymize + notify)").clicked() {
                     let export = self.export_dir.clone();
