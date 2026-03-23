@@ -248,6 +248,14 @@ impl AppState {
                 }
             }
         }
+        if m.starts_with("NNG:RECV:") {
+            if let Some(text) = m.strip_prefix("NNG:RECV:") {
+                let txt = text.trim().to_string();
+                self.add_toast(format!("NNG: {}", txt), 4000);
+                self.last_msg = format!("NNG: {}", txt);
+                return;
+            }
+        }
         if m == "done" {
             self.last_msg = "Processing complete".to_string();
             self.processing_step = None;
@@ -1325,7 +1333,7 @@ fn main() {
                                     Ok(t) => t.to_string(),
                                     Err(_) => format!("<bin:{} bytes>", msg.len()),
                                 };
-                                let _ = tx_clone.send(format!("NNG msg: {}", text));
+                                let _ = tx_clone.send(format!("NNG:RECV:{}", text));
                                 // Kick off processing: copy-export-then-anonymize in background
                                 let tx2 = tx_clone.clone();
                                 let export_dir2 = export_dir_clone.clone();
