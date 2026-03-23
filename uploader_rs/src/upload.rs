@@ -131,6 +131,38 @@ pub fn save_skip_ssl(skip: bool) -> bool {
     std::fs::write(p, serde_json::Value::Object(map).to_string()).is_ok()
 }
 
+pub fn load_theme() -> Option<String> {
+    let p = config_file_path();
+    if p.exists() {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                if let Some(t) = v.get("theme").and_then(|x| x.as_str()) {
+                    return Some(t.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn save_theme(theme: &str) -> bool {
+    let p = config_file_path();
+    let mut map = serde_json::Map::new();
+    if p.exists() {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                if let Some(o) = v.as_object() {
+                    for (k, val) in o {
+                        map.insert(k.clone(), val.clone());
+                    }
+                }
+            }
+        }
+    }
+    map.insert("theme".to_string(), serde_json::Value::String(theme.to_string()));
+    std::fs::write(p, serde_json::Value::Object(map).to_string()).is_ok()
+}
+
 fn token_file_path() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let cfg = home.join(".uploader");
@@ -204,7 +236,13 @@ pub fn token_username() -> Option<String> {
     if let Some(t) = load_api_token() {
         let base = base_site_url();
         let token_check = format!("{}{}", base, "/api/atlas/token_check");
-        let client = reqwest::blocking::Client::new();
+        let client = match make_client(Some(&t)) {
+            Ok(c) => c,
+            Err(e) => {
+                log_rpc(&format!("make_client failed: {}", e));
+                return None;
+            }
+        };
         if let Ok(r) = client.post(&token_check).header("Authorization", format!("Bearer {}", t)).send() {
             let status = r.status();
             if let Ok(body) = r.text() {
@@ -228,7 +266,7 @@ pub fn token_username() -> Option<String> {
     None
 }
 
-fn make_client(token: Option<&str>) -> Result<Client, String> {
+pub fn make_client(token: Option<&str>) -> Result<Client, String> {
     let mut b = reqwest::blocking::Client::builder();
     // priority: env var -> saved config -> default
     let skip = if let Ok(env) = std::env::var("UPLOADER_SKIP_SSL_VERIFY") {

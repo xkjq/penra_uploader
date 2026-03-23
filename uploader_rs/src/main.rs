@@ -49,6 +49,8 @@ struct AppState {
     login_open: bool,
     ready_series: Vec<SeriesInfo>,
     selected_series: Vec<bool>,
+    // theme: true = dark, false = light
+    theme_dark: bool,
     base_url_mode: i32,
     custom_base_url: String,
     skip_ssl: bool,
@@ -107,6 +109,12 @@ impl Default for AppState {
                     0
                 }
             },
+            theme_dark: {
+                match upload::load_theme() {
+                    Some(t) => t == "dark",
+                    None => true,
+                }
+            },
             custom_base_url: upload::load_base_url().unwrap_or_default(),
             skip_ssl: upload::load_skip_ssl(),
             metadata_window_open: false,
@@ -136,7 +144,14 @@ impl AppState {
             let base = upload::base_site_url();
             let url = format!("{}{}", base, "/api/atlas/create_api_token");
             let token_check = format!("{}{}", base, "/api/atlas/token_check");
-            let client = reqwest::blocking::Client::new();
+            let client = match upload::make_client(None) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(format!("Login client build failed: {}", e));
+                    let _ = tx.send("done".to_string());
+                    return;
+                }
+            };
             let body = serde_json::json!({"username": user, "password": pass});
             match client.post(&url).json(&body).send() {
                 Ok(r) => {
@@ -236,6 +251,13 @@ impl AppState {
 
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // apply visuals based on saved theme
+        if self.theme_dark {
+            ctx.set_visuals(egui::Visuals::dark());
+        } else {
+            ctx.set_visuals(egui::Visuals::light());
+        }
+
         CentralPanel::default().show(ctx, |ui| {
             ui.heading("Uploader (Rust)");
 
@@ -853,6 +875,15 @@ impl eframe::App for AppState {
                     ui.text_edit_singleline(&mut self.custom_base_url);
                 });
                 ui.checkbox(&mut self.skip_ssl, "Disable SSL verification (unsafe)");
+                // Theme toggle
+                if ui.checkbox(&mut self.theme_dark, "Dark theme (toggle light/dark)").changed() {
+                    let theme_str = if self.theme_dark { "dark" } else { "light" };
+                    if upload::save_theme(theme_str) {
+                        self.last_msg = format!("Saved theme: {}", theme_str);
+                    } else {
+                        self.last_msg = "Failed to save theme".to_string();
+                    }
+                }
                 if ui.button("Save Settings").clicked() {
                     let url = match self.base_url_mode {
                         0 => "https://www.penracourses.org.uk".to_string(),
