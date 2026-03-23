@@ -208,6 +208,20 @@ impl AppState {
     // Handle an incoming message string (extracted from the UI update loop).
     // Extracted so tests can exercise UI state transitions without running egui.
     fn handle_message(&mut self, m: &str) {
+        if m.starts_with("SCAN:SET:") {
+            if let Some(b64) = m.strip_prefix("SCAN:SET:") {
+                if let Ok(json) = base64::decode(b64) {
+                    if let Ok(txt) = String::from_utf8(json) {
+                        if let Ok(v) = serde_json::from_str::<Vec<SeriesInfo>>(&txt) {
+                            self.ready_series = v;
+                            self.selected_series = vec![true; self.ready_series.len()];
+                            self.last_msg = "Ready-to-upload refreshed".to_string();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         if m == "done" {
             self.last_msg = "Processing complete".to_string();
             self.processing_step = None;
@@ -663,7 +677,12 @@ impl eframe::App for AppState {
                                                 });
                                             }
                                             if let Ok(json2) = serde_json::to_string(&new_series) {
-                                                let _ = std::fs::write(".last_scan.json", json2);
+                                                // update in-memory cache so UI picks up new series without re-parsing
+                                                upload::store_last_scan(new_series.clone());
+                                                                let _ = std::fs::write(".last_scan.json", &json2);
+                                                                // also send the parsed series as a SCAN:SET message (base64-encoded)
+                                                                let b64 = base64::encode(json2.as_bytes());
+                                                let _ = tx.send(format!("SCAN:SET:{}", b64));
                                                 let _ = tx.send("scan_written".to_string());
                                             }
                                             let _ = tx.send(format!("duplicates_cleared:{}", deleted));
@@ -1018,9 +1037,13 @@ impl eframe::App for AppState {
                                                 }
                                             }
                                         }
-                                        // after removals, write an empty scan result (directory should now be empty)
-                                        if let Ok(json2) = serde_json::to_string(&Vec::<SeriesInfo>::new()) {
-                                            let _ = std::fs::write(".last_scan.json", json2);
+                                        // after removals, update in-memory cache and write an empty scan result
+                                        let empty: Vec<SeriesInfo> = Vec::new();
+                                        upload::store_last_scan(empty.clone());
+                                        if let Ok(json2) = serde_json::to_string(&empty) {
+                                            let _ = std::fs::write(".last_scan.json", &json2);
+                                            let b64 = base64::encode(json2.as_bytes());
+                                            let _ = tx.send(format!("SCAN:SET:{}", b64));
                                             let _ = tx.send("scan_written".to_string());
                                         }
                                         let _ = tx.send(format!("removed_all:{}", removed));

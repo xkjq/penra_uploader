@@ -799,6 +799,7 @@ pub fn request_scan(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>
                         let _ = std::fs::write(".last_scan.json", json);
                         if let Some(ref s) = tx {
                             let _ = s.send("scan_written".to_string());
+                            let _ = s.send("done".to_string());
                         }
                     } else if let Some(ref s) = tx {
                         let _ = s.send("scan_serialize_failed".to_string());
@@ -807,6 +808,7 @@ pub fn request_scan(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>
                 Err(e) => {
                     if let Some(ref s) = tx {
                         let _ = s.send(format!("Scan failed: {}", e));
+                        let _ = s.send("done".to_string());
                     }
                 }
             }
