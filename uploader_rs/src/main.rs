@@ -54,6 +54,8 @@ struct AppState {
     base_url_mode: i32,
     custom_base_url: String,
     skip_ssl: bool,
+    // number of parallel threads used for file operations/anonymization
+    anon_threads: usize,
     // metadata viewer state
     metadata_window_open: bool,
     metadata_compare_open: bool,
@@ -117,6 +119,9 @@ impl Default for AppState {
             },
             custom_base_url: upload::load_base_url().unwrap_or_default(),
             skip_ssl: upload::load_skip_ssl(),
+            anon_threads: upload::load_parallelism().unwrap_or_else(|| {
+                let n = num_cpus::get(); if n > 1 { n.saturating_sub(1) } else { 1 }
+            }),
             metadata_window_open: false,
             metadata_compare_open: false,
             metadata_single: None,
@@ -511,6 +516,8 @@ impl eframe::App for AppState {
                     });
                 });
 
+                // Parallelism control moved to Settings (save required)
+
                 
 
                 if ui.button("Refresh ready-to-upload").clicked() {
@@ -887,6 +894,16 @@ impl eframe::App for AppState {
                         self.last_msg = "Failed to save theme".to_string();
                     }
                 }
+
+                ui.horizontal(|ui| {
+                    ui.label("Parallel file operations:");
+                    let mut anon_i = self.anon_threads as i32;
+                    let resp = ui.add(egui::widgets::DragValue::new(&mut anon_i).clamp_range(1..= (num_cpus::get() as i32 * 2)).speed(1.0));
+                    if resp.changed() {
+                        self.anon_threads = anon_i.max(1) as usize;
+                    }
+                    ui.label("(will be saved when 'Save Settings' is clicked; restart required)");
+                });
                 if ui.button("Save Settings").clicked() {
                     let url = match self.base_url_mode {
                         0 => "https://www.penracourses.org.uk".to_string(),
@@ -895,8 +912,9 @@ impl eframe::App for AppState {
                     };
                     let ok1 = upload::save_base_url(&url);
                     let ok2 = upload::save_skip_ssl(self.skip_ssl);
-                    if ok1 && ok2 {
-                        self.last_msg = format!("Saved settings: {} (skip_ssl={})", url, self.skip_ssl);
+                    let ok3 = upload::save_parallelism(self.anon_threads);
+                    if ok1 && ok2 && ok3 {
+                        self.last_msg = format!("Saved settings: {} (skip_ssl={}, parallelism={})", url, self.skip_ssl, self.anon_threads);
                     } else {
                         self.last_msg = "Failed to save settings".to_string();
                     }
@@ -952,7 +970,7 @@ impl eframe::App for AppState {
                             let _ = tx.send("PROC:STEP:Removing files".to_string());
                             let _ = tx.send(format!("PROC:PROG:{}", 0.0));
                             thread::spawn(move || {
-                                match scan_for_upload(&anon_dir, Some(tx.clone())) {
+                                match upload::scan_for_upload_quick(&anon_dir, Some(tx.clone())) {
                                     Ok(series) => {
                                         let mut removed = 0usize;
                                         let total_files: usize = series.iter().map(|s| s.files.len()).sum();
@@ -1112,12 +1130,16 @@ impl eframe::App for AppState {
 }
 
 fn main() {
-    // Configure rayon threadpool for anonymization tasks. Read `ANON_THREADS` env var
-    // to override; otherwise default to (num_cpus - 1) or 1.
-    let threads = std::env::var("ANON_THREADS").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or_else(|| {
-        let n = num_cpus::get();
-        if n > 1 { n.saturating_sub(1) } else { 1 }
-    });
+    // Configure rayon threadpool for anonymization tasks. Priority order:
+    // 1. `ANON_THREADS` env var
+    // 2. saved config `parallelism` in ~/.uploader/config.json
+    // 3. default to (num_cpus - 1) or 1.
+    let threads = std::env::var("ANON_THREADS").ok().and_then(|s| s.parse::<usize>().ok())
+        .or_else(|| upload::load_parallelism())
+        .unwrap_or_else(|| {
+            let n = num_cpus::get();
+            if n > 1 { n.saturating_sub(1) } else { 1 }
+        });
     if let Err(e) = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global() {
         eprintln!("Failed to configure global rayon thread pool: {:?}", e);
     }

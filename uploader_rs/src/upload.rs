@@ -163,6 +163,38 @@ pub fn save_theme(theme: &str) -> bool {
     std::fs::write(p, serde_json::Value::Object(map).to_string()).is_ok()
 }
 
+pub fn load_parallelism() -> Option<usize> {
+    let p = config_file_path();
+    if p.exists() {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                if let Some(n) = v.get("parallelism").and_then(|x| x.as_u64()) {
+                    return Some(n as usize);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn save_parallelism(n: usize) -> bool {
+    let p = config_file_path();
+    let mut map = serde_json::Map::new();
+    if p.exists() {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                if let Some(o) = v.as_object() {
+                    for (k, val) in o {
+                        map.insert(k.clone(), val.clone());
+                    }
+                }
+            }
+        }
+    }
+    map.insert("parallelism".to_string(), serde_json::Value::Number(serde_json::Number::from(n as u64)));
+    std::fs::write(p, serde_json::Value::Object(map).to_string()).is_ok()
+}
+
 fn token_file_path() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let cfg = home.join(".uploader");
@@ -663,6 +695,137 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
             modality,
             series_description,
             series_number,
+            file_count: items.len(),
+            total_bytes,
+        });
+    }
+
+    Ok(out)
+}
+
+/// A faster scan that does not attempt to open files as DICOMs.
+///
+/// This is useful in situations where the anon directory is trusted to contain
+/// only DICOMs (or the caller doesn't need SeriesInstanceUID grouping) and we
+/// want to avoid the overhead of parsing DICOM files. Files are grouped under
+/// a single `NO_SERIES` series and hashes are computed from file bytes for
+/// duplicate prechecks with the server.
+pub fn scan_for_upload_quick(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>) -> Result<Vec<SeriesInfo>, String> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    let rd = std::fs::read_dir(anon_dir).map_err(|e| format!("read_dir failed: {}", e))?;
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_file() {
+            files.push(p);
+        }
+    }
+
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let total_files = files.len();
+    if let Some(ref s) = tx {
+        let _ = s.send("PROC:STEP:Quick scanning files".to_string());
+        let _ = s.send(format!("PROC:PROG:{}", 0.0));
+    }
+
+    let mut hash_list: Vec<String> = Vec::new();
+    let mut series_map: HashMap<String, Vec<(PathBuf, String)>> = HashMap::new();
+
+    for (i, p) in files.iter().enumerate() {
+        let mut h_opt: Option<String> = None;
+        if let Ok(bytes) = std::fs::read(p) {
+            h_opt = Some(blake3::hash(&bytes).to_hex().to_string());
+        }
+        let h = h_opt.clone().unwrap_or_else(|| "".to_string());
+        if h_opt.is_some() { hash_list.push(h.clone()); }
+        // fast scan cannot determine SeriesInstanceUID; group under NO_SERIES
+        series_map.entry("NO_SERIES".to_string()).or_default().push((p.clone(), h));
+
+        if let Some(ref s) = tx {
+            if total_files > 0 {
+                let prog = ((i + 1) as f32 / total_files as f32).clamp(0.0, 1.0);
+                let _ = s.send(format!("PROC:PROG:{}", prog));
+            }
+        }
+    }
+
+    // precheck duplicates via server (same as full scan)
+    let mut duplicate_hashes: HashSet<String> = HashSet::new();
+    let mut duplicate_series_urls: HashMap<String, Vec<String>> = HashMap::new();
+    if !hash_list.is_empty() {
+        let client = make_client(load_api_token().as_deref()).map_err(|e| e)?;
+        let base = base_site_url();
+        let hash_check_url = format!("{}{}", base, "/api/atlas/check_image_hashes/");
+        log_rpc(&format!("POST {} with {} hashes", hash_check_url, hash_list.len()));
+        if let Ok(r) = client.post(&hash_check_url).json(&hash_list).send() {
+            let status = r.status();
+            if let Ok(body) = r.text() {
+                if let Some(pf) = save_body_to_file(&body) {
+                    log_rpc(&format!("Response {}: {} BODY_FILE:{}", hash_check_url, status, pf.display()));
+                } else {
+                    log_rpc(&format!("Response {}: {} body: (failed to save body)", hash_check_url, status));
+                }
+                if status.is_success() {
+                    if let Ok(map) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if let Some(obj) = map.as_object() {
+                            for (hash_val, info) in obj.iter() {
+                                if info.is_object() {
+                                    if let Some(id) = info.get("id") {
+                                        if json_value_truthy(id) {
+                                            duplicate_hashes.insert(hash_val.clone());
+                                            if let Some(urlv) = info.get("url") {
+                                                if let Some(urls) = urlv.as_str() {
+                                                    let full = if urls.starts_with("http") {
+                                                        urls.to_string()
+                                                    } else if urls.starts_with('/') {
+                                                        format!("{}{}", base.trim_end_matches('/'), urls)
+                                                    } else {
+                                                        format!("{}/{}", base.trim_end_matches('/'), urls)
+                                                    };
+                                                    duplicate_series_urls.entry(hash_val.clone()).or_default().push(full);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // build SeriesInfo - limited metadata (no DICOM parsing)
+    let mut out: Vec<SeriesInfo> = Vec::new();
+    for (series_uid, items) in series_map.into_iter() {
+        let mut entries: Vec<FileEntry> = Vec::new();
+        let mut urls: Vec<String> = Vec::new();
+        let mut total_bytes: u64 = 0;
+        for (p, h) in &items {
+            let is_dup = duplicate_hashes.contains(h);
+            if let Some(u) = duplicate_series_urls.get(h) {
+                for s in u { urls.push(s.clone()); }
+            }
+            if let Ok(md) = std::fs::metadata(p) {
+                total_bytes = total_bytes.saturating_add(md.len());
+            }
+            entries.push(FileEntry { path: p.clone(), hash: h.clone(), is_duplicate: is_dup });
+        }
+
+        out.push(SeriesInfo {
+            series_uid,
+            files: entries,
+            duplicate_series_urls: urls,
+            patient_name: None,
+            examination: None,
+            patient_id: None,
+            study_date: None,
+            modality: None,
+            series_description: None,
+            series_number: None,
             file_count: items.len(),
             total_bytes,
         });
