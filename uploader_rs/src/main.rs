@@ -222,6 +222,86 @@ impl AppState {
         self.export_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon")
     }
 
+    // Spawn the anonymize+notify processing for the export directory.
+    // Reused by the UI button and by IPC 'loaded' notifications.
+    fn trigger_process_export(&self) {
+        let export = self.export_dir.clone();
+        let anon_dir = export
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("anon");
+        let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
+        let notify_flag = self.notify_on_process;
+        let seed_clone = self.seed.clone();
+
+        thread::spawn(move || {
+            // collect .dcm files first so we can report progress
+            let mut dcm_files: Vec<std::path::PathBuf> = Vec::new();
+            if let Ok(entries) = fs::read_dir(&export) {
+                for ent in entries.flatten() {
+                    let p = ent.path();
+                    if p.extension().map(|e| e == "dcm").unwrap_or(false) {
+                        dcm_files.push(p);
+                    }
+                }
+            } else {
+                let _ = tx.send("No export dir or read error".to_string());
+            }
+
+            let total = dcm_files.len();
+            if total > 0 {
+                let _ = tx.send("PROC:STEP:Anonymizing export files".to_string());
+                let processed_count = Arc::new(AtomicUsize::new(0));
+                let total_copy = total; // capture for closure
+                dcm_files.par_iter().for_each(|p| {
+                    let tx = tx.clone();
+                    let processed_count = processed_count.clone();
+                    let seed = seed_clone.clone();
+                    match anonymize_file(p, &anon_dir, true, false, false, seed.as_deref()) {
+                        Ok(out) => {
+                            let _ = tx.send(format!("Anonymized: {}", out.display()));
+                            if let Ok(bytes) = fs::read(&out) {
+                                let hash = blake3::hash(&bytes);
+                                let _ = tx.send(format!("Hash {}: {}", out.display(), hash.to_hex()));
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(format!("Anon failed {}: {}", p.display(), e));
+                        }
+                    }
+                    let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    let report_interval = std::cmp::max(1, total_copy / 50);
+                    if (done % report_interval == 0) || (done == total_copy) {
+                        let prog = done as f32 / (total_copy as f32);
+                        let _ = tx.send(format!("PROC:PROG:{}", prog));
+                    }
+                });
+            }
+
+            if notify_flag {
+                // notify any running instance via local socket
+                let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| format!("pid{}", std::process::id()));
+                let ipc_name = format!("uploader_rs_{}", user);
+                if let Ok(mut s) = LocalSocketStream::connect(ipc_name.as_str()) {
+                    if s.write_all(b"loaded").is_ok() {
+                        let _ = tx.send("Sent IPC 'loaded'".to_string());
+                    } else {
+                        let _ = tx.send("Failed to write to IPC socket".to_string());
+                    }
+                } else {
+                    let _ = tx.send("Failed to connect to IPC socket".to_string());
+                }
+            }
+
+            if let Err(e) = request_scan(&anon_dir, Some(tx.clone())) {
+                let _ = tx.send(format!("Post-process scan failed: {}", e));
+            }
+
+            let _ = tx.send("done".to_string());
+        });
+    }
+
     // Handle an incoming message string (extracted from the UI update loop).
     // Extracted so tests can exercise UI state transitions without running egui.
     fn handle_message(&mut self, m: &str) {
@@ -255,6 +335,10 @@ impl AppState {
                 let txt = text.trim().to_string();
                 self.add_toast(format!("IPC: {}", txt), 4000);
                 self.last_msg = format!("IPC: {}", txt);
+                if txt == "loaded" {
+                    // Trigger processing of export dir when a sender notifies we're loaded
+                    self.trigger_process_export();
+                }
                 return;
             }
         }
@@ -371,82 +455,8 @@ impl eframe::App for AppState {
                     ui.label(format!("Step: {}", step));
                 }
                     if ui.button("Process export (anonymize + notify)").clicked() {
-                    let export = self.export_dir.clone();
-                    let anon_dir = export
-                        .parent()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| PathBuf::from("."))
-                        .join("anon");
-                    let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
-                    let notify_flag = self.notify_on_process;
-                    let seed_clone = self.seed.clone();
-
-                    thread::spawn(move || {
-                        // collect .dcm files first so we can report progress
-                        let mut dcm_files: Vec<std::path::PathBuf> = Vec::new();
-                        if let Ok(entries) = fs::read_dir(&export) {
-                            for ent in entries.flatten() {
-                                let p = ent.path();
-                                if p.extension().map(|e| e == "dcm").unwrap_or(false) {
-                                    dcm_files.push(p);
-                                }
-                            }
-                        } else {
-                            let _ = tx.send("No export dir or read error".to_string());
-                        }
-
-                        let total = dcm_files.len();
-                        if total > 0 {
-                            let _ = tx.send("PROC:STEP:Anonymizing export files".to_string());
-                            let processed_count = Arc::new(AtomicUsize::new(0));
-                            let total_copy = total; // capture for closure
-                            dcm_files.par_iter().for_each(|p| {
-                                let tx = tx.clone();
-                                let processed_count = processed_count.clone();
-                                let seed = seed_clone.clone();
-                                match anonymize_file(p, &anon_dir, true, false, false, seed.as_deref()) {
-                                    Ok(out) => {
-                                        let _ = tx.send(format!("Anonymized: {}", out.display()));
-                                        if let Ok(bytes) = fs::read(&out) {
-                                            let hash = blake3::hash(&bytes);
-                                            let _ = tx.send(format!("Hash {}: {}", out.display(), hash.to_hex()));
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let _ = tx.send(format!("Anon failed {}: {}", p.display(), e));
-                                    }
-                                }
-                                let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
-                                let report_interval = std::cmp::max(1, total_copy / 50);
-                                if (done % report_interval == 0) || (done == total_copy) {
-                                    let prog = done as f32 / (total_copy as f32);
-                                    let _ = tx.send(format!("PROC:PROG:{}", prog));
-                                }
-                            });
-                        }
-
-                        if notify_flag {
-                            // notify any running instance via local socket
-                            let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| format!("pid{}", std::process::id()));
-                            let ipc_name = format!("uploader_rs_{}", user);
-                            if let Ok(mut s) = LocalSocketStream::connect(ipc_name.as_str()) {
-                                if s.write_all(b"loaded").is_ok() {
-                                    let _ = tx.send("Sent IPC 'loaded'".to_string());
-                                } else {
-                                    let _ = tx.send("Failed to write to IPC socket".to_string());
-                                }
-                            } else {
-                                let _ = tx.send("Failed to connect to IPC socket".to_string());
-                            }
-                        }
-
-                        if let Err(e) = request_scan(&anon_dir, Some(tx.clone())) {
-                            let _ = tx.send(format!("Post-process scan failed: {}", e));
-                        }
-
-                        let _ = tx.send("done".to_string());
-                    });
-                }
+                        self.trigger_process_export();
+                    }
 
                 ui.group(|ui| {
                     if ui.button("Import from folder").clicked() {
