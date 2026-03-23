@@ -267,8 +267,10 @@ impl eframe::App for AppState {
             ui.horizontal(|ui| {
                 ui.heading("Uploader (Rust)");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.processing_step.is_some() {
-                        ui.add(egui::ProgressBar::new(self.processing_progress).show_percentage());
+                    if let Some(step) = &self.processing_step {
+                        let pct = (self.processing_progress * 100.0).clamp(0.0, 100.0);
+                        let label = format!("{} — {:.0}%", step, pct);
+                        ui.add(egui::ProgressBar::new(self.processing_progress).text(label));
                     }
                 });
             });
