@@ -33,19 +33,19 @@ fn calc(path: &Path) -> HashReport {
     let mut out = HashReport::default();
 
     if let Ok(obj) = open_file(path) {
-        println!("opened file OK");
+        tracing::info!("opened file OK");
         match obj.element(Tag(0x7FE0,0x0010)) {
-            Ok(_) => println!("PixelData element present"),
-            Err(e) => println!("PixelData element missing or error: {}", e),
+            Ok(_) => tracing::info!("PixelData element present"),
+            Err(e) => tracing::warn!("PixelData element missing or error: {}", e),
         }
 
         // Preferred: hash decoded pixel bytes.
         match obj.decode_pixel_data() {
             Ok(pixel_data) => {
                 let bytes = pixel_data.data();
-                println!("Decoded PixelData bytes len: {}", bytes.len());
+                tracing::info!("Decoded PixelData bytes len: {}", bytes.len());
                 let show = &bytes[..std::cmp::min(32, bytes.len())];
-                println!("first decoded bytes: {}", hex::encode(show));
+                tracing::debug!("first decoded bytes: {}", hex::encode(show));
                 out.decoded_pixel_hash = Some(hash_hex(bytes));
 
                 // Additional canonicalization variants for troubleshooting
@@ -104,7 +104,7 @@ fn calc(path: &Path) -> HashReport {
                         * bytes_per_sample;
                     if frame_size > 0 && num_frames > 0 {
                         let expected = frame_size * num_frames;
-                        println!("frame_size={} num_frames={} expected_decoded_len={}", frame_size, num_frames, expected);
+                        tracing::info!("frame_size={} num_frames={} expected_decoded_len={}", frame_size, num_frames, expected);
                         if bytes.len() >= expected {
                             let concat = &bytes[..expected];
                             out.decoded_frame_concat_hash = Some(hash_hex(concat));
@@ -113,20 +113,20 @@ fn calc(path: &Path) -> HashReport {
                 }
             }
             Err(e) => {
-                println!("decode_pixel_data failed: {}", e);
+                tracing::error!("decode_pixel_data failed: {}", e);
             }
         }
 
         // Fallback: hash raw PixelData element bytes.
         if let Ok(elem) = obj.element(Tag(0x7FE0, 0x0010)) {
             if let Ok(bytes) = elem.to_bytes() {
-                println!("Raw PixelData bytes len: {}", bytes.len());
+                tracing::info!("Raw PixelData bytes len: {}", bytes.len());
                 let show = &bytes[..std::cmp::min(32, bytes.len())];
-                println!("first raw bytes: {}", hex::encode(show));
+                tracing::debug!("first raw bytes: {}", hex::encode(show));
                 out.raw_pixel_hash = Some(blake3::hash(&bytes).to_hex().to_string());
             }
             if let Ok(s) = elem.to_str() {
-                println!("PixelData as str len: {}", s.as_bytes().len());
+                tracing::info!("PixelData as str len: {}", s.as_bytes().len());
                 out.raw_pixel_hash = Some(blake3::hash(s.as_bytes()).to_hex().to_string());
             }
         }
@@ -134,7 +134,7 @@ fn calc(path: &Path) -> HashReport {
 
     // Always compute whole-file hash for side-by-side comparison.
     if let Ok(b) = fs::read(path) {
-        println!("Hashing whole file bytes len: {}", b.len());
+        tracing::info!("Hashing whole file bytes len: {}", b.len());
         out.whole_file_hash = Some(blake3::hash(&b).to_hex().to_string());
     }
 
@@ -142,6 +142,12 @@ fn calc(path: &Path) -> HashReport {
 }
 
 fn main() {
+    // initialize basic tracing for this utility so internal info/debug
+    // messages are emitted to stderr.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+        .with_target(false)
+        .try_init();
     let arg = std::env::args().nth(1).expect("provide path");
     let p = Path::new(&arg);
     let report = calc(p);

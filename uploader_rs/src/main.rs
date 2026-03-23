@@ -1267,7 +1267,7 @@ fn main() {
     // Uses `RUST_LOG` env var for filter (defaults to info).
     let log_path = upload::log_file_path();
     let file = std::fs::OpenOptions::new().create(true).append(true).open(&log_path).unwrap_or_else(|e| {
-        eprintln!("Failed to open log file {}: {:?}", log_path.display(), e);
+        tracing::error!("Failed to open log file {}: {:?}", log_path.display(), e);
         std::process::exit(1);
     });
     let (non_blocking, guard) = tracing_appender::non_blocking(file);

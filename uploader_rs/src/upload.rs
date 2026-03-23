@@ -252,10 +252,10 @@ pub fn log_file_path() -> PathBuf {
 }
 
 pub fn log_rpc(msg: &str) {
-    let p = log_file_path();
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let entry = format!("[{}] {}\n", now, msg);
-    let _ = std::fs::OpenOptions::new().create(true).append(true).open(&p).and_then(|mut f| std::io::Write::write_all(&mut f, entry.as_bytes()));
+    // Emit structured log event via tracing; tracing subscriber in the GUI
+    // will persist this into the app log file. Keep the plain string for
+    // backwards compatibility with callers.
+    tracing::info!(message = %msg);
 }
 
 fn bodies_dir() -> PathBuf {
