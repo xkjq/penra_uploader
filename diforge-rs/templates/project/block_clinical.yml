@@ -1,0 +1,8 @@
+id: block_clinical
+title: Block Clinical
+applicable_codes: []
+modalities: []
+body: "Clinical details:\n\nFindings: \nImpression: \n"
+insert_inline: false
+ensure_surrounding_newlines: true
+inline_finish: None

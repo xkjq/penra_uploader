@@ -1,0 +1,8 @@
+id: inline_time
+title: Inline Time
+applicable_codes: []
+modalities: []
+body: "Current time: {{time}}"
+insert_inline: true
+ensure_surrounding_newlines: false
+inline_finish: None
