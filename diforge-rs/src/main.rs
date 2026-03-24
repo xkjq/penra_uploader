@@ -22,6 +22,7 @@ enum VimMode {
     Normal,
     Insert,
     Visual,
+    VisualLine,
 }
 
 impl Default for VimMode {
@@ -491,7 +492,7 @@ impl eframe::App for ReportApp {
                                     }
                                     let ch = text.chars().next().unwrap();
                                     match self.vim_mode {
-                                        VimMode::Normal | VimMode::Visual => {
+                                        VimMode::Normal | VimMode::Visual | VimMode::VisualLine => {
                                             let focus = vim::ReportBuffer::handle_normal_key(&mut self.buffer, &mut self.vim_mode, &mut self.last_vim_key, &mut self.last_vim_object, &mut self.vim_count, &mut self.visual_anchor, ch);
                                             if focus {
                                                 output.response.request_focus();
@@ -511,9 +512,7 @@ impl eframe::App for ReportApp {
                                         VimMode::Insert => {
                                             // in Insert mode, normal text events are handled by TextEdit; we only intercept Escape above
                                         }
-                                        VimMode::Visual => {
-                                            // not implemented yet
-                                        }
+                                        _ => {}
                                     }
                                 }
                                 _ => {}
@@ -522,22 +521,36 @@ impl eframe::App for ReportApp {
                     }
 
                     // If we already have a desired caret position (e.g. from an insert earlier this frame), push it into widget state
-                    if self.vim_mode == VimMode::Visual {
+                    if self.vim_mode == VimMode::Visual || self.vim_mode == VimMode::VisualLine {
                         // When in Visual mode, prefer showing a selection between the visual anchor
                         // and the current caret. This drives the TextEdit's selection rendering.
                         if let Some(anchor) = self.visual_anchor {
                             let cur = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
-                                let s = anchor.min(cur);
-                                let e = anchor.max(cur);
-                                // Extend the shown cursor range for any non-empty selection
-                                // so the final character is included (ranges are end-exclusive).
-                                let extend = if e > s { 1 } else { 0 };
-                                let display_end = (e).min(self.buffer.char_len()).saturating_add(extend);
+                                let start_char;
+                                let display_end;
+                                if self.vim_mode == VimMode::VisualLine {
+                                    // compute full-line bounds for anchor and caret
+                                    let (a_s, a_e) = self.buffer.line_bounds_at(anchor);
+                                    let (c_s, c_e) = self.buffer.line_bounds_at(cur);
+                                    start_char = a_s.min(c_s);
+                                    let e = a_e.max(c_e).min(self.buffer.char_len());
+                                    display_end = e;
+                                } else {
+                                    let s = anchor.min(cur);
+                                    let e = anchor.max(cur);
+                                    // Extend the shown cursor range for any non-empty selection
+                                    // so the final character is included (ranges are end-exclusive).
+                                    let extend = if e > s { 1 } else { 0 };
+                                    start_char = s;
+                                    display_end = (e).min(self.buffer.char_len()).saturating_add(extend);
+                                }
+                                let s = start_char;
+                                let cur_pos = cur;
                                 // Ensure textual selection mirrors visual selection
-                                eprintln!("[dbg] visual sync anchor={} cur={} -> display {}..{}", anchor, cur, s, display_end);
+                                eprintln!("[dbg] visual sync anchor={} cur={} -> display {}..{}", anchor, cur_pos, s, display_end);
                                 // Keep canonical caret as the caret position (`cur..cur`).
                                 // The visible selection is driven by `visual_anchor` + the caret.
-                                self.buffer.caret_char_range = Some(cur..cur);
+                                self.buffer.caret_char_range = Some(cur_pos..cur_pos);
                                 let start = CCursor::new(s);
                                 let end = CCursor::new(display_end);
                             output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
@@ -576,14 +589,21 @@ impl eframe::App for ReportApp {
                             let painter = ui.painter();
 
                             // If Visual mode is active and we have an anchor, draw a selection background
-                            if self.vim_mode == VimMode::Visual {
+                            if self.vim_mode == VimMode::Visual || self.vim_mode == VimMode::VisualLine {
                                 if let Some(anchor) = self.visual_anchor {
                                     let cur = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
-                                    let s = anchor.min(cur);
-                                    let e = anchor.max(cur);
-                                    // Display the selection inclusive of the final character
-                                    // for any non-empty selection.
-                                    let e_display = if e > s { e.saturating_add(1) } else { e };
+                                    let (s, e_display) = if self.vim_mode == VimMode::VisualLine {
+                                        let (a_s, a_e) = self.buffer.line_bounds_at(anchor);
+                                        let (c_s, c_e) = self.buffer.line_bounds_at(cur);
+                                        let s = a_s.min(c_s);
+                                        let e = a_e.max(c_e).min(self.buffer.char_len());
+                                        (s, e)
+                                    } else {
+                                        let s = anchor.min(cur);
+                                        let e = anchor.max(cur);
+                                        let e_display = if e > s { e.saturating_add(1) } else { e };
+                                        (s, e_display)
+                                    };
                                     if s < e_display {
                                         // Determine exact per-line glyph bounds by splitting the selected
                                         // substring on newline boundaries and mapping each segment back
@@ -633,7 +653,7 @@ impl eframe::App for ReportApp {
                                             // advance absolute index past this line and the newline (if present)
                                             abs_index = line_end + 1; // skip the newline; safe even if at end because we'll not use abs_index further
                                             offset += line_len + 1;
-                                            if abs_index > e { break; }
+                                            if abs_index > e_display { break; }
                                         }
                                     }
                                 }
@@ -715,6 +735,7 @@ impl eframe::App for ReportApp {
                             VimMode::Normal => "Normal",
                             VimMode::Insert => "Insert",
                             VimMode::Visual => "Visual",
+                            VimMode::VisualLine => "Visual-Line",
                         };
                         ui.label(format!("Mode: {}", mode_label));
                     });

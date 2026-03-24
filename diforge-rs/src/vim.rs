@@ -5,7 +5,8 @@ use std::ops::Range;
 pub enum VimMode {
     Normal,
     Insert,
-    Visual,
+        Visual,
+        VisualLine,
 }
 
 impl Default for VimMode {
@@ -298,6 +299,29 @@ impl ReportBuffer {
         }
         let col = pos.saturating_sub(start);
         (start, end, col)
+    }
+
+    /// Return the (start, end) char indices for the line containing `pos`.
+    pub fn line_bounds_at(&self, pos: usize) -> (usize, usize) {
+        let chars: Vec<char> = self.report.chars().collect();
+        let n = chars.len();
+        if n == 0 { return (0, 0); }
+        let p = pos.min(n);
+        let mut start = 0usize;
+        for i in (0..p).rev() {
+            if chars[i] == '\n' {
+                start = i + 1;
+                break;
+            }
+        }
+        let mut end = n;
+        for i in p..n {
+            if chars[i] == '\n' {
+                end = i + 1;
+                break;
+            }
+        }
+        (start, end)
     }
 
     pub fn move_line_up(&mut self) {
@@ -603,9 +627,9 @@ impl ReportBuffer {
                 true
             }
             'o' => {
-                // If we're in Visual mode, `o` should move the caret to the
+                // If we're in Visual mode (char or line), `o` should move the caret to the
                 // other end of the selection (reverse selection endpoints).
-                if *vim_mode == crate::VimMode::Visual {
+                if *vim_mode == crate::VimMode::Visual || *vim_mode == crate::VimMode::VisualLine {
                     if let Some(anchor_pos) = *visual_anchor {
                         let cur = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
                         *visual_anchor = Some(cur);
@@ -645,6 +669,22 @@ impl ReportBuffer {
                     // initialize the caret range so UI shows selection immediately
                     buffer.caret_char_range = Some(pos..pos);
                     *vim_mode = crate::VimMode::Visual;
+                }
+                *last_vim_key = None;
+                *last_vim_count = None;
+                false
+            }
+            'V' => {
+                // Visual Line mode: select whole lines
+                if *vim_mode == crate::VimMode::VisualLine {
+                    *vim_mode = crate::VimMode::Normal;
+                    *visual_anchor = None;
+                } else {
+                    let pos = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    let (s, _e, _c) = buffer.move_to_line_bounds();
+                    *visual_anchor = Some(s);
+                    buffer.caret_char_range = Some(s..s);
+                    *vim_mode = crate::VimMode::VisualLine;
                 }
                 *last_vim_key = None;
                 *last_vim_count = None;
@@ -973,13 +1013,21 @@ impl ReportBuffer {
                 true
             }
             'x' => {
-                // If in Visual mode, delete the selected range instead of a single char
-                if *vim_mode == crate::VimMode::Visual {
+                // If in Visual mode (char or line), delete the selected range instead of a single char
+                if *vim_mode == crate::VimMode::Visual || *vim_mode == crate::VimMode::VisualLine {
                     if let Some(anchor) = visual_anchor.take() {
                         let cur = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
-                        let s = anchor.min(cur);
-                        let e = anchor.max(cur).saturating_add(1).min(buffer.char_len());
-                        buffer.delete_range(s, e);
+                        if *vim_mode == crate::VimMode::VisualLine {
+                            let (as_, ae) = buffer.line_bounds_at(anchor);
+                            let (cs, ce) = buffer.line_bounds_at(cur);
+                            let s = as_.min(cs);
+                            let e = ae.max(ce).min(buffer.char_len());
+                            buffer.delete_range(s, e);
+                        } else {
+                            let s = anchor.min(cur);
+                            let e = anchor.max(cur).saturating_add(1).min(buffer.char_len());
+                            buffer.delete_range(s, e);
+                        }
                         *last_vim_key = None;
                         *vim_mode = crate::VimMode::Normal;
                         return false;
@@ -990,14 +1038,22 @@ impl ReportBuffer {
                 false
             }
             'd' => {
-                // If we're in Visual mode, "d" should delete the visual selection.
-                if *vim_mode == crate::VimMode::Visual {
+                // If we're in Visual mode (char or line), "d" should delete the visual selection.
+                if *vim_mode == crate::VimMode::Visual || *vim_mode == crate::VimMode::VisualLine {
                     if let Some(anchor) = visual_anchor.take() {
                         let cur = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
-                        let s = anchor.min(cur);
-                        // compute canonical end-exclusive end
-                        let e = anchor.max(cur).min(buffer.char_len());
-                        buffer.delete_range(s, e);
+                        if *vim_mode == crate::VimMode::VisualLine {
+                            let (as_, ae) = buffer.line_bounds_at(anchor);
+                            let (cs, ce) = buffer.line_bounds_at(cur);
+                            let s = as_.min(cs);
+                            let e = ae.max(ce).min(buffer.char_len());
+                            buffer.delete_range(s, e);
+                        } else {
+                            let s = anchor.min(cur);
+                            // compute canonical end-exclusive end
+                            let e = anchor.max(cur).min(buffer.char_len());
+                            buffer.delete_range(s, e);
+                        }
                         *last_vim_key = None;
                         *vim_mode = crate::VimMode::Normal;
                         return false;
