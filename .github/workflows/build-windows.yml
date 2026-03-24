@@ -8,9 +8,13 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'Build target: msvc (default) or all'
+        description: 'Build target: choose which artifacts to build — "msvc" (default: build all MSVC artifacts), "all" (alias for msvc), or "uploader" (build only uploader_rs)'
         required: false
         default: 'msvc'
+        options:
+          - msvc
+          - all
+          - uploader
 
 jobs:
   build-msvc:
