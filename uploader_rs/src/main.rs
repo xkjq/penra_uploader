@@ -489,9 +489,9 @@ impl eframe::App for AppState {
                 if let Some(step) = &self.processing_step {
                     ui.label(format!("Step: {}", step));
                 }
-                    if ui.button("Process export (anonymize + notify)").clicked() {
-                        self.trigger_process_export();
-                    }
+                if ui.button("Process export (anonymize + notify)").clicked() {
+                    self.trigger_process_export();
+                }
 
                 if ui.button("Import from folder").clicked() {
                     self.import_dialog_open = true;
