@@ -315,6 +315,49 @@ impl eframe::App for ReportApp {
                         }
                     }
 
+                    // Handle mouse interactions inside the TextEdit widget so
+                    // clicks and drag-selections update our vim buffer state
+                    // regardless of mode. This keeps the caret/selection in
+                    // sync when the user clicks or selects with the mouse.
+                    for ev in events.iter() {
+                        if let Event::PointerButton { pos, pressed, button, .. } = ev {
+                            // Only react to primary button events that hit the widget
+                            if *button == egui::PointerButton::Primary && output.response.rect.contains(*pos) {
+                                // If the widget has reported a cursor/selection, adopt it
+                                if let Some(ccr) = output.cursor_range {
+                                    let sorted = ccr.as_sorted_char_range();
+                                    self.buffer.caret_char_range = Some(sorted.clone());
+                                    // Clear any operator-pending state
+                                    self.last_vim_key = None;
+
+                                    // If the user released the button and a non-empty
+                                    // selection exists, enter Visual mode so the
+                                    // selection behaves like a vim visual selection.
+                                    if !*pressed {
+                                        if self.vim_enabled {
+                                            if sorted.start != sorted.end {
+                                                self.vim_mode = VimMode::Visual;
+                                                self.visual_anchor = Some(sorted.start);
+                                            } else if self.vim_mode == VimMode::Visual {
+                                                // clicking with no selection cancels Visual
+                                                self.vim_mode = VimMode::Normal;
+                                                self.visual_anchor = None;
+                                            }
+                                        }
+                                    } else {
+                                        // On press, if already in Visual mode and there's
+                                        // no anchor set, initialize it to the press char
+                                        if self.vim_enabled && self.vim_mode == VimMode::Visual {
+                                            if self.visual_anchor.is_none() {
+                                                self.visual_anchor = Some(sorted.start);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Vim-only handling: Escape and text input handling for modal editing
                     if self.vim_enabled {
                         for ev in events.iter() {

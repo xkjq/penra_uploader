@@ -489,13 +489,26 @@ impl eframe::App for AppState {
                 if let Some(step) = &self.processing_step {
                     ui.label(format!("Step: {}", step));
                 }
-                if ui.button("Process export (anonymize + notify)").clicked() {
-                    self.trigger_process_export();
-                }
+                ui.horizontal(|ui| {
+                    if ui.button("Process export (anonymize + notify)").clicked() {
+                        self.trigger_process_export();
+                    }
+                    if ui.button("Refresh ready-to-upload").clicked() {
+                        let _anon_dir = self.export_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
+                            let anon_dir = self.anon_dir();
+                        let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
+                        thread::spawn(move || {
+                            if let Err(e) = request_scan(&anon_dir, Some(tx.clone())) {
+                                let _ = tx.send(format!("Scan failed: {}", e));
+                            }
+                            let _ = tx.send("done".to_string());
+                        });
+                    }
 
-                if ui.button("Import from folder").clicked() {
-                    self.import_dialog_open = true;
-                }
+                    if ui.button("Import from folder").clicked() {
+                        self.import_dialog_open = true;
+                    }
+                });
 
                 // Import dialog (modal)
                 if self.import_dialog_open {
@@ -644,21 +657,6 @@ impl eframe::App for AppState {
                     });
                 }
 
-                // Parallelism control moved to Settings (save required)
-
-                
-
-                if ui.button("Refresh ready-to-upload").clicked() {
-                    let _anon_dir = self.export_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
-                        let anon_dir = self.anon_dir();
-                    let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
-                    thread::spawn(move || {
-                        if let Err(e) = request_scan(&anon_dir, Some(tx.clone())) {
-                            let _ = tx.send(format!("Scan failed: {}", e));
-                        }
-                        let _ = tx.send("done".to_string());
-                    });
-                }
             });
             
             // Temporarily take ownership of the receiver so `handle_message` can
