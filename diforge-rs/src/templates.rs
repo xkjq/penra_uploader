@@ -21,9 +21,88 @@ pub struct Template {
     /// When true, ensure there is a blank line before and after the inserted
     /// template body when not inserting inline.
     pub ensure_surrounding_newlines: bool,
+    #[serde(default)]
+    /// Controls finishing behavior when inserting inline: None, Pre, Post or Both
+    pub inline_finish: InlineFinish,
 }
 
 fn default_true() -> bool { true }
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub enum InlineFinish {
+    None,
+    Pre,
+    Post,
+    Both,
+}
+
+impl Default for InlineFinish {
+    fn default() -> Self { InlineFinish::None }
+}
+
+fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
+    s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+/// If needed, ensure the text immediately before `pos` ends a sentence and is
+/// followed by a single space. Returns the updated insertion char index.
+pub fn ensure_finish_before(report: &mut String, pos: usize) -> usize {
+    if pos == 0 { return pos; }
+    // find last non-whitespace char before pos
+    let mut last = None;
+    for i in (0..pos).rev() {
+        if let Some(c) = report.chars().nth(i) {
+            if !c.is_whitespace() { last = Some((i, c)); break; }
+        }
+    }
+    let mut new_pos = pos;
+    if let Some((idx, ch)) = last {
+        if !".!?".contains(ch) {
+            // insert a period at `pos`
+            let byte_pos = char_to_byte_idx(report, pos);
+            report.insert_str(byte_pos, ".");
+            new_pos += 1;
+        }
+        // ensure a single space after the sentence-ending punctuation
+        let byte_pos = char_to_byte_idx(report, new_pos);
+        let next_char = report.chars().nth(new_pos);
+        if next_char != Some(' ') {
+            report.insert_str(byte_pos, " ");
+            new_pos += 1;
+        }
+    }
+    new_pos
+}
+
+/// After inserting text at `pos` of length `inserted_len` chars, ensure the
+/// following text is spaced and capitalized appropriately.
+pub fn ensure_finish_after(report: &mut String, pos: usize, inserted_len: usize) {
+    let check_pos = pos + inserted_len;
+    // ensure a single space between inserted text and following text
+    let byte_check = char_to_byte_idx(report, check_pos);
+    let next_char = report.chars().nth(check_pos);
+    if next_char != Some(' ') && next_char.is_some() {
+        report.insert_str(byte_check, " ");
+    }
+    // find first non-space char after insertion
+    let mut first_nonspace = None;
+    let mut i = check_pos;
+    while let Some(c) = report.chars().nth(i) {
+        if !c.is_whitespace() { first_nonspace = Some(i); break; }
+        i += 1;
+    }
+    if let Some(fi) = first_nonspace {
+        if let Some(c) = report.chars().nth(fi) {
+            if c.is_ascii_lowercase() {
+                // replace this character with uppercase
+                let start = char_to_byte_idx(report, fi);
+                let end = char_to_byte_idx(report, fi + 1);
+                let up = c.to_ascii_uppercase().to_string();
+                report.replace_range(start..end, &up);
+            }
+        }
+    }
+}
 
 impl Template {
     pub fn display_title(&self) -> String {
@@ -80,6 +159,7 @@ pub fn load_templates() -> Vec<Template> {
                                                 body: txt,
                                                 insert_inline: false,
                                                 ensure_surrounding_newlines: true,
+                                                inline_finish: InlineFinish::None,
                                         });
                                     }
                                 }
@@ -100,6 +180,7 @@ pub fn load_templates() -> Vec<Template> {
             body: "Clinical details: \n\nImpression: \n".to_string(),
             insert_inline: false,
             ensure_surrounding_newlines: true,
+            inline_finish: InlineFinish::None,
         });
         out.push(Template {
             id: Some("default2".to_string()),
@@ -109,6 +190,7 @@ pub fn load_templates() -> Vec<Template> {
             body: "History: \nTechnique: \nFindings: \nImpression: \n".to_string(),
             insert_inline: false,
             ensure_surrounding_newlines: true,
+            inline_finish: InlineFinish::None,
         });
     }
     out
@@ -207,5 +289,36 @@ pub fn render_template(template: &str, vars: &HashMap<String, String>, all_templ
     }
 
     recurse(template, vars, all_templates, 0)
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ensure_finish_before_inserts_period_and_space() {
+        let mut s = "This is a testand more".to_string();
+        // position between 'test' and 'and' (char index 14)
+        let pos = s.chars().take_while(|&c| { true }).count();
+        // compute pos for substring: find index of "and"
+        let pos = s.find("and").unwrap();
+        // convert byte index to char index
+        let char_pos = s[..pos].chars().count();
+        let new_pos = ensure_finish_before(&mut s, char_pos);
+        assert!(s.contains("test. and"));
+        assert_eq!(new_pos, char_pos + 2);
+    }
+
+    #[test]
+    fn test_ensure_finish_after_adds_space_and_capitalizes() {
+        let mut s = "Hello INSERThere".to_string();
+        // insert at position after "Hello " (6 chars)
+        let pos = "Hello ".chars().count();
+        // simulate insertion length 6 (INSERT)
+        ensure_finish_after(&mut s, pos, 6);
+        // after call, the 'h' of 'here' should become 'H' and a space present
+        assert!(s.contains("INSERT Here") || s.contains("INSERT Here"));
+    }
 }
 

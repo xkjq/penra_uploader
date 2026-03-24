@@ -17,9 +17,21 @@ struct Template {
     pub insert_inline: bool,
     #[serde(default = "default_true")]
     pub ensure_surrounding_newlines: bool,
+    #[serde(default)]
+    pub inline_finish: InlineFinish,
 }
 
 fn default_true() -> bool { true }
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+enum InlineFinish {
+    None,
+    Pre,
+    Post,
+    Both,
+}
+
+impl Default for InlineFinish { fn default() -> Self { InlineFinish::None } }
 
 impl Template {
     fn display_title(&self) -> String {
@@ -28,6 +40,8 @@ impl Template {
         self.body.lines().next().unwrap_or("(template)").to_string()
     }
 }
+
+// (InlineFinish is defined locally above)
 
 fn find_templates_root() -> Option<PathBuf> {
     if let Ok(mut dir) = std::env::current_dir() {
@@ -72,7 +86,7 @@ fn load_templates() -> Vec<Template> {
                             if let Ok(txt) = fs::read_to_string(&path) {
                                 match serde_yaml::from_str::<Template>(&txt) {
                                     Ok(t) => out.push(t),
-                                    Err(_) => out.push(Template { id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()), title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: txt, insert_inline: false, ensure_surrounding_newlines: true }),
+                                    Err(_) => out.push(Template { id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()), title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: txt, insert_inline: false, ensure_surrounding_newlines: true, inline_finish: InlineFinish::None }),
                                 }
                                 eprintln!("[template_editor] loaded: {}", path.display());
                             }
@@ -94,7 +108,7 @@ fn load_templates() -> Vec<Template> {
                                 if let Ok(txt) = fs::read_to_string(&path) {
                                     match serde_yaml::from_str::<Template>(&txt) {
                                         Ok(t) => out.push(t),
-                                        Err(_) => out.push(Template { id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()), title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: txt, insert_inline: false, ensure_surrounding_newlines: true }),
+                                        Err(_) => out.push(Template { id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()), title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: txt, insert_inline: false, ensure_surrounding_newlines: true, inline_finish: InlineFinish::None }),
                                     }
                                     eprintln!("[template_editor] loaded: {}", path.display());
                                 }
@@ -107,7 +121,7 @@ fn load_templates() -> Vec<Template> {
     }
     eprintln!("[template_editor] total templates: {}", out.len());
     if out.is_empty() {
-        out.push(Template { id: Some("default1".to_string()), title: Some("Default Clinical".to_string()), applicable_codes: Vec::new(), modalities: Vec::new(), body: "Clinical details:\n\nImpression:\n".to_string(), insert_inline: false, ensure_surrounding_newlines: true });
+        out.push(Template { id: Some("default1".to_string()), title: Some("Default Clinical".to_string()), applicable_codes: Vec::new(), modalities: Vec::new(), body: "Clinical details:\n\nImpression:\n".to_string(), insert_inline: false, ensure_surrounding_newlines: true, inline_finish: InlineFinish::None });
     }
     out
 }
@@ -135,7 +149,7 @@ impl eframe::App for AppState {
             ui.heading("Template Editor");
             ui.horizontal(|ui| {
                 if ui.button("New").clicked() {
-                    self.editing = Some(Template { id: None, title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: String::new(), insert_inline: false, ensure_surrounding_newlines: true });
+                    self.editing = Some(Template { id: None, title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: String::new(), insert_inline: false, ensure_surrounding_newlines: true, inline_finish: InlineFinish::None });
                     self.show_editor = true;
                 }
                 if ui.button("Edit").clicked() {
@@ -257,6 +271,13 @@ impl eframe::App for AppState {
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut t.insert_inline, "Insert inline");
                             ui.checkbox(&mut t.ensure_surrounding_newlines, "Ensure surrounding newlines");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Inline finish:");
+                            ui.selectable_value(&mut t.inline_finish, InlineFinish::None, "None");
+                            ui.selectable_value(&mut t.inline_finish, InlineFinish::Pre, "Pre");
+                            ui.selectable_value(&mut t.inline_finish, InlineFinish::Post, "Post");
+                            ui.selectable_value(&mut t.inline_finish, InlineFinish::Both, "Both");
                         });
                         ui.horizontal(|ui| {
                             if ui.button("Save").clicked() {

@@ -196,50 +196,51 @@ impl ReportApp {
         }
     }
 
-    // Prepare the template body for insertion according to template settings
-    fn prepare_body_for_insertion(&self, t: &templates::Template, mut body: String) -> String {
-        // If the template explicitly allows inline insertion, return as-is
+    // Insert a template at the current caret position, applying inline/block
+    // insertion rules and optional pre/post finishing (sentence completion).
+    fn insert_template_at_caret(&mut self, t: &templates::Template) {
+        let vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let rendered = templates::render_template(&t.body, &vars, &self.templates);
+
         if t.insert_inline {
-            return body;
-        }
-
-        // Determine caret position
-        let pos = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or_else(|| self.buffer.report.chars().count());
-
-        // Helper to peek character at index
-        let ch_at = |s: &String, idx: usize| -> Option<char> {
-            s.chars().nth(idx)
-        };
-
-        // Ensure there is a newline before if required
-        if t.ensure_surrounding_newlines {
-            let need_prefix = if pos == 0 {
-                false
-            } else {
-                match ch_at(&self.buffer.report, pos.saturating_sub(1)) {
-                    Some('\n') => false,
-                    _ => true,
-                }
-            };
-            if need_prefix {
-                body = format!("\n{}", body);
+            let mut pos = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or_else(|| self.buffer.report.chars().count());
+            // apply pre-finish if requested
+            if t.inline_finish == templates::InlineFinish::Pre || t.inline_finish == templates::InlineFinish::Both {
+                pos = templates::ensure_finish_before(&mut self.buffer.report, pos);
+                self.buffer.set_caret_pos(pos);
             }
 
-            // Ensure there's a newline after insertion
-            let after_char = ch_at(&self.buffer.report, pos);
-            let need_suffix = match after_char {
-                Some('\n') => false,
-                None => false,
-                _ => true,
-            };
-            if need_suffix {
-                if !body.ends_with('\n') {
-                    body.push('\n');
+            // perform insertion
+            self.buffer.insert_at_caret(&rendered);
+
+            // apply post-finish if requested (pos is insertion start)
+            if t.inline_finish == templates::InlineFinish::Post || t.inline_finish == templates::InlineFinish::Both {
+                let insert_len = rendered.chars().count();
+                let start_pos = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or_else(|| self.buffer.report.chars().count()).saturating_sub(insert_len);
+                templates::ensure_finish_after(&mut self.buffer.report, start_pos, insert_len);
+            }
+        } else {
+            // block-mode insertion: ensure surrounding blank lines if requested
+            let mut body = rendered.clone();
+            let pos = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or_else(|| self.buffer.report.chars().count());
+            if t.ensure_surrounding_newlines {
+                // prefix
+                if pos > 0 {
+                    if let Some(ch) = self.buffer.report.chars().nth(pos.saturating_sub(1)) {
+                        if ch != '\n' {
+                            body = format!("\n{}", body);
+                        }
+                    }
+                }
+                // suffix
+                if let Some(ch) = self.buffer.report.chars().nth(pos) {
+                    if ch != '\n' && !body.ends_with('\n') {
+                        body.push('\n');
+                    }
                 }
             }
+            self.buffer.insert_at_caret(&body);
         }
-
-        body
     }
 
     fn apply_settings(&mut self, s: Settings) {
@@ -426,12 +427,10 @@ impl eframe::App for ReportApp {
                                 };
 
                                 if let Some(pos) = target_opt {
-                                    if let Some(&tmpl_i) = visible_indices.get(pos) {
-                                        let t = &self.templates[tmpl_i];
+                                        if let Some(&tmpl_i) = visible_indices.get(pos) {
+                                        let t = self.templates[tmpl_i].clone();
                                         let vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-                                        let rendered = templates::render_template(&t.body, &vars, &self.templates);
-                                        let prepared = self.prepare_body_for_insertion(t, rendered);
-                                        self.buffer.insert_at_caret(&prepared);
+                                        self.insert_template_at_caret(&t);
                                     }
                                 }
                             }
@@ -973,10 +972,7 @@ impl eframe::App for ReportApp {
                                         ui.label("(soft)");
                                     }
                                     if ui.small_button("Insert").clicked() {
-                                        let vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-                                        let rendered = templates::render_template(&t.body, &vars, &self.templates);
-                                        let prepared = self.prepare_body_for_insertion(t, rendered);
-                                        self.buffer.insert_at_caret(&prepared);
+                                        self.insert_template_at_caret(t);
                                     }
                                     let selected = self.selected_template.map(|s| s == i).unwrap_or(false);
                                     if ui.selectable_label(selected, title).clicked() {
