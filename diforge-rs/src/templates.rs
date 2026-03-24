@@ -1,9 +1,9 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Template {
     pub id: Option<String>,
     pub title: Option<String>,
@@ -103,39 +103,74 @@ pub fn matches_template(t: &Template, study_codes: &[String], modality: Option<&
 }
 
 /// Render template by replacing `{{key}}` and `{{key|default}}` with values in the `vars` map.
-pub fn render_template(template: &str, vars: &HashMap<String, String>) -> String {
-    let mut out = String::with_capacity(template.len());
-    let mut chars = template.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '{' && chars.peek() == Some(&'{') {
-            chars.next();
-            let mut key = String::new();
-            while let Some(&nc) = chars.peek() {
-                if nc == '}' {
-                    break;
+/// Render template by replacing `{{key}}` and `{{key|default}}` with values in the `vars` map.
+///
+/// Supports including other templates with `{{> name}}` where `name` is a template `id` or title.
+pub fn render_template(template: &str, vars: &HashMap<String, String>, all_templates: &[Template]) -> String {
+    fn recurse(tmpl: &str, vars: &HashMap<String, String>, all: &[Template], depth: usize) -> String {
+        if depth > 8 {
+            return "".to_string();
+        }
+        let mut out = String::with_capacity(tmpl.len());
+        let mut chars = tmpl.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '{' && chars.peek() == Some(&'{') {
+                // consume the second '{'
+                chars.next();
+                // peek to see if this is an include (>)
+                // consume any whitespace after the '{{'
+                while let Some(&w) = chars.peek() {
+                    if w.is_whitespace() { chars.next(); } else { break; }
                 }
-                key.push(nc);
-                chars.next();
-            }
-            if chars.peek() == Some(&'}') {
-                chars.next();
-                if chars.peek() == Some(&'}') {
+                if chars.peek() == Some(&'>') {
+                    // include
+                    chars.next();
+                    // read until '}}'
+                    let mut name = String::new();
+                    while let Some(&nc) = chars.peek() {
+                        if nc == '}' { break; }
+                        name.push(nc);
+                        chars.next();
+                    }
+                    // consume trailing '}}'
+                    if chars.peek() == Some(&'}') { chars.next(); }
+                    if chars.peek() == Some(&'}') { chars.next(); }
+                    let name = name.trim();
+                    // find template by id or title
+                    if let Some(found) = all.iter().find(|tt| tt.id.as_deref().map(|s| s.eq_ignore_ascii_case(name)).unwrap_or(false) || tt.title.as_deref().map(|s| s.eq_ignore_ascii_case(name)).unwrap_or(false)) {
+                        let included = recurse(&found.body, vars, all, depth + 1);
+                        out.push_str(&included);
+                    } else {
+                        // not found: leave empty (or could keep a marker)
+                    }
+                    continue;
+                }
+
+                // otherwise parse a variable expression up to the first '}}'
+                let mut key = String::new();
+                while let Some(&nc) = chars.peek() {
+                    if nc == '}' { break; }
+                    key.push(nc);
                     chars.next();
                 }
+                if chars.peek() == Some(&'}') { chars.next(); }
+                if chars.peek() == Some(&'}') { chars.next(); }
+                let key = key.trim();
+                let mut parts = key.splitn(2, '|');
+                let k = parts.next().unwrap_or("").trim();
+                let default = parts.next().unwrap_or("").trim();
+                if let Some(v) = vars.get(k) {
+                    out.push_str(v);
+                } else if !default.is_empty() {
+                    out.push_str(default);
+                }
+            } else {
+                out.push(c);
             }
-            let key = key.trim();
-            let mut parts = key.splitn(2, '|');
-            let k = parts.next().unwrap_or("").trim();
-            let default = parts.next().unwrap_or("").trim();
-            if let Some(v) = vars.get(k) {
-                out.push_str(v);
-            } else if !default.is_empty() {
-                out.push_str(default);
-            }
-        } else {
-            out.push(c);
         }
+        out
     }
-    out
+
+    recurse(template, vars, all_templates, 0)
 }
 

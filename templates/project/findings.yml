@@ -1,0 +1,8 @@
+id: findings
+title: Findings Partial
+applicable_codes: []
+modalities: []
+body: |
+  Findings:
+  - {{finding1|No significant findings}}
+  - {{finding2|}}

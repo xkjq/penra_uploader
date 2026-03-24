@@ -1,0 +1,8 @@
+id: header
+title: Report Header
+applicable_codes: []
+modalities: []
+body: |
+  Patient: {{patient_name|Unknown}}
+  DOB: {{dob|}}
+  Study: {{study|}}

@@ -94,6 +94,10 @@ struct ReportApp {
     template_search: String,
     template_nicip: String,
     selected_template: Option<usize>,
+    // template editor state
+    show_template_editor: bool,
+    editing_template: Option<templates::Template>,
+    editing_index: Option<usize>,
     attach_requested: bool,
     // overlay position (for helper)
     overlay_x: i32,
@@ -141,6 +145,9 @@ impl Default for ReportApp {
             template_search: String::new(),
             template_nicip: String::new(),
             selected_template: None,
+            show_template_editor: false,
+            editing_template: None,
+            editing_index: None,
             attach_requested: false,
             overlay_x: 100,
             overlay_y: 100,
@@ -808,6 +815,63 @@ impl eframe::App for ReportApp {
                             }
                         });
 
+                        ui.horizontal(|ui| {
+                            if ui.button("New").clicked() {
+                                self.editing_template = Some(templates::Template {
+                                    id: None,
+                                    title: None,
+                                    applicable_codes: Vec::new(),
+                                    modalities: Vec::new(),
+                                    body: "".to_string(),
+                                });
+                                self.editing_index = None;
+                                self.show_template_editor = true;
+                            }
+                            if ui.button("Edit").clicked() {
+                                if let Some(i) = self.selected_template {
+                                    if i < self.templates.len() {
+                                        self.editing_template = Some(self.templates[i].clone());
+                                        self.editing_index = Some(i);
+                                        self.show_template_editor = true;
+                                    }
+                                }
+                            }
+                            if ui.button("Delete").clicked() {
+                                if let Some(i) = self.selected_template {
+                                    if i < self.templates.len() {
+                                        let t = &self.templates[i];
+                                        // Try to find matching user file and delete it
+                                        let user_dir = std::path::Path::new("templates/user");
+                                        if user_dir.exists() {
+                                            if let Ok(entries) = std::fs::read_dir(user_dir) {
+                                                for e in entries.flatten() {
+                                                    let path = e.path();
+                                                    if path.is_file() {
+                                                        if let Ok(txt) = std::fs::read_to_string(&path) {
+                                                            // match by id or by body
+                                                            let matched = if let Ok(parsed) = serde_yaml::from_str::<templates::Template>(&txt) {
+                                                                (t.id.is_some() && parsed.id == t.id) || parsed.body == t.body
+                                                            } else {
+                                                                // plain text template file -> match by body
+                                                                txt == t.body
+                                                            };
+                                                            if matched {
+                                                                let _ = std::fs::remove_file(&path);
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // refresh templates
+                                        self.templates = templates::load_templates();
+                                        self.selected_template = None;
+                                    }
+                                }
+                            }
+                        });
+
                         let nicips: Vec<String> = self
                             .template_nicip
                             .split(',')
@@ -833,7 +897,7 @@ impl eframe::App for ReportApp {
                                 ui.horizontal(|ui| {
                                     if ui.small_button("Insert").clicked() {
                                         let vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-                                        let rendered = templates::render_template(&t.body, &vars);
+                                        let rendered = templates::render_template(&t.body, &vars, &self.templates);
                                         let mut body = rendered.clone();
                                                     if !self.buffer.report.is_empty() && !self.buffer.report.ends_with('\n') && self.buffer.caret_char_range.is_none() {
                                                         body = format!("\n{}", body);
@@ -841,12 +905,86 @@ impl eframe::App for ReportApp {
                                                     self.buffer.insert_at_caret(&body);
                                         // After inserting ensure widget state will be updated next frame by the TextEdit output handling
                                     }
-                                    ui.label(title);
+                                    let selected = self.selected_template.map(|s| s == i).unwrap_or(false);
+                                    if ui.selectable_label(selected, title).clicked() {
+                                        if selected {
+                                            self.selected_template = None;
+                                        } else {
+                                            self.selected_template = Some(i);
+                                        }
+                                    }
                                 });
                             }
                         });
                     });
                 });
+            }
+
+            // Template editor window
+            if self.show_template_editor {
+                let mut open = self.show_template_editor;
+                egui::Window::new("Template Editor").open(&mut open).show(ctx, |ui| {
+                    if let Some(mut t) = self.editing_template.clone() {
+                        ui.horizontal(|ui| {
+                            ui.label("ID:");
+                            let mut idv = t.id.clone().unwrap_or_default();
+                            ui.text_edit_singleline(&mut idv);
+                            if idv.is_empty() { t.id = None; } else { t.id = Some(idv); }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Title:");
+                            let mut tv = t.title.clone().unwrap_or_default();
+                            ui.text_edit_singleline(&mut tv);
+                            if tv.is_empty() { t.title = None; } else { t.title = Some(tv); }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("NICIP codes (comma):");
+                            let mut codes = t.applicable_codes.join(",");
+                            ui.text_edit_singleline(&mut codes);
+                            t.applicable_codes = codes.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Modalities (comma):");
+                            let mut mods = t.modalities.join(",");
+                            ui.text_edit_singleline(&mut mods);
+                            t.modalities = mods.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                        });
+                        ui.label("Body:");
+                        ui.add(egui::TextEdit::multiline(&mut t.body).desired_rows(12));
+                        ui.horizontal(|ui| {
+                            if ui.button("Save").clicked() {
+                                // ensure user templates dir
+                                let user_dir = std::path::Path::new("templates/user");
+                                let _ = std::fs::create_dir_all(user_dir);
+                                // pick filename from id or title
+                                let fname_base = t.id.as_ref().or_else(|| t.title.as_ref()).map(|s| s.clone()).unwrap_or_else(|| format!("template_{}", chrono::Utc::now().timestamp()));
+                                let mut safe = fname_base.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect::<String>();
+                                if safe.is_empty() { safe = format!("template_{}", chrono::Utc::now().timestamp()); }
+                                let path = user_dir.join(format!("{}.yml", safe));
+                                if let Ok(yml) = serde_yaml::to_string(&t) {
+                                    let _ = std::fs::write(&path, yml);
+                                }
+                                // refresh templates list
+                                self.templates = templates::load_templates();
+                                self.show_template_editor = false;
+                                self.editing_template = None;
+                                self.editing_index = None;
+                                return;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.show_template_editor = false;
+                                self.editing_template = None;
+                                self.editing_index = None;
+                                return;
+                            }
+                        });
+                        // save changes back into editing_template state while open
+                        self.editing_template = Some(t);
+                    } else {
+                        ui.label("No template loaded.");
+                    }
+                });
+                self.show_template_editor = open;
             }
         });
     }

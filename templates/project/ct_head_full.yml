@@ -1,0 +1,11 @@
+id: ct_head_full
+title: CT Head Full Report
+applicable_codes: []
+modalities:
+  - CT
+body: |
+  {{> header}}
+
+  {{> findings}}
+
+  {{> impression}}

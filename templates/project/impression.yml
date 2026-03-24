@@ -1,0 +1,8 @@
+id: impression
+title: Impression Partial
+applicable_codes: []
+modalities: []
+body: |
+  Impression:
+  1. {{impression1|No acute abnormality}}
+  2. {{impression2|}}

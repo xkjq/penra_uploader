@@ -1,0 +1,13 @@
+id: ct_abdomen_full
+title: CT Abdomen Full
+applicable_codes:
+  - ABC123
+modalities:
+  - CT
+body: |
+  {{> header}}
+
+  Abdomen-specific findings:
+  - {{abd_finding1|No acute abdominal pathology}}
+
+  {{> impression}}

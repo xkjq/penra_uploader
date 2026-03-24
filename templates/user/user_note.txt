@@ -1,0 +1,6 @@
+This is a user note template.
+It references the findings partial below:
+
+{{> findings}}
+
+End of user note.
