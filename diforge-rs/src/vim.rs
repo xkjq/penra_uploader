@@ -642,6 +642,8 @@ impl ReportBuffer {
                 } else {
                     let pos = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
                     *visual_anchor = Some(pos);
+                    // initialize the caret range so UI shows selection immediately
+                    buffer.caret_char_range = Some(pos..pos);
                     *vim_mode = crate::VimMode::Visual;
                 }
                 *last_vim_key = None;

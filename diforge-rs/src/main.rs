@@ -283,15 +283,20 @@ impl eframe::App for ReportApp {
                     let mut output = text_edit.show(ui);
 
                     // Update stored caret char range from the widget's reported cursor_range
-                    if let Some(ccr) = output.cursor_range {
-                        let sorted = ccr.as_sorted_char_range();
-                        self.buffer.caret_char_range = Some(sorted);
+                    // Only trust the widget when the TextEdit is interactive (Insert mode or Vim disabled).
+                    if is_interactive {
+                        if let Some(ccr) = output.cursor_range {
+                            let sorted = ccr.as_sorted_char_range();
+                            eprintln!("[dbg] widget.cursor_range -> {:?}", sorted);
+                            self.buffer.caret_char_range = Some(sorted);
+                        }
                     }
 
                     // If vim emulation is active but we're not in Insert mode, revert any
                     // direct text changes the TextEdit may have applied (so Normal mode
                     // keystrokes are handled by our modal logic instead).
                     if self.vim_enabled && self.vim_mode != VimMode::Insert && self.buffer.report != prev_report {
+                        eprintln!("[dbg] reverting buffer.report due to non-Insert vim mode (widget tried to edit)");
                         self.buffer.report = prev_report;
                     }
 
@@ -341,30 +346,34 @@ impl eframe::App for ReportApp {
                             if !output.response.rect.contains(*pos) { continue; }
 
                             // Prefer the widget-reported cursor_range when available
-                            if let Some(ccr) = output.cursor_range {
-                                let sorted = ccr.as_sorted_char_range();
-                                self.buffer.caret_char_range = Some(sorted.clone());
-                                self.last_vim_key = None;
+                            // but only when the TextEdit is interactive (Insert mode or Vim disabled).
+                            if is_interactive {
+                                if let Some(ccr) = output.cursor_range {
+                                    let sorted = ccr.as_sorted_char_range();
+                                    eprintln!("[dbg] pointer button (interactive): widget reported cursor_range -> {:?} pressed={}", sorted, pressed);
+                                    self.buffer.caret_char_range = Some(sorted.clone());
+                                    self.last_vim_key = None;
 
-                                if *pressed {
-                                    // start drag using the reported cursor position
-                                    self.mouse_dragging = true;
-                                    self.mouse_drag_anchor = Some(sorted.start);
-                                }
-
-                                if !*pressed {
-                                    if self.vim_enabled {
-                                        if sorted.start != sorted.end {
-                                            self.vim_mode = VimMode::Visual;
-                                            self.visual_anchor = Some(sorted.start);
-                                        } else if self.vim_mode == VimMode::Visual {
-                                            self.vim_mode = VimMode::Normal;
-                                            self.visual_anchor = None;
-                                        }
+                                    if *pressed {
+                                        // start drag using the reported cursor position
+                                        self.mouse_dragging = true;
+                                        self.mouse_drag_anchor = Some(sorted.start);
                                     }
-                                } else if self.vim_enabled && self.vim_mode == VimMode::Visual {
-                                    if self.visual_anchor.is_none() {
-                                        self.visual_anchor = Some(sorted.start);
+
+                                    if !*pressed {
+                                        if self.vim_enabled {
+                                            if sorted.start != sorted.end {
+                                                self.vim_mode = VimMode::Visual;
+                                                self.visual_anchor = Some(sorted.start);
+                                            } else if self.vim_mode == VimMode::Visual {
+                                                self.vim_mode = VimMode::Normal;
+                                                self.visual_anchor = None;
+                                            }
+                                        }
+                                    } else if self.vim_enabled && self.vim_mode == VimMode::Visual {
+                                        if self.visual_anchor.is_none() {
+                                            self.visual_anchor = Some(sorted.start);
+                                        }
                                     }
                                 }
                             } else if !is_interactive {
@@ -385,6 +394,7 @@ impl eframe::App for ReportApp {
                                         best = idx;
                                     }
                                 }
+                                eprintln!("[dbg] pointer button: galley mapped pos -> {} (pressed={})", best, pressed);
                                 self.buffer.caret_char_range = Some(best..best);
                                 self.last_vim_key = None;
                                 if *pressed {
@@ -399,6 +409,7 @@ impl eframe::App for ReportApp {
                                         if let Some(anchor) = self.mouse_drag_anchor.take() {
                                             let cur = best;
                                             if anchor != cur {
+                                                eprintln!("[dbg] mouse drag end anchor={} cur={} -> selection {}..{}", anchor, cur, anchor.min(cur), anchor.max(cur).saturating_add(1));
                                                 if self.vim_enabled {
                                                     self.vim_mode = VimMode::Visual;
                                                     self.visual_anchor = Some(anchor.min(cur));
@@ -447,6 +458,7 @@ impl eframe::App for ReportApp {
                             if let Some(anchor) = self.mouse_drag_anchor {
                                 let s = anchor.min(best);
                                 let e = anchor.max(best).saturating_add(1).min(self.buffer.char_len());
+                                eprintln!("[dbg] pointer moved drag update anchor={} best={} -> selection {}..{}", anchor, best, s, e);
                                 self.buffer.caret_char_range = Some(s..e);
                                 if self.vim_enabled {
                                     self.vim_mode = VimMode::Visual;
@@ -514,8 +526,12 @@ impl eframe::App for ReportApp {
                                 // Extend the shown cursor range for any non-empty selection
                                 // so the final character is included (ranges are end-exclusive).
                                 let extend = if e > s { 1 } else { 0 };
+                                let display_end = (e).min(self.buffer.char_len()).saturating_add(extend);
+                                // Ensure textual selection mirrors visual selection
+                                eprintln!("[dbg] visual sync anchor={} cur={} -> display {}..{}", anchor, cur, s, display_end);
+                                self.buffer.caret_char_range = Some(s..display_end);
                                 let start = CCursor::new(s);
-                                let end = CCursor::new((e).min(self.buffer.char_len()).saturating_add(extend));
+                                let end = CCursor::new(display_end);
                             output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
                             output.state.store(ui.ctx(), output.response.id);
                         } else if let Some(range) = &self.buffer.caret_char_range {
