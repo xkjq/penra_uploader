@@ -332,6 +332,66 @@ impl eframe::App for ReportApp {
                                     _ => {}
                                 }
                             }
+                            // Alt + number quick-insert handling. Map Num1..Num9 to visible templates 1..9.
+                            if modifiers.alt {
+                                // Build visible template index list on-demand (same filtering rules as rendering)
+                                let nicips: Vec<String> = self
+                                    .template_nicip
+                                    .split(',')
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                let mut visible_indices: Vec<usize> = Vec::new();
+                                for (i, t) in self.templates.iter().enumerate() {
+                                    if !nicips.is_empty() {
+                                        if !t.applicable_codes.is_empty() {
+                                            let mut matched = false;
+                                            for sc in &nicips {
+                                                if t.applicable_codes.iter().any(|ac| ac.eq_ignore_ascii_case(sc)) {
+                                                    matched = true;
+                                                    break;
+                                                }
+                                            }
+                                            if !matched { continue; }
+                                        }
+                                    }
+                                    let title = t.display_title();
+                                    if !self.template_search.is_empty()
+                                        && !title.to_lowercase().contains(&self.template_search.to_lowercase())
+                                        && !t.body.to_lowercase().contains(&self.template_search.to_lowercase())
+                                    {
+                                        continue;
+                                    }
+                                    visible_indices.push(i);
+                                }
+
+                                let target_opt = match key {
+                                    egui::Key::Num1 => Some(0usize),
+                                    egui::Key::Num2 => Some(1usize),
+                                    egui::Key::Num3 => Some(2usize),
+                                    egui::Key::Num4 => Some(3usize),
+                                    egui::Key::Num5 => Some(4usize),
+                                    egui::Key::Num6 => Some(5usize),
+                                    egui::Key::Num7 => Some(6usize),
+                                    egui::Key::Num8 => Some(7usize),
+                                    egui::Key::Num9 => Some(8usize),
+                                    egui::Key::Num0 => Some(9usize),
+                                    _ => None,
+                                };
+
+                                if let Some(pos) = target_opt {
+                                    if let Some(&tmpl_i) = visible_indices.get(pos) {
+                                        let t = &self.templates[tmpl_i];
+                                        let vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                                        let rendered = templates::render_template(&t.body, &vars, &self.templates);
+                                        let mut body = rendered.clone();
+                                        if !self.buffer.report.is_empty() && !self.buffer.report.ends_with('\n') && self.buffer.caret_char_range.is_none() {
+                                            body = format!("\n{}", body);
+                                        }
+                                        self.buffer.insert_at_caret(&body);
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -824,45 +884,51 @@ impl eframe::App for ReportApp {
                             .filter(|s| !s.is_empty())
                             .collect();
 
-                        // Clone templates to avoid immutable borrow across UI closures.
+                        // Build a list of visible template indices after applying filters so
+                        // we can both render numeric shortcuts and react to Alt+<n> keys.
                         let templates_list = self.templates.clone();
-
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            for (i, t) in templates_list.iter().enumerate() {
-                                    // Only apply NICIP filtering when the user supplied NICIP codes.
-                                    if !nicips.is_empty() {
-                                        // If template has no applicable_codes it's global -> show it.
-                                        if !t.applicable_codes.is_empty() {
-                                            // require intersection
-                                            let mut matched = false;
-                                            for sc in &nicips {
-                                                if t.applicable_codes.iter().any(|ac| ac.eq_ignore_ascii_case(sc)) {
-                                                    matched = true;
-                                                    break;
-                                                }
-                                            }
-                                            if !matched {
-                                                continue;
-                                            }
+                        let mut visible_indices: Vec<usize> = Vec::new();
+                        for (i, t) in templates_list.iter().enumerate() {
+                            if !nicips.is_empty() {
+                                if !t.applicable_codes.is_empty() {
+                                    let mut matched = false;
+                                    for sc in &nicips {
+                                        if t.applicable_codes.iter().any(|ac| ac.eq_ignore_ascii_case(sc)) {
+                                            matched = true;
+                                            break;
                                         }
                                     }
-                                    let title = t.display_title();
-                                    if !self.template_search.is_empty()
-                                        && !title.to_lowercase().contains(&self.template_search.to_lowercase())
-                                        && !t.body.to_lowercase().contains(&self.template_search.to_lowercase())
-                                    {
+                                    if !matched {
                                         continue;
                                     }
+                                }
+                            }
+                            let title = t.display_title();
+                            if !self.template_search.is_empty()
+                                && !title.to_lowercase().contains(&self.template_search.to_lowercase())
+                                && !t.body.to_lowercase().contains(&self.template_search.to_lowercase())
+                            {
+                                continue;
+                            }
+                            visible_indices.push(i);
+                        }
+
+                        // Render visible templates with numeric prefixes (1-based) and an Insert button.
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            for (pos, &i) in visible_indices.iter().enumerate() {
+                                let t = &templates_list[i];
+                                let title = t.display_title();
+                                let num = pos + 1; // 1-based numbering for shortcut keys
                                 ui.horizontal(|ui| {
+                                    ui.label(format!("[{}]", num));
                                     if ui.small_button("Insert").clicked() {
                                         let vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
                                         let rendered = templates::render_template(&t.body, &vars, &self.templates);
                                         let mut body = rendered.clone();
-                                                    if !self.buffer.report.is_empty() && !self.buffer.report.ends_with('\n') && self.buffer.caret_char_range.is_none() {
-                                                        body = format!("\n{}", body);
-                                                    }
-                                                    self.buffer.insert_at_caret(&body);
-                                        // After inserting ensure widget state will be updated next frame by the TextEdit output handling
+                                        if !self.buffer.report.is_empty() && !self.buffer.report.ends_with('\n') && self.buffer.caret_char_range.is_none() {
+                                            body = format!("\n{}", body);
+                                        }
+                                        self.buffer.insert_at_caret(&body);
                                     }
                                     let selected = self.selected_template.map(|s| s == i).unwrap_or(false);
                                     if ui.selectable_label(selected, title).clicked() {

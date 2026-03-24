@@ -360,6 +360,44 @@ impl AppState {
             if let Err(e) = request_scan(&anon_dir, Some(tx.clone())) {
                 let _ = tx.send(format!("Post-process scan failed: {}", e));
             }
+            // attempt to clean up the processing directory we created (best-effort)
+            if processing_dir.exists() {
+                if let Err(e) = fs::remove_dir_all(&processing_dir) {
+                    let _ = tx.send(format!("Failed to remove processing dir {}: {}", processing_dir.display(), e));
+                } else {
+                    let _ = tx.send(format!("Cleaned processing dir {}", processing_dir.display()));
+                }
+            }
+
+            // also prune any empty directories left under the export root (best-effort)
+            if export.exists() {
+                // recursively remove empty directories under `export` but don't remove `export` itself
+                fn prune_empty_dirs(dir: &std::path::Path) {
+                    if let Ok(entries) = fs::read_dir(dir) {
+                        for e in entries.flatten() {
+                            let p = e.path();
+                            if p.is_dir() {
+                                prune_empty_dirs(&p);
+                            }
+                        }
+                    }
+                    // try removing this dir if it's empty
+                    if let Ok(mut it) = fs::read_dir(dir) {
+                        if it.next().is_none() {
+                            let _ = fs::remove_dir(dir);
+                        }
+                    }
+                }
+                // prune children of export (not export itself)
+                if let Ok(entries) = fs::read_dir(&export) {
+                    for e in entries.flatten() {
+                        let p = e.path();
+                        if p.is_dir() {
+                            prune_empty_dirs(&p);
+                        }
+                    }
+                }
+            }
 
             let _ = tx.send("done".to_string());
         });
@@ -681,6 +719,27 @@ impl eframe::App for AppState {
                                                     }
                                                 }
                                             }
+
+                                                // If we moved files from the source, prune any empty directories left behind (best-effort).
+                                                if do_move {
+                                                    // Recursively remove empty directories under `src`, but do not remove `src` itself.
+                                                    fn remove_empty_dirs(path: &std::path::Path, root: &std::path::Path) {
+                                                        if let Ok(entries) = fs::read_dir(path) {
+                                                            for e in entries.flatten() {
+                                                                let p = e.path();
+                                                                if p.is_dir() {
+                                                                    remove_empty_dirs(&p, root);
+                                                                }
+                                                            }
+                                                        }
+                                                        if path != root {
+                                                            if fs::read_dir(path).map(|mut it| it.next().is_none()).unwrap_or(false) {
+                                                                let _ = fs::remove_dir(path);
+                                                            }
+                                                        }
+                                                    }
+                                                    remove_empty_dirs(&src, &src);
+                                                }
                                         }
 
                                         let _ = tx.send("done".to_string());
