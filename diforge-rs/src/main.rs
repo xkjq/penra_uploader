@@ -111,6 +111,10 @@ struct ReportApp {
     // visual mode anchor (selection start) in char indices
     visual_anchor: Option<usize>,
     // numeric prefix for vim commands (e.g., `3dw`)
+    // mouse drag tracking for click-and-drag selection when TextEdit is non-interactive
+    mouse_dragging: bool,
+    mouse_drag_anchor: Option<usize>,
+    // numeric prefix for vim commands (e.g., `3dw`)
     vim_count: Option<usize>,
 }
 
@@ -145,6 +149,8 @@ impl Default for ReportApp {
             last_vim_key: None,
             last_vim_object: None,
             visual_anchor: None,
+            mouse_dragging: false,
+            mouse_drag_anchor: None,
             vim_count: None,
         };
 
@@ -291,6 +297,31 @@ impl eframe::App for ReportApp {
 
                     use egui::Event;
 
+                    // Compute small draggable handle rects under the TextEdit for the
+                    // caret/selection boundaries so users can click-drag selection
+                    // even when the TextEdit is non-interactive. These are simple
+                    // screen-space rects placed a few pixels below the widget.
+                    let mut handle_start_rect: Option<egui::Rect> = None;
+                    let mut handle_end_rect: Option<egui::Rect> = None;
+                    if let Some(range) = &self.buffer.caret_char_range {
+                        let start = CCursor::new(range.start);
+                        let end = CCursor::new(range.end.min(self.buffer.char_len()));
+                        let start_pos = output.galley.pos_from_cursor(start);
+                        let end_pos = output.galley.pos_from_cursor(end);
+                        let screen_start = output.response.rect.min + start_pos.min.to_vec2();
+                        let screen_end = output.response.rect.min + end_pos.min.to_vec2();
+                        let y = output.response.rect.max.y + 6.0;
+                        let size = 10.0;
+                        handle_start_rect = Some(egui::Rect::from_min_max(
+                            egui::pos2(screen_start.x - size * 0.5, y - size * 0.5),
+                            egui::pos2(screen_start.x + size * 0.5, y + size * 0.5),
+                        ));
+                        handle_end_rect = Some(egui::Rect::from_min_max(
+                            egui::pos2(screen_end.x - size * 0.5, y - size * 0.5),
+                            egui::pos2(screen_end.x + size * 0.5, y + size * 0.5),
+                        ));
+                    }
+
                     // Capture events once and use them both for global handling and
                     // vim-specific handling below. Make undo/redo available even
                     // when Vim emulation is disabled by handling Ctrl-Z / Ctrl-Y
@@ -328,6 +359,29 @@ impl eframe::App for ReportApp {
                     for ev in events.iter() {
                         if let Event::PointerButton { pos, pressed, button, .. } = ev {
                             if *button != egui::PointerButton::Primary { continue; }
+                            // Priority: if user clicked a handle, treat that as the target
+                            if let Some(rect) = &handle_start_rect {
+                                if rect.contains(*pos) {
+                                    if *pressed {
+                                        self.mouse_dragging = true;
+                                        self.mouse_drag_anchor = Some(self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0));
+                                    } else {
+                                        self.mouse_dragging = false;
+                                    }
+                                    continue;
+                                }
+                            }
+                            if let Some(rect) = &handle_end_rect {
+                                if rect.contains(*pos) {
+                                    if *pressed {
+                                        self.mouse_dragging = true;
+                                        self.mouse_drag_anchor = Some(self.buffer.caret_char_range.as_ref().map(|r| r.end).unwrap_or(0));
+                                    } else {
+                                        self.mouse_dragging = false;
+                                    }
+                                    continue;
+                                }
+                            }
                             if !output.response.rect.contains(*pos) { continue; }
 
                             // Prefer the widget-reported cursor_range when available
@@ -335,6 +389,12 @@ impl eframe::App for ReportApp {
                                 let sorted = ccr.as_sorted_char_range();
                                 self.buffer.caret_char_range = Some(sorted.clone());
                                 self.last_vim_key = None;
+
+                                if *pressed {
+                                    // start drag using the reported cursor position
+                                    self.mouse_dragging = true;
+                                    self.mouse_drag_anchor = Some(sorted.start);
+                                }
 
                                 if !*pressed {
                                     if self.vim_enabled {
@@ -371,19 +431,72 @@ impl eframe::App for ReportApp {
                                 }
                                 self.buffer.caret_char_range = Some(best..best);
                                 self.last_vim_key = None;
-                                if !*pressed {
-                                    if self.vim_enabled {
-                                        // single click with no drag -> cancel visual or leave normal
-                                        if self.vim_mode == VimMode::Visual {
-                                            self.vim_mode = VimMode::Normal;
-                                            self.visual_anchor = None;
+                                if *pressed {
+                                    // start drag
+                                    self.mouse_dragging = true;
+                                    self.mouse_drag_anchor = Some(best);
+                                } else {
+                                    // mouse released
+                                    if self.mouse_dragging {
+                                        // ended a drag
+                                        self.mouse_dragging = false;
+                                        if let Some(anchor) = self.mouse_drag_anchor.take() {
+                                            let cur = best;
+                                            if anchor != cur {
+                                                if self.vim_enabled {
+                                                    self.vim_mode = VimMode::Visual;
+                                                    self.visual_anchor = Some(anchor.min(cur));
+                                                }
+                                                // set selection inclusive of final char
+                                                let s = anchor.min(cur);
+                                                let e = anchor.max(cur).saturating_add(1).min(self.buffer.char_len());
+                                                self.buffer.caret_char_range = Some(s..e);
+                                            }
+                                        }
+                                    } else {
+                                        // single click without drag
+                                        if self.vim_enabled {
+                                            if self.vim_mode == VimMode::Visual {
+                                                self.vim_mode = VimMode::Normal;
+                                                self.visual_anchor = None;
+                                            }
                                         }
                                     }
-                                } else if self.vim_enabled && self.vim_mode == VimMode::Visual {
-                                    if self.visual_anchor.is_none() {
-                                        self.visual_anchor = Some(best);
-                                    }
                                 }
+                            }
+                        }
+                    }
+
+                    // Handle pointer movement to update selection during drag
+                    for ev in events.iter() {
+                        if let Event::PointerMoved(pos) = ev {
+                            if !self.mouse_dragging { continue; }
+                            // compute nearest char index to mouse pos
+                            let pos = *pos;
+                            let mut best = 0usize;
+                            let mut best_dist = f32::INFINITY;
+                            let total = self.buffer.char_len();
+                            for idx in 0..=total {
+                                let cursor = CCursor::new(idx);
+                                let rect = output.galley.pos_from_cursor(cursor);
+                                let screen = output.response.rect.min + rect.min.to_vec2();
+                                let dx = screen.x - pos.x;
+                                let dy = screen.y - pos.y;
+                                let dist = dx * dx + dy * dy;
+                                if dist < best_dist {
+                                    best_dist = dist;
+                                    best = idx;
+                                }
+                            }
+                            if let Some(anchor) = self.mouse_drag_anchor {
+                                let s = anchor.min(best);
+                                let e = anchor.max(best).saturating_add(1).min(self.buffer.char_len());
+                                self.buffer.caret_char_range = Some(s..e);
+                                if self.vim_enabled {
+                                    self.vim_mode = VimMode::Visual;
+                                    self.visual_anchor = Some(s);
+                                }
+                                self.last_vim_key = None;
                             }
                         }
                     }
@@ -545,6 +658,13 @@ impl eframe::App for ReportApp {
                                     }
                                 }
                             }
+                            // Draw draggable handles beneath the widget for selection boundaries
+                            if let Some(hs) = handle_start_rect {
+                                painter.rect_filled(hs, 2.0, egui::Color32::from_rgb(180, 220, 255));
+                            }
+                            if let Some(he) = handle_end_rect {
+                                painter.rect_filled(he, 2.0, egui::Color32::from_rgb(180, 220, 255));
+                            }
                             // Draw a visible caret as a filled rectangle the width of a character.
                             let caret_height = 18.0_f32;
                             // Use the galley cursor rect width as a best-effort char width; fallback to 8.0
@@ -596,12 +716,14 @@ impl eframe::App for ReportApp {
 
                     // Show caret position below the text edit so user always sees it
                     if let Some(range) = &self.buffer.caret_char_range {
-                        ui.label(format!("Caret: {}{}",
-                            range.end,
-                            if range.start != range.end { format!(" (sel {}..{})", range.start, range.end) } else { String::new() }
-                        ));
+                        let sel_text = if range.start != range.end {
+                            format!("Selection: {}-{}", range.start, range.end)
+                        } else {
+                            "Selection: -".to_string()
+                        };
+                        ui.label(format!("Caret: {}    {}", range.end, sel_text));
                     } else {
-                        ui.label("Caret: -");
+                        ui.label("Caret: -    Selection: -");
                     }
 
                     ui.horizontal(|ui| {
