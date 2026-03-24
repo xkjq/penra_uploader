@@ -297,30 +297,8 @@ impl eframe::App for ReportApp {
 
                     use egui::Event;
 
-                    // Compute small draggable handle rects under the TextEdit for the
-                    // caret/selection boundaries so users can click-drag selection
-                    // even when the TextEdit is non-interactive. These are simple
-                    // screen-space rects placed a few pixels below the widget.
-                    let mut handle_start_rect: Option<egui::Rect> = None;
-                    let mut handle_end_rect: Option<egui::Rect> = None;
-                    if let Some(range) = &self.buffer.caret_char_range {
-                        let start = CCursor::new(range.start);
-                        let end = CCursor::new(range.end.min(self.buffer.char_len()));
-                        let start_pos = output.galley.pos_from_cursor(start);
-                        let end_pos = output.galley.pos_from_cursor(end);
-                        let screen_start = output.response.rect.min + start_pos.min.to_vec2();
-                        let screen_end = output.response.rect.min + end_pos.min.to_vec2();
-                        let y = output.response.rect.max.y + 6.0;
-                        let size = 10.0;
-                        handle_start_rect = Some(egui::Rect::from_min_max(
-                            egui::pos2(screen_start.x - size * 0.5, y - size * 0.5),
-                            egui::pos2(screen_start.x + size * 0.5, y + size * 0.5),
-                        ));
-                        handle_end_rect = Some(egui::Rect::from_min_max(
-                            egui::pos2(screen_end.x - size * 0.5, y - size * 0.5),
-                            egui::pos2(screen_end.x + size * 0.5, y + size * 0.5),
-                        ));
-                    }
+                    // (No visible drag handles; mouse selection is handled via
+                    // galley-based mapping and pointer drag logic below.)
 
                     // Capture events once and use them both for global handling and
                     // vim-specific handling below. Make undo/redo available even
@@ -359,29 +337,7 @@ impl eframe::App for ReportApp {
                     for ev in events.iter() {
                         if let Event::PointerButton { pos, pressed, button, .. } = ev {
                             if *button != egui::PointerButton::Primary { continue; }
-                            // Priority: if user clicked a handle, treat that as the target
-                            if let Some(rect) = &handle_start_rect {
-                                if rect.contains(*pos) {
-                                    if *pressed {
-                                        self.mouse_dragging = true;
-                                        self.mouse_drag_anchor = Some(self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0));
-                                    } else {
-                                        self.mouse_dragging = false;
-                                    }
-                                    continue;
-                                }
-                            }
-                            if let Some(rect) = &handle_end_rect {
-                                if rect.contains(*pos) {
-                                    if *pressed {
-                                        self.mouse_dragging = true;
-                                        self.mouse_drag_anchor = Some(self.buffer.caret_char_range.as_ref().map(|r| r.end).unwrap_or(0));
-                                    } else {
-                                        self.mouse_dragging = false;
-                                    }
-                                    continue;
-                                }
-                            }
+                            // No special handle hit-testing; fall through to normal logic
                             if !output.response.rect.contains(*pos) { continue; }
 
                             // Prefer the widget-reported cursor_range when available
@@ -658,13 +614,7 @@ impl eframe::App for ReportApp {
                                     }
                                 }
                             }
-                            // Draw draggable handles beneath the widget for selection boundaries
-                            if let Some(hs) = handle_start_rect {
-                                painter.rect_filled(hs, 2.0, egui::Color32::from_rgb(180, 220, 255));
-                            }
-                            if let Some(he) = handle_end_rect {
-                                painter.rect_filled(he, 2.0, egui::Color32::from_rgb(180, 220, 255));
-                            }
+                            // No visible drag handles (selection is shown in-text).
                             // Draw a visible caret as a filled rectangle the width of a character.
                             let caret_height = 18.0_f32;
                             // Use the galley cursor rect width as a best-effort char width; fallback to 8.0
