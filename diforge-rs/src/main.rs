@@ -609,7 +609,16 @@ impl eframe::App for ReportApp {
                                         // substring on newline boundaries and mapping each segment back
                                         // to absolute char indices to query `pos_from_cursor`.
                                         let report = &self.buffer.report;
-                                        let sel = report.chars().skip(s).take(e_display.saturating_sub(s)).collect::<String>();
+                                        // Avoid drawing a trailing empty segment when the selection
+                                        // ends exactly at a newline in VisualLine mode; that
+                                        // would produce a caret-width highlight on the next line.
+                                        let mut draw_end = e_display;
+                                        if self.vim_mode == VimMode::VisualLine && e_display > s {
+                                            if report.chars().nth(e_display.saturating_sub(1)) == Some('\n') {
+                                                draw_end = e_display.saturating_sub(1);
+                                            }
+                                        }
+                                        let sel = report.chars().skip(s).take(draw_end.saturating_sub(s)).collect::<String>();
                                         let mut offset = 0usize;
                                         let mut abs_index = s;
                                         for (i, line) in sel.split('\n').enumerate() {
@@ -653,7 +662,7 @@ impl eframe::App for ReportApp {
                                             // advance absolute index past this line and the newline (if present)
                                             abs_index = line_end + 1; // skip the newline; safe even if at end because we'll not use abs_index further
                                             offset += line_len + 1;
-                                            if abs_index > e_display { break; }
+                                            if abs_index > draw_end { break; }
                                         }
                                     }
                                 }
