@@ -196,6 +196,52 @@ impl ReportApp {
         }
     }
 
+    // Prepare the template body for insertion according to template settings
+    fn prepare_body_for_insertion(&self, t: &templates::Template, mut body: String) -> String {
+        // If the template explicitly allows inline insertion, return as-is
+        if t.insert_inline {
+            return body;
+        }
+
+        // Determine caret position
+        let pos = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or_else(|| self.buffer.report.chars().count());
+
+        // Helper to peek character at index
+        let ch_at = |s: &String, idx: usize| -> Option<char> {
+            s.chars().nth(idx)
+        };
+
+        // Ensure there is a newline before if required
+        if t.ensure_surrounding_newlines {
+            let need_prefix = if pos == 0 {
+                false
+            } else {
+                match ch_at(&self.buffer.report, pos.saturating_sub(1)) {
+                    Some('\n') => false,
+                    _ => true,
+                }
+            };
+            if need_prefix {
+                body = format!("\n{}", body);
+            }
+
+            // Ensure there's a newline after insertion
+            let after_char = ch_at(&self.buffer.report, pos);
+            let need_suffix = match after_char {
+                Some('\n') => false,
+                None => false,
+                _ => true,
+            };
+            if need_suffix {
+                if !body.ends_with('\n') {
+                    body.push('\n');
+                }
+            }
+        }
+
+        body
+    }
+
     fn apply_settings(&mut self, s: Settings) {
         self.vim_enabled = s.vim_enabled;
         self.vim_mode = s.vim_mode;
@@ -384,11 +430,8 @@ impl eframe::App for ReportApp {
                                         let t = &self.templates[tmpl_i];
                                         let vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
                                         let rendered = templates::render_template(&t.body, &vars, &self.templates);
-                                        let mut body = rendered.clone();
-                                        if !self.buffer.report.is_empty() && !self.buffer.report.ends_with('\n') && self.buffer.caret_char_range.is_none() {
-                                            body = format!("\n{}", body);
-                                        }
-                                        self.buffer.insert_at_caret(&body);
+                                        let prepared = self.prepare_body_for_insertion(t, rendered);
+                                        self.buffer.insert_at_caret(&prepared);
                                     }
                                 }
                             }
@@ -924,11 +967,8 @@ impl eframe::App for ReportApp {
                                     if ui.small_button("Insert").clicked() {
                                         let vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
                                         let rendered = templates::render_template(&t.body, &vars, &self.templates);
-                                        let mut body = rendered.clone();
-                                        if !self.buffer.report.is_empty() && !self.buffer.report.ends_with('\n') && self.buffer.caret_char_range.is_none() {
-                                            body = format!("\n{}", body);
-                                        }
-                                        self.buffer.insert_at_caret(&body);
+                                        let prepared = self.prepare_body_for_insertion(t, rendered);
+                                        self.buffer.insert_at_caret(&prepared);
                                     }
                                     let selected = self.selected_template.map(|s| s == i).unwrap_or(false);
                                     if ui.selectable_label(selected, title).clicked() {
@@ -964,6 +1004,14 @@ impl eframe::App for ReportApp {
                                     ui.horizontal(|ui| {
                                         ui.label("Modalities:");
                                         ui.monospace(t.modalities.join(", "));
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Insert inline:");
+                                        ui.label(if t.insert_inline { "yes" } else { "no" });
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Ensure surrounding newlines:");
+                                        ui.label(if t.ensure_surrounding_newlines { "yes" } else { "no" });
                                     });
                                     ui.label("Body preview:");
                                     let mut preview = t.body.clone();

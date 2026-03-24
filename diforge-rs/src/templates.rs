@@ -13,7 +13,17 @@ pub struct Template {
     pub modalities: Vec<String>,
     #[serde(default)]
     pub body: String,
+    #[serde(default)]
+    /// When true, allow inserting this template in the middle of a line without
+    /// forcing surrounding newlines.
+    pub insert_inline: bool,
+    #[serde(default = "default_true")]
+    /// When true, ensure there is a blank line before and after the inserted
+    /// template body when not inserting inline.
+    pub ensure_surrounding_newlines: bool,
 }
+
+fn default_true() -> bool { true }
 
 impl Template {
     pub fn display_title(&self) -> String {
@@ -63,11 +73,13 @@ pub fn load_templates() -> Vec<Template> {
                                     }
                                     Err(_) => {
                                         out.push(Template {
-                                            id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()),
-                                            title: None,
-                                            applicable_codes: Vec::new(),
-                                            modalities: Vec::new(),
-                                            body: txt,
+                                                id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()),
+                                                title: None,
+                                                applicable_codes: Vec::new(),
+                                                modalities: Vec::new(),
+                                                body: txt,
+                                                insert_inline: false,
+                                                ensure_surrounding_newlines: true,
                                         });
                                     }
                                 }
@@ -86,6 +98,8 @@ pub fn load_templates() -> Vec<Template> {
             applicable_codes: Vec::new(),
             modalities: Vec::new(),
             body: "Clinical details: \n\nImpression: \n".to_string(),
+            insert_inline: false,
+            ensure_surrounding_newlines: true,
         });
         out.push(Template {
             id: Some("default2".to_string()),
@@ -93,6 +107,8 @@ pub fn load_templates() -> Vec<Template> {
             applicable_codes: Vec::new(),
             modalities: Vec::new(),
             body: "History: \nTechnique: \nFindings: \nImpression: \n".to_string(),
+            insert_inline: false,
+            ensure_surrounding_newlines: true,
         });
     }
     out
