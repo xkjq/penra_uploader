@@ -4,6 +4,7 @@ use crossbeam_channel::{unbounded, Receiver};
 use anyhow::Result;
 use serde_json::Value;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 mod speech;
@@ -41,6 +42,10 @@ struct Settings {
     overlay_y: i32,
     overlay_w: i32,
     overlay_h: i32,
+    // per-user overrides for template variables: template_key -> (var -> value)
+    user_template_vars: HashMap<String, HashMap<String, String>>,
+    // centralized global variables that apply to all templates unless overridden
+    global_vars: HashMap<String, String>,
 }
 
 fn settings_path() -> PathBuf {
@@ -80,6 +85,7 @@ fn save_settings(s: &Settings) -> Result<()> {
     Ok(())
 }
 
+
 struct ReportApp {
     buffer: vim::ReportBuffer,
     templates: Vec<templates::Template>,
@@ -98,6 +104,17 @@ struct ReportApp {
     show_template_editor: bool,
     editing_template: Option<templates::Template>,
     editing_index: Option<usize>,
+    // per-user template variable overrides (runtime copy of Settings.user_template_vars)
+    user_template_vars: HashMap<String, HashMap<String, String>>,
+    // showing edit-vars dialog: template_key (text stored in edit_vars_text)
+    show_edit_vars_dialog: Option<String>,
+    edit_vars_text: String,
+    // centralized global vars state
+    global_vars: HashMap<String, String>,
+    show_global_vars_dialog: bool,
+    global_vars_text: String,
+    global_vars_dirty: bool,
+    user_template_vars_dirty: bool,
     attach_requested: bool,
     // overlay position (for helper)
     overlay_x: i32,
@@ -164,6 +181,14 @@ impl Default for ReportApp {
             mouse_dragging: false,
             mouse_drag_anchor: None,
             vim_count: None,
+            user_template_vars: HashMap::new(),
+            show_edit_vars_dialog: None,
+            edit_vars_text: String::new(),
+            user_template_vars_dirty: false,
+            global_vars: HashMap::new(),
+            show_global_vars_dialog: false,
+            global_vars_text: String::new(),
+            global_vars_dirty: false,
         };
 
         // Load persisted settings (if any) and apply
@@ -193,6 +218,8 @@ impl ReportApp {
             overlay_y: self.overlay_y,
             overlay_w: self.overlay_w,
             overlay_h: self.overlay_h,
+            user_template_vars: self.user_template_vars.clone(),
+            global_vars: self.global_vars.clone(),
         }
     }
 
@@ -203,9 +230,21 @@ impl ReportApp {
         // block insertion) into a single undo step so Undo/Redo treats it
         // atomically.
         self.buffer.start_undo_group();
-        // start with per-template defaults, then override with any caller vars
+        // start with per-template defaults
         let mut vars: std::collections::HashMap<String, String> = t.vars.clone();
-        // (future: populate vars from UI prompts)
+        // overlay user overrides from settings (per-user saved values)
+        let key = t.id.clone().unwrap_or_else(|| t.title.clone().unwrap_or_else(|| t.display_title()));
+        if let Some(user_map) = self.user_template_vars.get(&key) {
+            for (k, v) in user_map.iter() {
+                vars.insert(k.clone(), v.clone());
+            }
+        }
+        // finally, fill missing keys from centralized global vars so users
+        // only need to set common values once
+        for (k, v) in self.global_vars.iter() {
+            vars.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        // (future) overlay per-insertion overrides here
         let rendered = templates::render_template(&t.body, &vars, &self.templates);
 
         if t.insert_inline {
@@ -260,6 +299,8 @@ impl ReportApp {
         self.overlay_y = s.overlay_y;
         self.overlay_w = s.overlay_w;
         self.overlay_h = s.overlay_h;
+        self.user_template_vars = s.user_template_vars;
+        self.global_vars = s.global_vars;
     }
 }
 
@@ -910,6 +951,14 @@ impl eframe::App for ReportApp {
                 ui.allocate_ui_at_rect(right_rect, |ui| {
                     ui.vertical(|ui| {
                         ui.heading("Templates");
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Global Vars").clicked() {
+                                // populate edit buffer from current global_vars
+                                let txt = self.global_vars.iter().map(|(k,v)| format!("{}: {}", k, v)).collect::<Vec<_>>().join("\n");
+                                self.global_vars_text = txt;
+                                self.show_global_vars_dialog = true;
+                            }
+                        });
                         ui.separator();
 
                         ui.horizontal(|ui| {
@@ -982,6 +1031,13 @@ impl eframe::App for ReportApp {
                                     if ui.small_button("Insert").clicked() {
                                         self.insert_template_at_caret(t);
                                     }
+                                    if ui.small_button("Vars").clicked() {
+                                        let key = t.id.clone().unwrap_or_else(|| t.title.clone().unwrap_or_else(|| t.display_title()));
+                                        let existing = self.user_template_vars.get(&key).cloned().unwrap_or_else(HashMap::new);
+                                        let vars_text = existing.into_iter().map(|(k,v)| format!("{}: {}", k, v)).collect::<Vec<_>>().join("\n");
+                                        self.edit_vars_text = vars_text;
+                                        self.show_edit_vars_dialog = Some(key);
+                                    }
                                     let selected = self.selected_template.map(|s| s == i).unwrap_or(false);
                                     if ui.selectable_label(selected, title).clicked() {
                                         if selected {
@@ -1028,12 +1084,94 @@ impl eframe::App for ReportApp {
                                     ui.label("Body preview:");
                                     let mut preview = t.body.clone();
                                     ui.add(egui::TextEdit::multiline(&mut preview).desired_rows(8).font(egui::TextStyle::Monospace).interactive(false));
+                                    ui.horizontal(|ui| {
+                                        if ui.button("Edit vars").clicked() {
+                                            let key = t.id.clone().unwrap_or_else(|| t.title.clone().unwrap_or_else(|| t.display_title()));
+                                            let existing = self.user_template_vars.get(&key).cloned().unwrap_or_else(HashMap::new);
+                                            let vars_text = existing.into_iter().map(|(k,v)| format!("{}: {}", k, v)).collect::<Vec<_>>().join("\n");
+                                            self.edit_vars_text = vars_text;
+                                            self.show_edit_vars_dialog = Some(key);
+                                        }
+                                    });
                                 });
                             }
                         }
                     });
                 });
             }
+
+            // Edit-vars dialog (per-user overrides)
+            if let Some(key) = self.show_edit_vars_dialog.clone() {
+                let mut open = true;
+                let txt = &mut self.edit_vars_text;
+                egui::Window::new("Edit template variables").open(&mut open).show(ctx, |ui| {
+                    ui.label(format!("Template: {}", key));
+                    ui.label("Enter one key: value per line:");
+                    ui.add(egui::TextEdit::multiline(txt).desired_rows(10));
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            // parse into map
+                            let mut m = HashMap::new();
+                            for line in txt.lines() {
+                                if let Some(idx) = line.find(':') {
+                                    let k = line[..idx].trim();
+                                    let v = line[idx+1..].trim();
+                                    if !k.is_empty() {
+                                        m.insert(k.to_string(), v.to_string());
+                                    }
+                                }
+                            }
+                            self.user_template_vars.insert(key.clone(), m);
+                            self.user_template_vars_dirty = true;
+                            self.show_edit_vars_dialog = None;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.show_edit_vars_dialog = None;
+                        }
+                    });
+                });
+                if !open { self.show_edit_vars_dialog = None; }
+                // persist settings after dialog closed if dirty
+                if self.user_template_vars_dirty {
+                    let _ = save_settings(&self.to_settings());
+                    self.user_template_vars_dirty = false;
+                }
+            }
+
+                // Global variables dialog (centralised vars)
+                if self.show_global_vars_dialog {
+                    let mut open = true;
+                    let txt = &mut self.global_vars_text;
+                    egui::Window::new("Global Variables").open(&mut open).show(ctx, |ui| {
+                        ui.label("Enter one key: value per line:");
+                        ui.add(egui::TextEdit::multiline(txt).desired_rows(12));
+                        ui.horizontal(|ui| {
+                            if ui.button("Save").clicked() {
+                                let mut m = HashMap::new();
+                                for line in txt.lines() {
+                                    if let Some(idx) = line.find(':') {
+                                        let k = line[..idx].trim();
+                                        let v = line[idx+1..].trim();
+                                        if !k.is_empty() {
+                                            m.insert(k.to_string(), v.to_string());
+                                        }
+                                    }
+                                }
+                                self.global_vars = m;
+                                self.global_vars_dirty = true;
+                                self.show_global_vars_dialog = false;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.show_global_vars_dialog = false;
+                            }
+                        });
+                    });
+                    if !open { self.show_global_vars_dialog = false; }
+                    if self.global_vars_dirty {
+                        let _ = save_settings(&self.to_settings());
+                        self.global_vars_dirty = false;
+                    }
+                }
 
             // Template editor window
             if self.show_template_editor {
