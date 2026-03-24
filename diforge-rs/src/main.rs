@@ -884,16 +884,30 @@ impl eframe::App for ReportApp {
 
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             for (i, t) in templates_list.iter().enumerate() {
-                                if !templates::matches_template(t, &nicips, None) {
-                                    continue;
-                                }
-                                let title = t.display_title();
-                                if !self.template_search.is_empty()
-                                    && !title.to_lowercase().contains(&self.template_search.to_lowercase())
-                                    && !t.body.to_lowercase().contains(&self.template_search.to_lowercase())
-                                {
-                                    continue;
-                                }
+                                    // Only apply NICIP filtering when the user supplied NICIP codes.
+                                    if !nicips.is_empty() {
+                                        // If template has no applicable_codes it's global -> show it.
+                                        if !t.applicable_codes.is_empty() {
+                                            // require intersection
+                                            let mut matched = false;
+                                            for sc in &nicips {
+                                                if t.applicable_codes.iter().any(|ac| ac.eq_ignore_ascii_case(sc)) {
+                                                    matched = true;
+                                                    break;
+                                                }
+                                            }
+                                            if !matched {
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    let title = t.display_title();
+                                    if !self.template_search.is_empty()
+                                        && !title.to_lowercase().contains(&self.template_search.to_lowercase())
+                                        && !t.body.to_lowercase().contains(&self.template_search.to_lowercase())
+                                    {
+                                        continue;
+                                    }
                                 ui.horizontal(|ui| {
                                     if ui.small_button("Insert").clicked() {
                                         let vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();

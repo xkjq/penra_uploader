@@ -37,22 +37,61 @@ fn find_templates_root() -> Option<PathBuf> {
     }
     None
 }
+fn find_all_templates_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(mut dir) = std::env::current_dir() {
+        loop {
+            let candidate = dir.join("templates");
+            if candidate.exists() {
+                roots.push(candidate);
+            }
+            if !dir.pop() { break; }
+        }
+    }
+    roots
+}
 
 fn load_templates() -> Vec<Template> {
     let mut out = Vec::new();
-    let root = find_templates_root().unwrap_or_else(|| PathBuf::from("templates"));
-    let project_dir = root.join("project");
-    let user_dir = root.join("user");
-    for dir in [project_dir, user_dir] {
-        if dir.exists() {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for e in entries.flatten() {
-                    let path = e.path();
-                    if path.is_file() {
-                        if let Ok(txt) = fs::read_to_string(&path) {
-                            match serde_yaml::from_str::<Template>(&txt) {
-                                Ok(t) => out.push(t),
-                                Err(_) => out.push(Template { id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()), title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: txt }),
+    let roots = find_all_templates_roots();
+    if roots.is_empty() {
+        eprintln!("[template_editor] no templates/ directory found while walking parents; using ./templates");
+        let root = PathBuf::from("templates");
+        for dir in [root.join("project"), root.join("user")] {
+            if dir.exists() {
+                if let Ok(entries) = fs::read_dir(dir) {
+                    for e in entries.flatten() {
+                        let path = e.path();
+                        if path.is_file() {
+                            if let Ok(txt) = fs::read_to_string(&path) {
+                                match serde_yaml::from_str::<Template>(&txt) {
+                                    Ok(t) => out.push(t),
+                                    Err(_) => out.push(Template { id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()), title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: txt }),
+                                }
+                                eprintln!("[template_editor] loaded: {}", path.display());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        for root in roots.iter() {
+            eprintln!("[template_editor] scanning root: {}", root.display());
+            for dir in [root.join("project"), root.join("user")] {
+                eprintln!("[template_editor] scanning: {}", dir.display());
+                if dir.exists() {
+                    if let Ok(entries) = fs::read_dir(dir) {
+                        for e in entries.flatten() {
+                            let path = e.path();
+                            if path.is_file() {
+                                if let Ok(txt) = fs::read_to_string(&path) {
+                                    match serde_yaml::from_str::<Template>(&txt) {
+                                        Ok(t) => out.push(t),
+                                        Err(_) => out.push(Template { id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()), title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: txt }),
+                                    }
+                                    eprintln!("[template_editor] loaded: {}", path.display());
+                                }
                             }
                         }
                     }
@@ -60,6 +99,7 @@ fn load_templates() -> Vec<Template> {
             }
         }
     }
+    eprintln!("[template_editor] total templates: {}", out.len());
     if out.is_empty() {
         out.push(Template { id: Some("default1".to_string()), title: Some("Default Clinical".to_string()), applicable_codes: Vec::new(), modalities: Vec::new(), body: "Clinical details:\n\nImpression:\n".to_string() });
     }
@@ -168,9 +208,27 @@ impl eframe::App for AppState {
                     let t = &self.templates[i];
                     let title = t.display_title();
                     let selected = self.selected.map(|s| s == i).unwrap_or(false);
-                    if ui.selectable_label(selected, title).clicked() {
-                        if selected { self.selected = None; } else { self.selected = Some(i); }
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(selected, title.clone()).clicked() {
+                            if selected { self.selected = None; } else { self.selected = Some(i); }
+                        }
+                        // show metadata inline
+                        let id = t.id.as_deref().unwrap_or("");
+                        if !id.is_empty() {
+                            ui.label(format!("id: {}", id));
+                        }
+                        if !t.modalities.is_empty() {
+                            ui.label(format!("mods: {}", t.modalities.join(",")));
+                        }
+                        if !t.applicable_codes.is_empty() {
+                            ui.label(format!("codes: {}", t.applicable_codes.join(",")));
+                        }
+                    });
+                    // show a short preview (first non-empty line)
+                    if let Some(first) = t.body.lines().find(|l| !l.trim().is_empty()) {
+                        ui.label(format!("  ↳ {}", first.trim()));
                     }
+                    ui.separator();
                 }
             });
 
