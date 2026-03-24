@@ -441,39 +441,44 @@ impl eframe::App for AppState {
             ui.separator();
             egui::ScrollArea::vertical().show(ui, |ui| {
                 egui::CollapsingHeader::new("Login").default_open(self.login_open).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Username:");
-                    ui.text_edit_singleline(&mut self.username);
-                });
-                // password field: pressing Enter should submit
-                ui.horizontal(|ui| {
-                    ui.label("Password:");
-                    let pw_resp = ui.add(egui::widgets::TextEdit::singleline(&mut self.password).password(true));
-                    if pw_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        let user = self.username.clone();
-                        let pass = self.password.clone();
-                        self.spawn_login(user, pass);
-                    }
-                });
-
-                if ui.button("Login").clicked() {
-                    let user = self.username.clone();
-                    let pass = self.password.clone();
-                    self.spawn_login(user, pass);
-                }
-
-                if ui.button("Logout").clicked() {
-                    if upload::clear_api_token() {
-                        self.logged_in_user = None;
-                        self.login_open = true;
-                        self.last_msg = "Logged out".to_string();
+                    let logged_in = self.logged_in_user.clone();
+                    if let Some(name) = logged_in {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Logged in as: {}", name));
+                            ui.add_space(8.0);
+                            if ui.button("Logout").clicked() {
+                                if upload::clear_api_token() {
+                                    self.logged_in_user = None;
+                                    self.login_open = true;
+                                    self.last_msg = "Logged out".to_string();
+                                } else {
+                                    self.last_msg = "Failed to clear token".to_string();
+                                }
+                            }
+                        });
                     } else {
-                        self.last_msg = "Failed to clear token".to_string();
-                    }
-                }
+                        ui.horizontal(|ui| {
+                            ui.label("Username:");
+                            ui.text_edit_singleline(&mut self.username);
+                        });
+                        // password field: pressing Enter should submit
+                        ui.horizontal(|ui| {
+                            ui.label("Password:");
+                            let pw_resp = ui.add(egui::widgets::TextEdit::singleline(&mut self.password).password(true));
+                            if pw_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                let user = self.username.clone();
+                                let pass = self.password.clone();
+                                self.spawn_login(user, pass);
+                            }
+                        });
 
-                ui.label(format!("Logged in: {}", self.logged_in_user.clone().unwrap_or_else(|| "no".to_string())));
-            });
+                        if ui.button("Login").clicked() {
+                            let user = self.username.clone();
+                            let pass = self.password.clone();
+                            self.spawn_login(user, pass);
+                        }
+                    }
+                });
 
             ui.collapsing("Processing", |ui| {
                 if let Some(step) = &self.processing_step {
