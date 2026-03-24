@@ -227,6 +227,8 @@ struct AppState {
     metadata_select_mode: bool,
     log_window_open: bool,
     about_open: bool,
+    // cached logo texture for About window
+    logo_tex: Option<egui::TextureHandle>,
     // import dialog state
     import_dialog_open: bool,
     import_src: Option<PathBuf>,
@@ -311,6 +313,7 @@ impl Default for AppState {
             exit_at: None,
             toasts: Vec::new(),
             log_level: std::env::var("RUST_LOG").ok().or_else(|| upload::load_log_level()).unwrap_or_else(|| "info".to_string()),
+            logo_tex: None,
         }
     }
 }
@@ -582,7 +585,16 @@ impl eframe::App for AppState {
             ui.horizontal(|ui| {
                 ui.heading("Uploader (Rust)");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("About").clicked() { self.about_open = !self.about_open; }
+                    if ui.small_button("About").clicked() {
+                        self.about_open = !self.about_open;
+                        if self.about_open {
+                            self.last_msg = "About opened".to_string();
+                            upload::log_rpc("About opened");
+                        } else {
+                            self.last_msg = "About closed".to_string();
+                            upload::log_rpc("About closed");
+                        }
+                    }
                     if let Some(step) = &self.processing_step {
                         let pct = (self.processing_progress * 100.0).clamp(0.0, 100.0);
                         let label = format!("{} — {:.0}%", step, pct);
@@ -1404,7 +1416,11 @@ impl eframe::App for AppState {
 
             // About window (includes summary info and the application log)
             if self.about_open {
-                egui::Window::new("About Uploader").open(&mut self.about_open).show(ctx, |ui| {
+                egui::Window::new("About Uploader")
+                    .open(&mut self.about_open)
+                    .default_width(600.0)
+                    .resizable(true)
+                    .show(ctx, |ui| {
                     ui.heading("Uploader (Rust)");
                     ui.label(format!("Version: {}", env!("CARGO_PKG_VERSION")));
                     ui.label(format!("Base URL: {}", upload::base_site_url()));
@@ -1507,6 +1523,86 @@ impl eframe::App for AppState {
             }
             });
         });
+
+        // About window rendered after central panel to ensure it's not hidden by layout
+        if self.about_open {
+            // load logo texture once when needed
+            if self.logo_tex.is_none() {
+                if let Ok(img) = image::load_from_memory(include_bytes!("../assets/generated/uploade-rs_logo_128.png")) {
+                    let img = img.to_rgba8();
+                    let size = [img.width() as usize, img.height() as usize];
+                    let pixels: Vec<egui::Color32> = img
+                        .chunks(4)
+                        .map(|px| egui::Color32::from_rgba_unmultiplied(px[0], px[1], px[2], px[3]))
+                        .collect();
+                    let mut raw: Vec<u8> = Vec::with_capacity(pixels.len() * 4);
+                    for c in &pixels {
+                        raw.push(c.r()); raw.push(c.g()); raw.push(c.b()); raw.push(c.a());
+                    }
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &raw);
+                    let handle = ctx.load_texture("about_logo", color_image, egui::TextureOptions::default());
+                    self.logo_tex = Some(handle);
+                } else {
+                    tracing::warn!("Failed to load about logo image");
+                }
+            }
+
+            egui::Window::new("About Uploader")
+                .open(&mut self.about_open)
+                .anchor(egui::Align2::RIGHT_TOP, egui::Vec2::new(-10.0, 40.0))
+                .default_size(egui::vec2(600.0, 400.0))
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if let Some(tex) = &self.logo_tex {
+                            let sz = egui::vec2(96.0, 96.0);
+                            ui.image((tex.id(), sz));
+                        }
+                        ui.vertical(|ui| {
+                            ui.heading("Uploader (Rust)");
+                            ui.label(format!("Version: {}", env!("CARGO_PKG_VERSION")));
+                            ui.label(format!("Base URL: {}", upload::base_site_url()));
+                            ui.label(format!("Logged in: {}", self.logged_in_user.as_deref().unwrap_or("(not logged in)")));
+                        });
+                    });
+                    ui.separator();
+                    ui.label("Application logs:");
+                    let p = upload::log_file_path();
+                    let contents = std::fs::read_to_string(&p).unwrap_or_else(|_| "(no logs)".to_string());
+                    // expand BODY_FILE entries similar to the Logs window
+                    let mut display = String::new();
+                    for line in contents.lines() {
+                        display.push_str(line);
+                        display.push('\n');
+                        if let Some(idx) = line.find("BODY_FILE:") {
+                            let path = line[idx+"BODY_FILE:".len()..].trim();
+                            if !path.is_empty() {
+                                if let Ok(body) = std::fs::read_to_string(path) {
+                                    display.push_str("---- BODY START ----\n");
+                                    display.push_str(&body);
+                                    if !body.ends_with('\n') { display.push('\n'); }
+                                    display.push_str("---- BODY END ----\n");
+                                } else {
+                                    display.push_str("(failed to read body file)\n");
+                                }
+                            }
+                        }
+                    }
+                    let mut txt = display;
+                    egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                        ui.add(egui::TextEdit::multiline(&mut txt).desired_rows(10).desired_width(ui.available_width()));
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Refresh").clicked() {
+                            self.last_msg = "Logs refreshed".to_string();
+                        }
+                        if ui.button("Clear").clicked() {
+                            let _ = std::fs::write(p.clone(), "");
+                            self.last_msg = "Logs cleared".to_string();
+                        }
+                    });
+                });
+        }
 
         // Render toasts in a top-right area and drop expired ones.
         let now = Instant::now();
