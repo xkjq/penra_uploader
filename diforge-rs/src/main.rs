@@ -203,7 +203,9 @@ impl ReportApp {
         // block insertion) into a single undo step so Undo/Redo treats it
         // atomically.
         self.buffer.start_undo_group();
-        let vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        // start with per-template defaults, then override with any caller vars
+        let mut vars: std::collections::HashMap<String, String> = t.vars.clone();
+        // (future: populate vars from UI prompts)
         let rendered = templates::render_template(&t.body, &vars, &self.templates);
 
         if t.insert_inline {

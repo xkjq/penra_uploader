@@ -15,6 +15,9 @@ pub struct Template {
     #[serde(default)]
     pub body: String,
     #[serde(default)]
+    /// Per-template variable defaults (e.g. name: Dr Test)
+    pub vars: std::collections::HashMap<String, String>,
+    #[serde(default)]
     /// When true, allow inserting this template in the middle of a line without
     /// forcing surrounding newlines.
     pub insert_inline: bool,
@@ -49,6 +52,7 @@ fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
 /// followed by a single space. Returns the updated insertion char index.
 pub fn ensure_finish_before(report: &mut String, pos: usize) -> usize {
     if pos == 0 { return pos; }
+    let orig_total_chars = report.chars().count();
     // find last non-whitespace char before pos
     let mut last = None;
     for i in (0..pos).rev() {
@@ -58,18 +62,52 @@ pub fn ensure_finish_before(report: &mut String, pos: usize) -> usize {
     }
     let mut new_pos = pos;
     if let Some((idx, ch)) = last {
-        if !".!?".contains(ch) {
-            // insert a period at `pos`
-            let byte_pos = char_to_byte_idx(report, pos);
-            report.insert_str(byte_pos, ".");
-            new_pos += 1;
+        // remove any whitespace between the last non-space char and the insertion pos
+        let start_ws_char = idx + 1;
+        let start_ws_byte = char_to_byte_idx(report, start_ws_char);
+        let end_ws_byte = char_to_byte_idx(report, pos);
+        if end_ws_byte > start_ws_byte {
+            report.replace_range(start_ws_byte..end_ws_byte, "");
         }
-        // ensure a single space after the sentence-ending punctuation
-        let byte_pos = char_to_byte_idx(report, new_pos);
-        let next_char = report.chars().nth(new_pos);
-        if next_char != Some(' ') {
-            report.insert_str(byte_pos, " ");
-            new_pos += 1;
+
+        // insertion point is immediately after the last non-space char
+        let ins_char = start_ws_char;
+        let mut ins_byte = char_to_byte_idx(report, ins_char);
+
+        // if previous char is not sentence-ending punctuation, insert a period
+        if !".!?".contains(ch) {
+            report.insert_str(ins_byte, ".");
+            // advance insertion byte/index to be after the period
+            ins_byte = char_to_byte_idx(report, ins_char + 1);
+        }
+
+        // collapse any whitespace after the punctuation to a single ASCII space
+        // find char-range of whitespace that originally followed the insertion point
+        let mut ws_end_char = ins_char + 1;
+        while let Some(c) = report.chars().nth(ws_end_char) {
+            if c.is_whitespace() { ws_end_char += 1; } else { break; }
+        }
+        let ws_end_byte = char_to_byte_idx(report, ws_end_char);
+        // replace whatever whitespace exists with a single ASCII space
+        report.replace_range(ins_byte..ws_end_byte, " ");
+
+        // If there originally was whitespace between the last word and the caret,
+        // preserve a slot after the template by inserting an extra space so the
+        // template can be placed between two spaces. This keeps the original
+        // separation semantics.
+        let had_ws_original = pos > start_ws_char;
+        if had_ws_original {
+            let extra_space_byte = char_to_byte_idx(report, ins_char + 2);
+            report.insert_str(extra_space_byte, " ");
+        }
+
+        // place caret after the first space (i.e. between the spaces when present)
+        // use original total chars (before we mutated the string) to decide EOF behavior
+        if ins_char >= orig_total_chars {
+            // insertion at end-of-string: we appended a single space, caret after that
+            new_pos = ins_char + 1;
+        } else {
+            new_pos = ins_char + 2;
         }
     }
     new_pos
@@ -79,15 +117,28 @@ pub fn ensure_finish_before(report: &mut String, pos: usize) -> usize {
 /// following text is spaced and capitalized appropriately.
 pub fn ensure_finish_after(report: &mut String, pos: usize, inserted_len: usize) {
     let check_pos = pos + inserted_len;
-    // ensure a single space between inserted text and following text
-    let byte_check = char_to_byte_idx(report, check_pos);
-    let next_char = report.chars().nth(check_pos);
-    if next_char != Some(' ') && next_char.is_some() {
-        report.insert_str(byte_check, " ");
+
+    // Collapse any whitespace immediately after the inserted text to a single ASCII space
+    let mut ws_start = check_pos;
+    let mut ws_end = check_pos;
+    while let Some(c) = report.chars().nth(ws_end) {
+        if c.is_whitespace() { ws_end += 1; } else { break; }
     }
-    // find first non-space char after insertion
+    if ws_end > ws_start {
+        let start = char_to_byte_idx(report, ws_start);
+        let end = char_to_byte_idx(report, ws_end);
+        report.replace_range(start..end, " ");
+    } else {
+        // if there's a non-space immediately after inserted text, insert a space
+        if let Some(_) = report.chars().nth(check_pos) {
+            let b = char_to_byte_idx(report, check_pos);
+            report.insert_str(b, " ");
+        }
+    }
+
+    // find first non-space char after insertion (after our collapsed space)
     let mut first_nonspace = None;
-    let mut i = check_pos;
+    let mut i = check_pos + 1; // skip the single space we ensured
     while let Some(c) = report.chars().nth(i) {
         if !c.is_whitespace() { first_nonspace = Some(i); break; }
         i += 1;
@@ -158,6 +209,7 @@ pub fn load_templates() -> Vec<Template> {
                                                 applicable_codes: Vec::new(),
                                                 modalities: Vec::new(),
                                                 body: txt,
+                                                vars: HashMap::new(),
                                                 insert_inline: false,
                                                 ensure_surrounding_newlines: true,
                                                 inline_finish: InlineFinish::None,
@@ -179,6 +231,7 @@ pub fn load_templates() -> Vec<Template> {
             applicable_codes: Vec::new(),
             modalities: Vec::new(),
             body: "Clinical details: \n\nImpression: \n".to_string(),
+            vars: HashMap::new(),
             insert_inline: false,
             ensure_surrounding_newlines: true,
             inline_finish: InlineFinish::None,
@@ -189,6 +242,7 @@ pub fn load_templates() -> Vec<Template> {
             applicable_codes: Vec::new(),
             modalities: Vec::new(),
             body: "History: \nTechnique: \nFindings: \nImpression: \n".to_string(),
+            vars: HashMap::new(),
             insert_inline: false,
             ensure_surrounding_newlines: true,
             inline_finish: InlineFinish::None,
@@ -228,6 +282,8 @@ pub fn render_template(template: &str, vars: &HashMap<String, String>, all_templ
     // Inject automatic variables (date/time) into a local vars map so templates
     // can reference `{{date}}` and `{{time}}` without the caller providing them.
     let mut vars_with_defaults = vars.clone();
+    // If caller passed a special entry `_template_defaults` this will be ignored here;
+    // callers should merge per-template defaults before calling `render_template`.
     vars_with_defaults.entry("date".to_string()).or_insert_with(|| Local::now().format("%Y-%m-%d").to_string());
     vars_with_defaults.entry("time".to_string()).or_insert_with(|| Local::now().format("%H:%M").to_string());
 
@@ -331,8 +387,8 @@ mod tests {
     #[test]
     fn test_render_template_includes_and_vars() {
         let mut all = Vec::new();
-        all.push(Template { id: Some("sig".to_string()), title: Some("Signature".to_string()), applicable_codes: Vec::new(), modalities: Vec::new(), body: "--\n{{name}}\n".to_string(), insert_inline: true, ensure_surrounding_newlines: false, inline_finish: InlineFinish::None });
-        all.push(Template { id: Some("main".to_string()), title: Some("Main".to_string()), applicable_codes: Vec::new(), modalities: Vec::new(), body: "Findings... {{> sig }} Report by {{author|unknown}}.".to_string(), insert_inline: true, ensure_surrounding_newlines: false, inline_finish: InlineFinish::None });
+        all.push(Template { id: Some("sig".to_string()), title: Some("Signature".to_string()), applicable_codes: Vec::new(), modalities: Vec::new(), body: "--\n{{name}}\n".to_string(), vars: HashMap::new(), insert_inline: true, ensure_surrounding_newlines: false, inline_finish: InlineFinish::None });
+        all.push(Template { id: Some("main".to_string()), title: Some("Main".to_string()), applicable_codes: Vec::new(), modalities: Vec::new(), body: "Findings... {{> sig }} Report by {{author|unknown}}.".to_string(), vars: HashMap::new(), insert_inline: true, ensure_surrounding_newlines: false, inline_finish: InlineFinish::None });
 
         let mut vars = HashMap::new();
         vars.insert("name".to_string(), "Dr Test".to_string());
@@ -456,6 +512,26 @@ mod tests {
         }
         buf.insert_at_caret(&body);
         assert!(buf.report.contains("Line two\nInserted block\n") || buf.report.contains("Line two\n\nInserted block\n"));
+    }
+
+    #[test]
+    fn test_inline_pre_example_hello_test_you() {
+        use crate::vim::ReportBuffer;
+        // initial buffer "hello you" with caret before 'you'
+        let mut buf = ReportBuffer::new();
+        buf.report = "hello you".to_string();
+        // find char index of 'you' start
+        let pos = buf.report.find("you").unwrap();
+        let char_pos = buf.report[..pos].chars().count();
+
+        // run pre-finish to normalize and place caret
+        let new_pos = ensure_finish_before(&mut buf.report, char_pos);
+        // set caret and insert template text
+        buf.set_caret_pos(new_pos);
+        buf.insert_at_caret("test");
+
+        // after insertion we expect: "hello. test you"
+        assert_eq!(buf.report, "hello. test you");
     }
 }
 

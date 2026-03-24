@@ -1,5 +1,6 @@
 use eframe::egui;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,6 +14,8 @@ struct Template {
     pub modalities: Vec<String>,
     #[serde(default)]
     pub body: String,
+    #[serde(default)]
+    pub vars: HashMap<String, String>,
     #[serde(default)]
     pub insert_inline: bool,
     #[serde(default = "default_true")]
@@ -86,7 +89,7 @@ fn load_templates() -> Vec<Template> {
                             if let Ok(txt) = fs::read_to_string(&path) {
                                 match serde_yaml::from_str::<Template>(&txt) {
                                     Ok(t) => out.push(t),
-                                    Err(_) => out.push(Template { id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()), title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: txt, insert_inline: false, ensure_surrounding_newlines: true, inline_finish: InlineFinish::None }),
+                                    Err(_) => out.push(Template { id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()), title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: txt, vars: HashMap::new(), insert_inline: false, ensure_surrounding_newlines: true, inline_finish: InlineFinish::None }),
                                 }
                                 eprintln!("[template_editor] loaded: {}", path.display());
                             }
@@ -108,7 +111,7 @@ fn load_templates() -> Vec<Template> {
                                 if let Ok(txt) = fs::read_to_string(&path) {
                                     match serde_yaml::from_str::<Template>(&txt) {
                                         Ok(t) => out.push(t),
-                                        Err(_) => out.push(Template { id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()), title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: txt, insert_inline: false, ensure_surrounding_newlines: true, inline_finish: InlineFinish::None }),
+                                        Err(_) => out.push(Template { id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()), title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: txt, vars: HashMap::new(), insert_inline: false, ensure_surrounding_newlines: true, inline_finish: InlineFinish::None }),
                                     }
                                     eprintln!("[template_editor] loaded: {}", path.display());
                                 }
@@ -121,7 +124,7 @@ fn load_templates() -> Vec<Template> {
     }
     eprintln!("[template_editor] total templates: {}", out.len());
     if out.is_empty() {
-        out.push(Template { id: Some("default1".to_string()), title: Some("Default Clinical".to_string()), applicable_codes: Vec::new(), modalities: Vec::new(), body: "Clinical details:\n\nImpression:\n".to_string(), insert_inline: false, ensure_surrounding_newlines: true, inline_finish: InlineFinish::None });
+        out.push(Template { id: Some("default1".to_string()), title: Some("Default Clinical".to_string()), applicable_codes: Vec::new(), modalities: Vec::new(), body: "Clinical details:\n\nImpression:\n".to_string(), vars: HashMap::new(), insert_inline: false, ensure_surrounding_newlines: true, inline_finish: InlineFinish::None });
     }
     out
 }
@@ -149,7 +152,7 @@ impl eframe::App for AppState {
             ui.heading("Template Editor");
             ui.horizontal(|ui| {
                 if ui.button("New").clicked() {
-                    self.editing = Some(Template { id: None, title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: String::new(), insert_inline: false, ensure_surrounding_newlines: true, inline_finish: InlineFinish::None });
+                    self.editing = Some(Template { id: None, title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: String::new(), vars: HashMap::new(), insert_inline: false, ensure_surrounding_newlines: true, inline_finish: InlineFinish::None });
                     self.show_editor = true;
                 }
                 if ui.button("Edit").clicked() {
@@ -268,6 +271,9 @@ impl eframe::App for AppState {
                         ui.horizontal(|ui| { ui.label("NICIP codes (comma):"); let mut codes = t.applicable_codes.join(","); ui.text_edit_singleline(&mut codes); t.applicable_codes = codes.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); });
                         ui.horizontal(|ui| { ui.label("Modalities (comma):"); let mut mods = t.modalities.join(","); ui.text_edit_singleline(&mut mods); t.modalities = mods.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); });
                         ui.label("Body:"); ui.add(egui::TextEdit::multiline(&mut t.body).desired_rows(12));
+                        // render vars as simple key: value lines
+                        let mut vars_text = t.vars.iter().map(|(k,v)| format!("{}: {}", k, v)).collect::<Vec<_>>().join("\n");
+                        ui.label("Vars (key: value per line):"); ui.add(egui::TextEdit::multiline(&mut vars_text).desired_rows(6));
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut t.insert_inline, "Insert inline");
                             ui.checkbox(&mut t.ensure_surrounding_newlines, "Ensure surrounding newlines");
@@ -281,6 +287,18 @@ impl eframe::App for AppState {
                         });
                         ui.horizontal(|ui| {
                             if ui.button("Save").clicked() {
+                                // parse vars_text into t.vars
+                                let mut newvars: HashMap<String, String> = HashMap::new();
+                                for line in vars_text.lines() {
+                                    if let Some(idx) = line.find(':') {
+                                        let k = line[..idx].trim();
+                                        let v = line[idx+1..].trim();
+                                        if !k.is_empty() {
+                                            newvars.insert(k.to_string(), v.to_string());
+                                        }
+                                    }
+                                }
+                                t.vars = newvars;
                                 let user_dir = Path::new("templates/user"); let _ = fs::create_dir_all(user_dir);
                                 let fname_base = t.id.as_ref().or_else(|| t.title.as_ref()).map(|s| s.clone()).unwrap_or_else(|| format!("template_{}", chrono::Utc::now().timestamp()));
                                 let mut safe = fname_base.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect::<String>(); if safe.is_empty() { safe = format!("template_{}", chrono::Utc::now().timestamp()); }
