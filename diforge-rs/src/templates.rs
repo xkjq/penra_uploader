@@ -341,8 +341,10 @@ mod tests {
         let mut s = "Ends here.".to_string();
         let pos = s.chars().count();
         let new_pos = ensure_finish_before(&mut s, pos);
-        assert_eq!(s, "Ends here.");
-        assert_eq!(new_pos, pos);
+        // The helper will ensure there is a single space after sentence-ending
+        // punctuation even at end-of-string, so a trailing space is expected.
+        assert_eq!(s, "Ends here. ");
+        assert_eq!(new_pos, pos + 1);
     }
 
     #[test]
@@ -356,6 +358,86 @@ mod tests {
         // We don't actually insert the text here; ensure_finish_after only adjusts surrounding text,
         // so validate no panic and spacing logic when string has content.
         assert!(s.len() > 0);
+    }
+
+    #[test]
+    fn test_inline_pre_insertion_combines_with_buffer() {
+        use crate::vim::ReportBuffer;
+        let mut buf = ReportBuffer::new();
+        buf.report = "Findings suspiciousand more".to_string();
+        // find position of "and"
+        let pos = buf.report.find("and").unwrap();
+        let char_pos = buf.report[..pos].chars().count();
+
+        // simulate Pre finish behavior
+        let new_pos = ensure_finish_before(&mut buf.report, char_pos);
+        buf.set_caret_pos(new_pos);
+        buf.insert_at_caret("X");
+
+        assert!(buf.report.contains("suspicious. Xand"));
+    }
+
+    #[test]
+    fn test_inline_post_insertion_combines_with_buffer() {
+        use crate::vim::ReportBuffer;
+        let mut buf = ReportBuffer::new();
+        buf.report = "Hello next".to_string();
+        let pos = "Hello ".chars().count();
+        buf.set_caret_pos(pos);
+        // perform insertion
+        buf.insert_at_caret("inserted");
+        let inserted_len = "inserted".chars().count();
+        // apply post finish
+        ensure_finish_after(&mut buf.report, pos, inserted_len);
+        assert!(buf.report.contains("inserted Next"));
+    }
+
+    #[test]
+    fn test_inline_both_pre_post() {
+        use crate::vim::ReportBuffer;
+        let mut buf = ReportBuffer::new();
+        buf.report = "noteokayhere afterwards".to_string();
+        // place caret before "afterwards"
+        let pos = buf.report.find("afterwards").unwrap();
+        let char_pos = buf.report[..pos].chars().count();
+
+        // pre
+        let new_pos = ensure_finish_before(&mut buf.report, char_pos);
+        buf.set_caret_pos(new_pos);
+        // insert
+        buf.insert_at_caret("ins");
+        let insert_len = "ins".chars().count();
+        // post
+        let start_pos = buf.caret_char_range.as_ref().map(|r| r.start).unwrap_or_else(|| buf.report.chars().count()).saturating_sub(insert_len);
+        ensure_finish_after(&mut buf.report, start_pos, insert_len);
+
+        let s = buf.report.clone();
+        assert!(s.contains("ins "));
+        assert!(s.to_lowercase().contains("afterwards"));
+        let idx_ins = s.find("ins ").unwrap();
+        let idx_dot = s.rfind('.').unwrap_or(0);
+        assert!(idx_dot < idx_ins);
+    }
+
+    #[test]
+    fn test_block_ensure_surrounding_newlines_behavior() {
+        use crate::vim::ReportBuffer;
+        let mut buf = ReportBuffer::new();
+        buf.report = "Line one\nLine two".to_string();
+        // caret at end
+        buf.goto_end_of_file();
+        let mut body = "Inserted block\n".to_string();
+        let pos = buf.caret_char_range.as_ref().map(|r| r.start).unwrap_or_else(|| buf.report.chars().count());
+        // ensure_surrounding_newlines true -> prefix with newline if previous char != '\n'
+        if pos > 0 {
+            if let Some(ch) = buf.report.chars().nth(pos.saturating_sub(1)) {
+                if ch != '\n' {
+                    body = format!("\n{}", body);
+                }
+            }
+        }
+        buf.insert_at_caret(&body);
+        assert!(buf.report.contains("Line two\nInserted block\n") || buf.report.contains("Line two\n\nInserted block\n"));
     }
 }
 

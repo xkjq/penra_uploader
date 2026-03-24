@@ -2,7 +2,7 @@ id: inline_sig
 title: Inline Signature
 applicable_codes: []
 modalities: []
-body: "\n--\n{{name}}\n"
+body: '{{name}}'
 insert_inline: true
 ensure_surrounding_newlines: false
-inline_finish: Post
+inline_finish: Both
