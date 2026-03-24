@@ -15,6 +15,8 @@ use speech::{create_vosk_engine, SpeechEngine};
 use std::ops::Range;
 use egui::text::{CCursor, CCursorRange};
 
+#[cfg(test)]
+mod selection_tests;
 #[derive(PartialEq, Eq, Serialize, Deserialize, Clone, Copy, Debug)]
 enum VimMode {
     Normal,
@@ -54,6 +56,8 @@ fn settings_path() -> PathBuf {
         PathBuf::from("./diforge-settings.json")
     }
 }
+
+// selection tests moved into src/selection_tests.rs
 
 fn load_settings() -> Settings {
     let p = settings_path();
@@ -409,14 +413,14 @@ impl eframe::App for ReportApp {
                                         if let Some(anchor) = self.mouse_drag_anchor.take() {
                                             let cur = best;
                                             if anchor != cur {
-                                                eprintln!("[dbg] mouse drag end anchor={} cur={} -> selection {}..{}", anchor, cur, anchor.min(cur), anchor.max(cur).saturating_add(1));
+                                                eprintln!("[dbg] mouse drag end anchor={} cur={} -> selection {}..{}", anchor, cur, anchor.min(cur), anchor.max(cur));
                                                 if self.vim_enabled {
                                                     self.vim_mode = VimMode::Visual;
                                                     self.visual_anchor = Some(anchor.min(cur));
                                                 }
-                                                // set selection inclusive of final char
+                                                // set canonical selection (end-exclusive)
                                                 let s = anchor.min(cur);
-                                                let e = anchor.max(cur).saturating_add(1).min(self.buffer.char_len());
+                                                let e = anchor.max(cur).min(self.buffer.char_len());
                                                 self.buffer.caret_char_range = Some(s..e);
                                             }
                                         }
@@ -457,7 +461,7 @@ impl eframe::App for ReportApp {
                             }
                             if let Some(anchor) = self.mouse_drag_anchor {
                                 let s = anchor.min(best);
-                                let e = anchor.max(best).saturating_add(1).min(self.buffer.char_len());
+                                let e = anchor.max(best).min(self.buffer.char_len());
                                 eprintln!("[dbg] pointer moved drag update anchor={} best={} -> selection {}..{}", anchor, best, s, e);
                                 self.buffer.caret_char_range = Some(s..e);
                                 if self.vim_enabled {
@@ -822,3 +826,4 @@ fn main() {
         Box::new(|_cc| Ok(Box::new(ReportApp::default()))),
     );
 }
+
