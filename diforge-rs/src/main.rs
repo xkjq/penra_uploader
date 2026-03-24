@@ -416,12 +416,11 @@ impl eframe::App for ReportApp {
                                                 eprintln!("[dbg] mouse drag end anchor={} cur={} -> selection {}..{}", anchor, cur, anchor.min(cur), anchor.max(cur));
                                                 if self.vim_enabled {
                                                     self.vim_mode = VimMode::Visual;
-                                                    self.visual_anchor = Some(anchor.min(cur));
+                                                    // store the original anchor; caret is the cursor
+                                                    self.visual_anchor = Some(anchor);
                                                 }
-                                                // set canonical selection (end-exclusive)
-                                                let s = anchor.min(cur);
-                                                let e = anchor.max(cur).min(self.buffer.char_len());
-                                                self.buffer.caret_char_range = Some(s..e);
+                                                // Keep canonical caret at the cursor position
+                                                self.buffer.caret_char_range = Some(cur..cur);
                                             }
                                         }
                                     } else {
@@ -460,13 +459,16 @@ impl eframe::App for ReportApp {
                                 }
                             }
                             if let Some(anchor) = self.mouse_drag_anchor {
-                                let s = anchor.min(best);
-                                let e = anchor.max(best).min(self.buffer.char_len());
+                                let cur = best;
+                                let s = anchor.min(cur);
+                                let e = anchor.max(cur).min(self.buffer.char_len());
                                 eprintln!("[dbg] pointer moved drag update anchor={} best={} -> selection {}..{}", anchor, best, s, e);
-                                self.buffer.caret_char_range = Some(s..e);
+                                // Keep canonical caret at the current cursor index
+                                self.buffer.caret_char_range = Some(cur..cur);
                                 if self.vim_enabled {
                                     self.vim_mode = VimMode::Visual;
-                                    self.visual_anchor = Some(s);
+                                    // keep the anchor as the original anchor
+                                    self.visual_anchor = Some(anchor);
                                 }
                                 self.last_vim_key = None;
                             }
@@ -533,7 +535,9 @@ impl eframe::App for ReportApp {
                                 let display_end = (e).min(self.buffer.char_len()).saturating_add(extend);
                                 // Ensure textual selection mirrors visual selection
                                 eprintln!("[dbg] visual sync anchor={} cur={} -> display {}..{}", anchor, cur, s, display_end);
-                                self.buffer.caret_char_range = Some(s..display_end);
+                                // Keep canonical caret as the caret position (`cur..cur`).
+                                // The visible selection is driven by `visual_anchor` + the caret.
+                                self.buffer.caret_char_range = Some(cur..cur);
                                 let start = CCursor::new(s);
                                 let end = CCursor::new(display_end);
                             output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
