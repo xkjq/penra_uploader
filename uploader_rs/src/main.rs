@@ -427,7 +427,7 @@ impl eframe::App for AppState {
         }
 
         CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            // Sticky header: stays fixed while the central content scrolls
             ui.horizontal(|ui| {
                 ui.heading("Uploader (Rust)");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -438,8 +438,9 @@ impl eframe::App for AppState {
                     }
                 });
             });
-
-            egui::CollapsingHeader::new("Login").default_open(self.login_open).show(ui, |ui| {
+            ui.separator();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::CollapsingHeader::new("Login").default_open(self.login_open).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Username:");
                     ui.text_edit_singleline(&mut self.username);
