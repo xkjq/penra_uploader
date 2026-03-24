@@ -941,6 +941,36 @@ impl eframe::App for ReportApp {
                                 });
                             }
                         });
+
+                        ui.separator();
+                        // Show details for the currently selected template (if any)
+                        if let Some(idx) = self.selected_template {
+                            if idx < self.templates.len() {
+                                let t = &self.templates[idx];
+                                ui.group(|ui| {
+                                    ui.label("Template details:");
+                                    ui.horizontal(|ui| {
+                                        ui.label("ID:");
+                                        ui.monospace(t.id.clone().unwrap_or_default());
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Title:");
+                                        ui.monospace(t.title.clone().unwrap_or_default());
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("NICIP codes:");
+                                        ui.monospace(t.applicable_codes.join(", "));
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Modalities:");
+                                        ui.monospace(t.modalities.join(", "));
+                                    });
+                                    ui.label("Body preview:");
+                                    let mut preview = t.body.clone();
+                                    ui.add(egui::TextEdit::multiline(&mut preview).desired_rows(8).font(egui::TextStyle::Monospace).interactive(false));
+                                });
+                            }
+                        }
                     });
                 });
             }
