@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use chrono::Local;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -224,6 +225,12 @@ pub fn matches_template(t: &Template, study_codes: &[String], modality: Option<&
 ///
 /// Supports including other templates with `{{> name}}` where `name` is a template `id` or title.
 pub fn render_template(template: &str, vars: &HashMap<String, String>, all_templates: &[Template]) -> String {
+    // Inject automatic variables (date/time) into a local vars map so templates
+    // can reference `{{date}}` and `{{time}}` without the caller providing them.
+    let mut vars_with_defaults = vars.clone();
+    vars_with_defaults.entry("date".to_string()).or_insert_with(|| Local::now().format("%Y-%m-%d").to_string());
+    vars_with_defaults.entry("time".to_string()).or_insert_with(|| Local::now().format("%H:%M").to_string());
+
     fn recurse(tmpl: &str, vars: &HashMap<String, String>, all: &[Template], depth: usize) -> String {
         if depth > 8 {
             return "".to_string();
@@ -288,7 +295,7 @@ pub fn render_template(template: &str, vars: &HashMap<String, String>, all_templ
         out
     }
 
-    recurse(template, vars, all_templates, 0)
+    recurse(template, &vars_with_defaults, all_templates, 0)
 }
 
 
@@ -334,6 +341,17 @@ mod tests {
         let out = render_template(&all[1].body, &vars, &all);
         assert!(out.contains("--\nDr Test"));
         assert!(out.contains("Report by Alice."));
+    }
+
+    #[test]
+    fn test_render_template_auto_date_time() {
+        let all: Vec<Template> = Vec::new();
+        let vars: HashMap<String, String> = HashMap::new();
+        let out = render_template("Today is {{date}} at {{time}}", &vars, &all);
+        assert!(out.contains("Today is "));
+        // date should contain a hyphen (YYYY-MM-DD) and time contain ':'
+        assert!(out.contains('-'));
+        assert!(out.contains(':'));
     }
 
     #[test]

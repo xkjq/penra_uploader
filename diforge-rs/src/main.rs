@@ -199,6 +199,10 @@ impl ReportApp {
     // Insert a template at the current caret position, applying inline/block
     // insertion rules and optional pre/post finishing (sentence completion).
     fn insert_template_at_caret(&mut self, t: &templates::Template) {
+        // Group the entire insertion (pre-finish, insertion, post-finish or
+        // block insertion) into a single undo step so Undo/Redo treats it
+        // atomically.
+        self.buffer.start_undo_group();
         let vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let rendered = templates::render_template(&t.body, &vars, &self.templates);
 
@@ -240,6 +244,8 @@ impl ReportApp {
                 }
             }
             self.buffer.insert_at_caret(&body);
+            // End the grouped undo step
+            self.buffer.end_undo_group();
         }
     }
 
