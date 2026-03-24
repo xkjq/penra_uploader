@@ -1484,6 +1484,9 @@ impl eframe::App for AppState {
     }
 }
 
+#[cfg(test)]
+mod processing_workflow_tests;
+
 fn main() {
     // Initialize structured logging (writes to ~/.uploader/request_log.txt).
     // Uses `RUST_LOG` env var for filter (defaults to info).
