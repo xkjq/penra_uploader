@@ -1,5 +1,6 @@
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 
 #[cfg(target_os = "linux")]

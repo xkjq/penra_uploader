@@ -633,7 +633,6 @@ impl eframe::App for AppState {
                 }
             });
             
-            ui.separator();
             // Temporarily take ownership of the receiver so `handle_message` can
             // mutably borrow `self` while we drain pending messages.
             if let Some(rx) = self.rx.take() {
@@ -650,15 +649,6 @@ impl eframe::App for AppState {
                 }
             }
 
-            if !self.processed.is_empty() {
-                ui.collapsing("Processed items", |ui| {
-                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                        for it in &self.processed {
-                            ui.label(it);
-                        }
-                    });
-                });
-            }
 
             ui.separator();
             ui.collapsing("Ready to Upload", |ui| {
@@ -1108,7 +1098,18 @@ impl eframe::App for AppState {
             });
             });
 
+            ui.separator();
             ui.label(format!("Last: {}", self.last_msg));
+            ui.separator();
+            if !self.processed.is_empty() {
+                ui.collapsing("Processed items", |ui| {
+                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                        for it in &self.processed {
+                            ui.label(it);
+                        }
+                    });
+                });
+            }
 
             // Confirmation modal for Remove all
             if self.confirm_remove_all {
