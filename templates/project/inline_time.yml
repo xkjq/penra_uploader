@@ -1,0 +1,7 @@
+id: inline_time
+title: Inline Time
+applicable_codes: []
+modalities: []
+insert_inline: true
+ensure_surrounding_newlines: false
+body: "{{time}}"

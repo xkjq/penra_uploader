@@ -13,7 +13,13 @@ struct Template {
     pub modalities: Vec<String>,
     #[serde(default)]
     pub body: String,
+    #[serde(default)]
+    pub insert_inline: bool,
+    #[serde(default = "default_true")]
+    pub ensure_surrounding_newlines: bool,
 }
+
+fn default_true() -> bool { true }
 
 impl Template {
     fn display_title(&self) -> String {
@@ -66,7 +72,7 @@ fn load_templates() -> Vec<Template> {
                             if let Ok(txt) = fs::read_to_string(&path) {
                                 match serde_yaml::from_str::<Template>(&txt) {
                                     Ok(t) => out.push(t),
-                                    Err(_) => out.push(Template { id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()), title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: txt }),
+                                    Err(_) => out.push(Template { id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()), title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: txt, insert_inline: false, ensure_surrounding_newlines: true }),
                                 }
                                 eprintln!("[template_editor] loaded: {}", path.display());
                             }
@@ -88,7 +94,7 @@ fn load_templates() -> Vec<Template> {
                                 if let Ok(txt) = fs::read_to_string(&path) {
                                     match serde_yaml::from_str::<Template>(&txt) {
                                         Ok(t) => out.push(t),
-                                        Err(_) => out.push(Template { id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()), title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: txt }),
+                                        Err(_) => out.push(Template { id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()), title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: txt, insert_inline: false, ensure_surrounding_newlines: true }),
                                     }
                                     eprintln!("[template_editor] loaded: {}", path.display());
                                 }
@@ -101,7 +107,7 @@ fn load_templates() -> Vec<Template> {
     }
     eprintln!("[template_editor] total templates: {}", out.len());
     if out.is_empty() {
-        out.push(Template { id: Some("default1".to_string()), title: Some("Default Clinical".to_string()), applicable_codes: Vec::new(), modalities: Vec::new(), body: "Clinical details:\n\nImpression:\n".to_string() });
+        out.push(Template { id: Some("default1".to_string()), title: Some("Default Clinical".to_string()), applicable_codes: Vec::new(), modalities: Vec::new(), body: "Clinical details:\n\nImpression:\n".to_string(), insert_inline: false, ensure_surrounding_newlines: true });
     }
     out
 }
@@ -129,7 +135,7 @@ impl eframe::App for AppState {
             ui.heading("Template Editor");
             ui.horizontal(|ui| {
                 if ui.button("New").clicked() {
-                    self.editing = Some(Template { id: None, title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: String::new() });
+                    self.editing = Some(Template { id: None, title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: String::new(), insert_inline: false, ensure_surrounding_newlines: true });
                     self.show_editor = true;
                 }
                 if ui.button("Edit").clicked() {
@@ -209,9 +215,17 @@ impl eframe::App for AppState {
                     let title = t.display_title();
                     let selected = self.selected.map(|s| s == i).unwrap_or(false);
                     ui.horizontal(|ui| {
-                        if ui.selectable_label(selected, title.clone()).clicked() {
+                            if ui.selectable_label(selected, title.clone()).clicked() {
                             if selected { self.selected = None; } else { self.selected = Some(i); }
                         }
+                            // insertion mode indicator
+                            if t.insert_inline {
+                                ui.label("(inline)");
+                            } else if t.ensure_surrounding_newlines {
+                                ui.label("(block)");
+                            } else {
+                                ui.label("(soft)");
+                            }
                         // show metadata inline
                         let id = t.id.as_deref().unwrap_or("");
                         if !id.is_empty() {
@@ -240,6 +254,10 @@ impl eframe::App for AppState {
                         ui.horizontal(|ui| { ui.label("NICIP codes (comma):"); let mut codes = t.applicable_codes.join(","); ui.text_edit_singleline(&mut codes); t.applicable_codes = codes.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); });
                         ui.horizontal(|ui| { ui.label("Modalities (comma):"); let mut mods = t.modalities.join(","); ui.text_edit_singleline(&mut mods); t.modalities = mods.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(); });
                         ui.label("Body:"); ui.add(egui::TextEdit::multiline(&mut t.body).desired_rows(12));
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut t.insert_inline, "Insert inline");
+                            ui.checkbox(&mut t.ensure_surrounding_newlines, "Ensure surrounding newlines");
+                        });
                         ui.horizontal(|ui| {
                             if ui.button("Save").clicked() {
                                 let user_dir = Path::new("templates/user"); let _ = fs::create_dir_all(user_dir);

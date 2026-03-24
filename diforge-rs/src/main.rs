@@ -964,6 +964,14 @@ impl eframe::App for ReportApp {
                                 let num = pos + 1; // 1-based numbering for shortcut keys
                                 ui.horizontal(|ui| {
                                     ui.label(format!("[{}]", num));
+                                    // small insertion-mode indicator
+                                    if t.insert_inline {
+                                        ui.label("(inline)");
+                                    } else if t.ensure_surrounding_newlines {
+                                        ui.label("(block)");
+                                    } else {
+                                        ui.label("(soft)");
+                                    }
                                     if ui.small_button("Insert").clicked() {
                                         let vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
                                         let rendered = templates::render_template(&t.body, &vars, &self.templates);

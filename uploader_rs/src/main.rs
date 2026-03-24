@@ -29,6 +29,157 @@ use tracing_subscriber::prelude::*;
 
 static FILTER_RELOADER: OnceCell<Box<dyn Fn(EnvFilter) -> Result<(), String> + Send + Sync>> = OnceCell::new();
 
+use once_cell::sync::Lazy;
+use std::sync::mpsc as std_mpsc;
+
+// Queue item sent to the processing worker. The `tx` is the UI sender so
+// the worker can send progress/status messages back to the application.
+struct QueueItem {
+    dir: PathBuf,
+    notify: bool,
+    seed: Option<String>,
+    tx: std_mpsc::Sender<String>,
+}
+
+// Global processing queue + worker. Debounce is set to 2 seconds to coalesce
+// multiple quick imports into a single processing window (user requested).
+static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
+    let (s, r) = std_mpsc::channel::<QueueItem>();
+    thread::spawn(move || {
+        loop {
+            // block until we have at least one item
+            let first = match r.recv() {
+                Ok(f) => f,
+                Err(_) => break,
+            };
+
+            // collect additional items for the debounce window
+            let mut items = vec![first];
+            std::thread::sleep(Duration::from_secs(2));
+            while let Ok(it) = r.try_recv() {
+                items.push(it);
+            }
+
+            // Process each queued processing directory sequentially
+            for qi in items.into_iter() {
+                let processing_dir = qi.dir;
+                let tx = qi.tx.clone();
+                let notify_flag = qi.notify;
+                let seed_clone = qi.seed.clone();
+
+                // compute anon_dir relative to the processing dir
+                let anon_dir = processing_dir
+                    .parent()
+                    .and_then(|p| p.parent().map(|pp| pp.join("anon")))
+                    .unwrap_or_else(|| PathBuf::from("anon"));
+
+                // collect .dcm files recursively from the processing dir
+                let mut dcm_files: Vec<std::path::PathBuf> = Vec::new();
+                let all = upload::collect_files_recursive(&processing_dir);
+                for p in all.into_iter() {
+                    if p.extension().map(|e| e == "dcm").unwrap_or(false) {
+                        dcm_files.push(p);
+                    }
+                }
+                if dcm_files.is_empty() {
+                    let _ = tx.send("No export dir or no .dcm files found".to_string());
+                }
+
+                let total = dcm_files.len();
+                if total > 0 {
+                    let _ = tx.send("PROC:STEP:Anonymizing export files".to_string());
+                    let processed_count = Arc::new(AtomicUsize::new(0));
+                    let total_copy = total; // capture for closure
+                    dcm_files.par_iter().for_each(|p| {
+                        let tx = tx.clone();
+                        let processed_count = processed_count.clone();
+                        let seed = seed_clone.clone();
+                        match anonymize_file(p, &anon_dir, true, false, false, seed.as_deref()) {
+                            Ok(out) => {
+                                let _ = tx.send(format!("Anonymized: {}", out.display()));
+                                if let Ok(bytes) = fs::read(&out) {
+                                    let hash = blake3::hash(&bytes);
+                                    let _ = tx.send(format!("Hash {}: {}", out.display(), hash.to_hex()));
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(format!("Anon failed {}: {}", p.display(), e));
+                            }
+                        }
+                        let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
+                        let report_interval = std::cmp::max(1, total_copy / 50);
+                        if (done % report_interval == 0) || (done == total_copy) {
+                            let prog = done as f32 / (total_copy as f32);
+                            let _ = tx.send(format!("PROC:PROG:{}", prog));
+                        }
+                    });
+                }
+
+                if notify_flag {
+                    // notify any running instance via local socket
+                    let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| format!("pid{}", std::process::id()));
+                    let ipc_name = format!("uploader_rs_{}", user);
+                    if let Ok(mut s) = LocalSocketStream::connect(ipc_name.as_str()) {
+                        if s.write_all(b"loaded").is_ok() {
+                            let _ = tx.send("Sent IPC 'loaded'".to_string());
+                        } else {
+                            let _ = tx.send("Failed to write to IPC socket".to_string());
+                        }
+                    } else {
+                        let _ = tx.send("Failed to connect to IPC socket".to_string());
+                    }
+                }
+
+                if let Err(e) = request_scan(&anon_dir, Some(tx.clone())) {
+                    let _ = tx.send(format!("Post-process scan failed: {}", e));
+                }
+
+                // attempt to clean up the processing directory we created (best-effort)
+                if processing_dir.exists() {
+                    if let Err(e) = fs::remove_dir_all(&processing_dir) {
+                        let _ = tx.send(format!("Failed to remove processing dir {}: {}", processing_dir.display(), e));
+                    } else {
+                        let _ = tx.send(format!("Cleaned processing dir {}", processing_dir.display()));
+                    }
+                }
+
+                // also prune any empty directories left under the export root (best-effort)
+                if let Some(processing_parent) = processing_dir.parent() {
+                    if let Some(export_root_parent) = processing_parent.parent() {
+                        let export_root = export_root_parent.join("export");
+                        if export_root.exists() {
+                            fn prune_empty_dirs(dir: &std::path::Path) {
+                                if let Ok(entries) = fs::read_dir(dir) {
+                                    for e in entries.flatten() {
+                                        let p = e.path();
+                                        if p.is_dir() {
+                                            prune_empty_dirs(&p);
+                                        }
+                                    }
+                                }
+                                if let Ok(mut it) = fs::read_dir(dir) {
+                                    if it.next().is_none() {
+                                        let _ = fs::remove_dir(dir);
+                                    }
+                                }
+                            }
+                            if let Ok(entries) = fs::read_dir(&export_root) {
+                                for e in entries.flatten() {
+                                    let p = e.path();
+                                    if p.is_dir() {
+                                        prune_empty_dirs(&p);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    s
+});
+
 fn human_size(bytes: u64) -> String {
     if bytes >= 1_000_000 {
         format!("{:.1} MB", bytes as f64 / 1_000_000.0)
@@ -300,104 +451,18 @@ impl AppState {
                             }
                         }
 
-                        // collect .dcm files recursively from the processing dir so subfolders are included
-                        let mut dcm_files: Vec<std::path::PathBuf> = Vec::new();
-                        let all = upload::collect_files_recursive(&processing_dir);
-                        for p in all.into_iter() {
-                            if p.extension().map(|e| e == "dcm").unwrap_or(false) {
-                                dcm_files.push(p);
-                            }
+                        // Enqueue the processing dir for background processing (debounced/coalesced)
+                        let qi = QueueItem {
+                            dir: processing_dir.clone(),
+                            notify: notify_flag,
+                            seed: seed_clone.clone(),
+                            tx: tx.clone(),
+                        };
+                        if let Err(e) = PROCESS_QUEUE.send(qi) {
+                            let _ = tx.send(format!("Failed to enqueue processing dir: {}", e));
+                        } else {
+                            let _ = tx.send(format!("Enqueued processing run: {}", processing_dir.display()));
                         }
-                        if dcm_files.is_empty() {
-                            let _ = tx.send("No export dir or no .dcm files found".to_string());
-                        }
-
-            let total = dcm_files.len();
-            if total > 0 {
-                let _ = tx.send("PROC:STEP:Anonymizing export files".to_string());
-                let processed_count = Arc::new(AtomicUsize::new(0));
-                let total_copy = total; // capture for closure
-                dcm_files.par_iter().for_each(|p| {
-                    let tx = tx.clone();
-                    let processed_count = processed_count.clone();
-                    let seed = seed_clone.clone();
-                    match anonymize_file(p, &anon_dir, true, false, false, seed.as_deref()) {
-                        Ok(out) => {
-                            let _ = tx.send(format!("Anonymized: {}", out.display()));
-                            if let Ok(bytes) = fs::read(&out) {
-                                let hash = blake3::hash(&bytes);
-                                let _ = tx.send(format!("Hash {}: {}", out.display(), hash.to_hex()));
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(format!("Anon failed {}: {}", p.display(), e));
-                        }
-                    }
-                    let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
-                    let report_interval = std::cmp::max(1, total_copy / 50);
-                    if (done % report_interval == 0) || (done == total_copy) {
-                        let prog = done as f32 / (total_copy as f32);
-                        let _ = tx.send(format!("PROC:PROG:{}", prog));
-                    }
-                });
-            }
-
-            if notify_flag {
-                // notify any running instance via local socket
-                let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| format!("pid{}", std::process::id()));
-                let ipc_name = format!("uploader_rs_{}", user);
-                if let Ok(mut s) = LocalSocketStream::connect(ipc_name.as_str()) {
-                    if s.write_all(b"loaded").is_ok() {
-                        let _ = tx.send("Sent IPC 'loaded'".to_string());
-                    } else {
-                        let _ = tx.send("Failed to write to IPC socket".to_string());
-                    }
-                } else {
-                    let _ = tx.send("Failed to connect to IPC socket".to_string());
-                }
-            }
-
-            if let Err(e) = request_scan(&anon_dir, Some(tx.clone())) {
-                let _ = tx.send(format!("Post-process scan failed: {}", e));
-            }
-            // attempt to clean up the processing directory we created (best-effort)
-            if processing_dir.exists() {
-                if let Err(e) = fs::remove_dir_all(&processing_dir) {
-                    let _ = tx.send(format!("Failed to remove processing dir {}: {}", processing_dir.display(), e));
-                } else {
-                    let _ = tx.send(format!("Cleaned processing dir {}", processing_dir.display()));
-                }
-            }
-
-            // also prune any empty directories left under the export root (best-effort)
-            if export.exists() {
-                // recursively remove empty directories under `export` but don't remove `export` itself
-                fn prune_empty_dirs(dir: &std::path::Path) {
-                    if let Ok(entries) = fs::read_dir(dir) {
-                        for e in entries.flatten() {
-                            let p = e.path();
-                            if p.is_dir() {
-                                prune_empty_dirs(&p);
-                            }
-                        }
-                    }
-                    // try removing this dir if it's empty
-                    if let Ok(mut it) = fs::read_dir(dir) {
-                        if it.next().is_none() {
-                            let _ = fs::remove_dir(dir);
-                        }
-                    }
-                }
-                // prune children of export (not export itself)
-                if let Ok(entries) = fs::read_dir(&export) {
-                    for e in entries.flatten() {
-                        let p = e.path();
-                        if p.is_dir() {
-                            prune_empty_dirs(&p);
-                        }
-                    }
-                }
-            }
 
             let _ = tx.send("done".to_string());
         });
@@ -689,34 +754,12 @@ impl eframe::App for AppState {
                                                 }).collect();
                                                 let total = to_process.len();
                                                 if total > 0 {
-                                                    let _ = tx.send("PROC:STEP:Anonymizing imported files".to_string());
-                                                    let processed_count = Arc::new(AtomicUsize::new(0));
-                                                    let total_copy = total;
-                                                    to_process.par_iter().for_each(|p| {
-                                                        let tx = tx.clone();
-                                                        let processed_count = processed_count.clone();
-                                                        let seed = seed_clone.clone();
-                                                        match anonymize_file(p, &anon_dir, true, false, false, seed.as_deref()) {
-                                                            Ok(out) => {
-                                                                let _ = tx.send(format!("Anonymized: {}", out.display()));
-                                                                if let Ok(bytes) = fs::read(&out) {
-                                                                    let hash = blake3::hash(&bytes);
-                                                                    let _ = tx.send(format!("Hash {}: {}", out.display(), hash.to_hex()));
-                                                                }
-                                                            }
-                                                            Err(e) => { let _ = tx.send(format!("Anon failed {}: {}", p.display(), e)); }
-                                                        }
-                                                        let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
-                                                        let report_interval = std::cmp::max(1, total_copy / 50);
-                                                        if (done % report_interval == 0) || (done == total_copy) {
-                                                            let prog = done as f32 / (total_copy as f32);
-                                                            let _ = tx.send(format!("PROC:PROG:{}", prog));
-                                                        }
-                                                    });
-
-                                                    if let Err(e) = request_scan(&anon_dir, Some(tx.clone())) {
-                                                        let _ = tx.send(format!("Post-import scan failed: {}", e));
-                                                    }
+                                                    // Defer anonymization to the processing queue so imports
+                                                    // that arrive in quick succession are coalesced. Send an
+                                                    // IPC-like message that will trigger `trigger_process_export()`
+                                                    // in the main thread which moves export -> processing and
+                                                    // enqueues the run.
+                                                    let _ = tx.send("IPC:RECV:loaded".to_string());
                                                 }
                                             }
 
