@@ -680,7 +680,7 @@ impl eframe::App for AppState {
             ui.separator();
             ui.collapsing("Ready to Upload", |ui| {
                 egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         // Styled Upload button moved here to Ready-to-Upload (prominent)
                         if !self.metadata_select_mode {
                                 if ui.add(egui::Button::new("Upload anonymized files").fill(egui::Color32::from_rgb(0,150,60))).clicked() {
