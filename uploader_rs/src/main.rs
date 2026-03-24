@@ -489,10 +489,11 @@ impl eframe::App for AppState {
                 if let Some(step) = &self.processing_step {
                     ui.label(format!("Step: {}", step));
                 }
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Process export (anonymize + notify)").clicked() {
                         self.trigger_process_export();
                     }
+                    ui.add_space(8.0);
                     if ui.button("Refresh ready-to-upload").clicked() {
                         let _anon_dir = self.export_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
                             let anon_dir = self.anon_dir();
@@ -504,7 +505,7 @@ impl eframe::App for AppState {
                             let _ = tx.send("done".to_string());
                         });
                     }
-
+                    ui.add_space(8.0);
                     if ui.button("Import from folder").clicked() {
                         self.import_dialog_open = true;
                     }

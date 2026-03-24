@@ -259,11 +259,15 @@ impl eframe::App for ReportApp {
                     // If Vim emulation is enabled and we are NOT in Insert mode, prevent the TextEdit
                     // from applying direct edits by restoring any accidental changes.
                     let prev_report = self.buffer.report.clone();
+                    let is_interactive = !self.vim_enabled || self.vim_mode == VimMode::Insert;
                     let mut text_edit = egui::TextEdit::multiline(&mut self.buffer.report)
                         .desired_rows(20)
                         .desired_width(left_w)
                         // only lock focus when in Insert mode so Normal mode can intercept keys
-                        .lock_focus(self.vim_enabled && self.vim_mode == VimMode::Insert);
+                        .lock_focus(self.vim_enabled && self.vim_mode == VimMode::Insert)
+                        // make the widget non-interactive when Vim is active but not in Insert,
+                        // so clicks don't hand keyboard focus to the TextEdit unexpectedly.
+                        .interactive(is_interactive);
 
                     // Use monospace font when Vim emulation is active for consistent fixed-width behavior
                     if self.vim_enabled {
@@ -317,41 +321,67 @@ impl eframe::App for ReportApp {
 
                     // Handle mouse interactions inside the TextEdit widget so
                     // clicks and drag-selections update our vim buffer state
-                    // regardless of mode. This keeps the caret/selection in
-                    // sync when the user clicks or selects with the mouse.
+                    // regardless of mode. If the TextEdit is non-interactive
+                    // (vim Normal mode) compute the clicked/selected char index
+                    // from the laid-out galley so the caret still moves without
+                    // giving the widget keyboard focus.
                     for ev in events.iter() {
                         if let Event::PointerButton { pos, pressed, button, .. } = ev {
-                            // Only react to primary button events that hit the widget
-                            if *button == egui::PointerButton::Primary && output.response.rect.contains(*pos) {
-                                // If the widget has reported a cursor/selection, adopt it
-                                if let Some(ccr) = output.cursor_range {
-                                    let sorted = ccr.as_sorted_char_range();
-                                    self.buffer.caret_char_range = Some(sorted.clone());
-                                    // Clear any operator-pending state
-                                    self.last_vim_key = None;
+                            if *button != egui::PointerButton::Primary { continue; }
+                            if !output.response.rect.contains(*pos) { continue; }
 
-                                    // If the user released the button and a non-empty
-                                    // selection exists, enter Visual mode so the
-                                    // selection behaves like a vim visual selection.
-                                    if !*pressed {
-                                        if self.vim_enabled {
-                                            if sorted.start != sorted.end {
-                                                self.vim_mode = VimMode::Visual;
-                                                self.visual_anchor = Some(sorted.start);
-                                            } else if self.vim_mode == VimMode::Visual {
-                                                // clicking with no selection cancels Visual
-                                                self.vim_mode = VimMode::Normal;
-                                                self.visual_anchor = None;
-                                            }
+                            // Prefer the widget-reported cursor_range when available
+                            if let Some(ccr) = output.cursor_range {
+                                let sorted = ccr.as_sorted_char_range();
+                                self.buffer.caret_char_range = Some(sorted.clone());
+                                self.last_vim_key = None;
+
+                                if !*pressed {
+                                    if self.vim_enabled {
+                                        if sorted.start != sorted.end {
+                                            self.vim_mode = VimMode::Visual;
+                                            self.visual_anchor = Some(sorted.start);
+                                        } else if self.vim_mode == VimMode::Visual {
+                                            self.vim_mode = VimMode::Normal;
+                                            self.visual_anchor = None;
                                         }
-                                    } else {
-                                        // On press, if already in Visual mode and there's
-                                        // no anchor set, initialize it to the press char
-                                        if self.vim_enabled && self.vim_mode == VimMode::Visual {
-                                            if self.visual_anchor.is_none() {
-                                                self.visual_anchor = Some(sorted.start);
-                                            }
+                                    }
+                                } else if self.vim_enabled && self.vim_mode == VimMode::Visual {
+                                    if self.visual_anchor.is_none() {
+                                        self.visual_anchor = Some(sorted.start);
+                                    }
+                                }
+                            } else if !is_interactive {
+                                // Widget didn't report a cursor_range (because it's non-interactive).
+                                // Map the mouse `pos` into a character index using the galley.
+                                let mut best = 0usize;
+                                let mut best_dist = f32::INFINITY;
+                                let total = self.buffer.char_len();
+                                for idx in 0..=total {
+                                    let cursor = CCursor::new(idx);
+                                    let rect = output.galley.pos_from_cursor(cursor);
+                                    let screen = output.response.rect.min + rect.min.to_vec2();
+                                    let dx = screen.x - pos.x;
+                                    let dy = screen.y - pos.y;
+                                    let dist = dx * dx + dy * dy;
+                                    if dist < best_dist {
+                                        best_dist = dist;
+                                        best = idx;
+                                    }
+                                }
+                                self.buffer.caret_char_range = Some(best..best);
+                                self.last_vim_key = None;
+                                if !*pressed {
+                                    if self.vim_enabled {
+                                        // single click with no drag -> cancel visual or leave normal
+                                        if self.vim_mode == VimMode::Visual {
+                                            self.vim_mode = VimMode::Normal;
+                                            self.visual_anchor = None;
                                         }
+                                    }
+                                } else if self.vim_enabled && self.vim_mode == VimMode::Visual {
+                                    if self.visual_anchor.is_none() {
+                                        self.visual_anchor = Some(best);
                                     }
                                 }
                             }
