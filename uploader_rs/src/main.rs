@@ -427,6 +427,7 @@ impl eframe::App for AppState {
         }
 
         CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Uploader (Rust)");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1286,6 +1287,7 @@ impl eframe::App for AppState {
                     });
                 });
             }
+            });
         });
 
         // Render toasts in a top-right area and drop expired ones.
