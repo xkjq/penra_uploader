@@ -75,6 +75,9 @@ struct AppState {
     selected_files_for_meta: HashSet<String>,
     metadata_select_mode: bool,
     log_window_open: bool,
+    // import dialog state
+    import_dialog_open: bool,
+    import_src: Option<PathBuf>,
     log_level: String,
     confirm_remove_all: bool,
     // when set, the app should exit (message explains why)
@@ -147,6 +150,8 @@ impl Default for AppState {
             selected_files_for_meta: HashSet::new(),
             metadata_select_mode: false,
             log_window_open: false,
+            import_dialog_open: false,
+            import_src: None,
             login_open: upload::token_username().is_none(),
             confirm_remove_all: false,
             exit_requested: None,
@@ -480,7 +485,7 @@ impl eframe::App for AppState {
                     }
                 });
 
-            ui.collapsing("Processing", |ui| {
+            ui.collapsing("Manual Actions", |ui| {
                 if let Some(step) = &self.processing_step {
                     ui.label(format!("Step: {}", step));
                 }
@@ -488,140 +493,156 @@ impl eframe::App for AppState {
                         self.trigger_process_export();
                     }
 
-                ui.group(|ui| {
-                    if ui.button("Import from folder").clicked() {
-                        // Pick a source folder and copy .dcm files into the export dir in background
-                        if let Some(src) = FileDialog::new().pick_folder() {
-                        let do_move = self.move_files;
-                        let seed_clone = self.seed.clone();
-                        let depth = self.recurse_depth;
-                        let ext = self.ext_filter.clone();
-                        let export = self.export_dir.clone();
-                        let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
+                if ui.button("Import from folder").clicked() {
+                    self.import_dialog_open = true;
+                }
 
-                        thread::spawn(move || {
-                            // collect files (optionally recurse with depth)
-                            let mut stack: Vec<(PathBuf, i32)> = vec![(src.clone(), depth)];
-                            let mut found: Vec<PathBuf> = Vec::new();
-                            let mut copied_files: Vec<PathBuf> = Vec::new();
-
-                            while let Some((dir, dleft)) = stack.pop() {
-                                if let Ok(entries) = fs::read_dir(&dir) {
-                                    for e in entries.flatten() {
-                                        let p = e.path();
-                                        if p.is_dir() && (dleft != 0) {
-                                            let next = if dleft > 0 { dleft - 1 } else { dleft };
-                                            stack.push((p, next));
-                                        } else if p.is_file() {
-                                            // If the extension filter is empty, accept all files; otherwise match extension (case-insensitive)
-                                            if ext.is_empty() {
-                                                found.push(p);
-                                            } else if let Some(exts) = p.extension().and_then(|s| s.to_str()) {
-                                                if exts.eq_ignore_ascii_case(&ext) {
-                                                    found.push(p);
-                                                }
-                                            }
-                                        }
-                                    }
+                // Import dialog (modal)
+                if self.import_dialog_open {
+                    egui::Window::new("Import from folder").collapsible(false).resizable(false).show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Source folder:");
+                            if let Some(p) = &self.import_src {
+                                ui.label(p.display().to_string());
+                            } else {
+                                ui.label("(none selected)");
+                            }
+                            if ui.button("Select...").clicked() {
+                                if let Some(src) = FileDialog::new().pick_folder() {
+                                    self.import_src = Some(src);
                                 }
                             }
+                        });
 
-                            if found.is_empty() {
-                                            let _ = tx.send("No .dcm files found in selected folder".to_string());
-                            } else {
-                                for p in found {
-                                    let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string();
-                                    let dest = export.join(&fname);
-                                    if do_move {
-                                        match fs::rename(&p, &dest) {
-                                            Ok(_) => { let _ = tx.send(format!("Moved {} -> {}", p.display(), dest.display())); copied_files.push(dest.clone()); }
-                                            Err(_) => match fs::copy(&p, &dest) {
-                                                Ok(_) => {
-                                                    let _ = fs::remove_file(&p);
-                                                    let _ = tx.send(format!("Copied+removed {} -> {}", p.display(), dest.display()));
-                                                    copied_files.push(dest.clone());
-                                                }
-                                                Err(e) => { let _ = tx.send(format!("Failed to move {}: {}", p.display(), e)); }
-                                            }
-                                        }
-                                    } else {
-                                        match fs::copy(&p, &dest) {
-                                            Ok(_) => { let _ = tx.send(format!("Copied {} -> {}", p.display(), dest.display())); copied_files.push(dest.clone()); }
-                                            Err(e) => { let _ = tx.send(format!("Failed to copy {}: {}", p.display(), e)); }
-                                        }
-                                    }
-                                }
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.move_files, "Move files (don't keep originals)");
+                            let mut depth = self.recurse_depth;
+                            let resp = ui.add(egui::widgets::DragValue::new(&mut depth).clamp_range(-1..=100).speed(1.0));
+                            if resp.changed() { self.recurse_depth = depth; }
+                            ui.label("Recursion depth (-1 = infinite)");
+                        });
 
-                                // After files have been copied/moved, automatically process them
-                                if !copied_files.is_empty() {
-                                    let anon_dir = export.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
-                                    // Filter files to process (apply extension filter) and run anonymization in parallel
-                                    let to_process: Vec<PathBuf> = copied_files.into_iter().filter(|p| {
-                                        if ext.is_empty() {
-                                            true
-                                        } else {
-                                            p.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case(&ext)).unwrap_or(false)
-                                        }
-                                    }).collect();
-                                    let total = to_process.len();
-                                    if total > 0 {
-                                        let _ = tx.send("PROC:STEP:Anonymizing imported files".to_string());
-                                        let processed_count = Arc::new(AtomicUsize::new(0));
-                                        let total_copy = total;
-                                        to_process.par_iter().for_each(|p| {
-                                            let tx = tx.clone();
-                                            let processed_count = processed_count.clone();
-                                            let seed = seed_clone.clone();
-                                            match anonymize_file(p, &anon_dir, true, false, false, seed.as_deref()) {
-                                                Ok(out) => {
-                                                    let _ = tx.send(format!("Anonymized: {}", out.display()));
-                                                    if let Ok(bytes) = fs::read(&out) {
-                                                        let hash = blake3::hash(&bytes);
-                                                        let _ = tx.send(format!("Hash {}: {}", out.display(), hash.to_hex()));
+                        ui.horizontal(|ui| {
+                            ui.label("Extension filter (empty = try all files):");
+                            ui.text_edit_singleline(&mut self.ext_filter);
+                        });
+
+                        ui.horizontal(|ui| {
+                            if ui.button("Start Import").clicked() {
+                                if let Some(src) = self.import_src.clone() {
+                                    let do_move = self.move_files;
+                                    let seed_clone = self.seed.clone();
+                                    let depth = self.recurse_depth;
+                                    let ext = self.ext_filter.clone();
+                                    let export = self.export_dir.clone();
+                                    let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
+
+                                    thread::spawn(move || {
+                                        // collect files (optionally recurse with depth)
+                                        let mut stack: Vec<(PathBuf, i32)> = vec![(src.clone(), depth)];
+                                        let mut found: Vec<PathBuf> = Vec::new();
+                                        let mut copied_files: Vec<PathBuf> = Vec::new();
+
+                                        while let Some((dir, dleft)) = stack.pop() {
+                                            if let Ok(entries) = fs::read_dir(&dir) {
+                                                for e in entries.flatten() {
+                                                    let p = e.path();
+                                                    if p.is_dir() && (dleft != 0) {
+                                                        let next = if dleft > 0 { dleft - 1 } else { dleft };
+                                                        stack.push((p, next));
+                                                    } else if p.is_file() {
+                                                        if ext.is_empty() {
+                                                            found.push(p);
+                                                        } else if let Some(exts) = p.extension().and_then(|s| s.to_str()) {
+                                                            if exts.eq_ignore_ascii_case(&ext) {
+                                                                found.push(p);
+                                                            }
+                                                        }
                                                     }
                                                 }
-                                                Err(e) => {
-                                                    let _ = tx.send(format!("Anon failed {}: {}", p.display(), e));
+                                            }
+                                        }
+
+                                        if found.is_empty() {
+                                            let _ = tx.send("No .dcm files found in selected folder".to_string());
+                                        } else {
+                                            for p in found {
+                                                let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string();
+                                                let dest = export.join(&fname);
+                                                if do_move {
+                                                    match fs::rename(&p, &dest) {
+                                                        Ok(_) => { let _ = tx.send(format!("Moved {} -> {}", p.display(), dest.display())); copied_files.push(dest.clone()); }
+                                                        Err(_) => match fs::copy(&p, &dest) {
+                                                            Ok(_) => {
+                                                                let _ = fs::remove_file(&p);
+                                                                let _ = tx.send(format!("Copied+removed {} -> {}", p.display(), dest.display()));
+                                                                copied_files.push(dest.clone());
+                                                            }
+                                                            Err(e) => { let _ = tx.send(format!("Failed to move {}: {}", p.display(), e)); }
+                                                        }
+                                                    }
+                                                } else {
+                                                    match fs::copy(&p, &dest) {
+                                                        Ok(_) => { let _ = tx.send(format!("Copied {} -> {}", p.display(), dest.display())); copied_files.push(dest.clone()); }
+                                                        Err(e) => { let _ = tx.send(format!("Failed to copy {}: {}", p.display(), e)); }
+                                                    }
                                                 }
                                             }
-                                            let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
-                                            let report_interval = std::cmp::max(1, total_copy / 50);
-                                            if (done % report_interval == 0) || (done == total_copy) {
-                                                let prog = done as f32 / (total_copy as f32);
-                                                let _ = tx.send(format!("PROC:PROG:{}", prog));
+
+                                            if !copied_files.is_empty() {
+                                                let anon_dir = export.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
+                                                let to_process: Vec<PathBuf> = copied_files.into_iter().filter(|p| {
+                                                    if ext.is_empty() { true } else { p.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case(&ext)).unwrap_or(false) }
+                                                }).collect();
+                                                let total = to_process.len();
+                                                if total > 0 {
+                                                    let _ = tx.send("PROC:STEP:Anonymizing imported files".to_string());
+                                                    let processed_count = Arc::new(AtomicUsize::new(0));
+                                                    let total_copy = total;
+                                                    to_process.par_iter().for_each(|p| {
+                                                        let tx = tx.clone();
+                                                        let processed_count = processed_count.clone();
+                                                        let seed = seed_clone.clone();
+                                                        match anonymize_file(p, &anon_dir, true, false, false, seed.as_deref()) {
+                                                            Ok(out) => {
+                                                                let _ = tx.send(format!("Anonymized: {}", out.display()));
+                                                                if let Ok(bytes) = fs::read(&out) {
+                                                                    let hash = blake3::hash(&bytes);
+                                                                    let _ = tx.send(format!("Hash {}: {}", out.display(), hash.to_hex()));
+                                                                }
+                                                            }
+                                                            Err(e) => { let _ = tx.send(format!("Anon failed {}: {}", p.display(), e)); }
+                                                        }
+                                                        let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
+                                                        let report_interval = std::cmp::max(1, total_copy / 50);
+                                                        if (done % report_interval == 0) || (done == total_copy) {
+                                                            let prog = done as f32 / (total_copy as f32);
+                                                            let _ = tx.send(format!("PROC:PROG:{}", prog));
+                                                        }
+                                                    });
+
+                                                    if let Err(e) = request_scan(&anon_dir, Some(tx.clone())) {
+                                                        let _ = tx.send(format!("Post-import scan failed: {}", e));
+                                                    }
+                                                }
                                             }
-                                        });
-
-                                        // after processing, refresh ready-to-upload by scanning anon dir
-                                        if let Err(e) = request_scan(&anon_dir, Some(tx.clone())) {
-                                            let _ = tx.send(format!("Post-import scan failed: {}", e));
                                         }
-                                    }
 
-                                    // (scan requested above)
+                                        let _ = tx.send("done".to_string());
+                                    });
+
+                                    self.import_dialog_open = false;
+                                } else {
+                                    self.last_msg = "No folder selected".to_string();
                                 }
                             }
 
-                            let _ = tx.send("done".to_string());
+                            if ui.button("Cancel").clicked() {
+                                self.import_dialog_open = false;
+                            }
                         });
-                    } else {
-                        self.last_msg = "No folder selected".to_string();
-                    }
-                    }
-
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.move_files, "Move files (don\'t keep originals)");
-                        ui.add(egui::widgets::DragValue::new(&mut self.recurse_depth).clamp_range(-1..=100).speed(1.0));
-                        ui.label("Recursion depth (-1 = infinite)");
                     });
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.notify_on_process, "Notify exporters after processing");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Extension filter (empty = try all files):");
-                        ui.text_edit_singleline(&mut self.ext_filter);
-                    });
-                });
+                }
 
                 // Parallelism control moved to Settings (save required)
 
