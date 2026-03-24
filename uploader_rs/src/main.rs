@@ -226,6 +226,7 @@ struct AppState {
     selected_files_for_meta: HashSet<String>,
     metadata_select_mode: bool,
     log_window_open: bool,
+    about_open: bool,
     // import dialog state
     import_dialog_open: bool,
     import_src: Option<PathBuf>,
@@ -301,6 +302,7 @@ impl Default for AppState {
             selected_files_for_meta: HashSet::new(),
             metadata_select_mode: false,
             log_window_open: false,
+            about_open: false,
             import_dialog_open: false,
             import_src: None,
             login_open: upload::token_username().is_none(),
@@ -580,6 +582,7 @@ impl eframe::App for AppState {
             ui.horizontal(|ui| {
                 ui.heading("Uploader (Rust)");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("About").clicked() { self.about_open = !self.about_open; }
                     if let Some(step) = &self.processing_step {
                         let pct = (self.processing_progress * 100.0).clamp(0.0, 100.0);
                         let label = format!("{} — {:.0}%", step, pct);
@@ -1398,6 +1401,52 @@ impl eframe::App for AppState {
                         }
                     });
                 });
+
+            // About window (includes summary info and the application log)
+            if self.about_open {
+                egui::Window::new("About Uploader").open(&mut self.about_open).show(ctx, |ui| {
+                    ui.heading("Uploader (Rust)");
+                    ui.label(format!("Version: {}", env!("CARGO_PKG_VERSION")));
+                    ui.label(format!("Base URL: {}", upload::base_site_url()));
+                    ui.label(format!("Logged in: {}", self.logged_in_user.as_deref().unwrap_or("(not logged in)")));
+                    ui.separator();
+                    ui.label("Application logs:");
+                    let p = upload::log_file_path();
+                    let contents = std::fs::read_to_string(&p).unwrap_or_else(|_| "(no logs)".to_string());
+                    // expand BODY_FILE entries similar to the Logs window
+                    let mut display = String::new();
+                    for line in contents.lines() {
+                        display.push_str(line);
+                        display.push('\n');
+                        if let Some(idx) = line.find("BODY_FILE:") {
+                            let path = line[idx+"BODY_FILE:".len()..].trim();
+                            if !path.is_empty() {
+                                if let Ok(body) = std::fs::read_to_string(path) {
+                                    display.push_str("---- BODY START ----\n");
+                                    display.push_str(&body);
+                                    if !body.ends_with('\n') { display.push('\n'); }
+                                    display.push_str("---- BODY END ----\n");
+                                } else {
+                                    display.push_str("(failed to read body file)\n");
+                                }
+                            }
+                        }
+                    }
+                    let mut txt = display;
+                    egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                        ui.add(egui::TextEdit::multiline(&mut txt).desired_rows(10).desired_width(ui.available_width()));
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Refresh").clicked() {
+                            self.last_msg = "Logs refreshed".to_string();
+                        }
+                        if ui.button("Clear").clicked() {
+                            let _ = std::fs::write(p.clone(), "");
+                            self.last_msg = "Logs cleared".to_string();
+                        }
+                    });
+                });
+            }
             }
 
             // Metadata compare window (side-by-side)
