@@ -81,9 +81,10 @@ jobs:
           toolchain: stable
           override: true
       - name: Build uploader_rs (MSVC)
+        working-directory: uploader_rs
         env:
           RUSTFLAGS: "-C link-args=/DEFAULTLIB:Advapi32.lib"
-        run: cargo build --release -p uploader_rs
+        run: cargo build --release
       - name: Upload uploader_rs MSVC artifact
         uses: actions/upload-artifact@v4
         with:
