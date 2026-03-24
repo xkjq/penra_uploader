@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use dicom_object::open_file;
 use dicom_object::Tag;
 use dicom_pixeldata::PixelDecoder;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use serde::{Serialize, Deserialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender as MpscSender;
@@ -346,7 +346,17 @@ pub fn token_username() -> Option<String> {
                 return None;
             }
         };
-        if let Ok(r) = client.post(&token_check).header("Authorization", format!("Bearer {}", t)).send() {
+        // Try header auth first; if it errors (network/proxy/ssl issues), fall back to POSTing JSON like the Python client.
+        let header_resp = client.post(&token_check).header("Authorization", format!("Bearer {}", t)).send();
+        let resp = match header_resp {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                log_rpc_debug(&format!("Header token_check failed (will try JSON body): {}", e));
+                client.post(&token_check).json(&serde_json::json!({"token": t})).send()
+            }
+        };
+
+        if let Ok(r) = resp {
             let status = r.status();
             if let Ok(body) = r.text() {
                 if let Some(pf) = save_body_to_file(&body) {
@@ -371,6 +381,8 @@ pub fn token_username() -> Option<String> {
 
 pub fn make_client(token: Option<&str>) -> Result<Client, String> {
     let mut b = reqwest::blocking::Client::builder();
+    // reasonable default timeout to fail fast on problematic networks
+    b = b.timeout(Duration::from_secs(10));
     // priority: env var -> saved config -> default
     let skip = if let Ok(env) = std::env::var("UPLOADER_SKIP_SSL_VERIFY") {
         if !env.is_empty() { env.to_lowercase() == "1" } else { load_skip_ssl() }

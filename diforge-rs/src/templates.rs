@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Template {
@@ -30,28 +30,46 @@ impl Template {
 /// Load templates from `templates/project/` and `templates/user/`.
 pub fn load_templates() -> Vec<Template> {
     let mut out = Vec::new();
-    let project_dir = Path::new("templates/project");
-    let user_dir = Path::new("templates/user");
-    for dir in [project_dir, user_dir] {
-        if dir.exists() {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for e in entries.flatten() {
-                    let path = e.path();
-                    if path.is_file() {
-                        if let Ok(txt) = fs::read_to_string(&path) {
-                            // Try to parse YAML; if that fails, create a basic template
-                            match serde_yaml::from_str::<Template>(&txt) {
-                                Ok(t) => {
-                                    out.push(t);
-                                }
-                                Err(_) => {
-                                    out.push(Template {
-                                        id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()),
-                                        title: None,
-                                        applicable_codes: Vec::new(),
-                                        modalities: Vec::new(),
-                                        body: txt,
-                                    });
+    // Walk up from current dir and collect any `templates/` directories we find.
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(mut dir) = std::env::current_dir() {
+        loop {
+            let candidate = dir.join("templates");
+            if candidate.exists() {
+                roots.push(candidate);
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+    }
+    // If none found, fall back to local `templates/` path.
+    if roots.is_empty() {
+        roots.push(PathBuf::from("templates"));
+    }
+
+    for root in roots.iter() {
+        for dir in [root.join("project"), root.join("user")] {
+            if dir.exists() {
+                if let Ok(entries) = fs::read_dir(&dir) {
+                    for e in entries.flatten() {
+                        let path = e.path();
+                        if path.is_file() {
+                            if let Ok(txt) = fs::read_to_string(&path) {
+                                // Try to parse YAML; if that fails, create a basic template
+                                match serde_yaml::from_str::<Template>(&txt) {
+                                    Ok(t) => {
+                                        out.push(t);
+                                    }
+                                    Err(_) => {
+                                        out.push(Template {
+                                            id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()),
+                                            title: None,
+                                            applicable_codes: Vec::new(),
+                                            modalities: Vec::new(),
+                                            body: txt,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -60,6 +78,7 @@ pub fn load_templates() -> Vec<Template> {
             }
         }
     }
+
     if out.is_empty() {
         out.push(Template {
             id: Some("default1".to_string()),

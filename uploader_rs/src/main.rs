@@ -198,7 +198,16 @@ impl AppState {
                                 if upload::save_api_token(t) {
                                     let _ = tx.send("Login successful".to_string());
                                     // validate token and fetch username
-                                    match client.post(&token_check).header("Authorization", format!("Bearer {}", t)).send() {
+                                    // Try header auth first; if it errors, fall back to posting JSON like the Python client.
+                                    let header_resp = client.post(&token_check).header("Authorization", format!("Bearer {}", t)).send();
+                                    let vc_res = match header_resp {
+                                        Ok(v) => Ok(v),
+                                        Err(e) => {
+                                            let _ = tx.send(format!("Header token_check failed (will try JSON body): {}", e));
+                                            client.post(&token_check).json(&serde_json::json!({"token": t})).send()
+                                        }
+                                    };
+                                    match vc_res {
                                         Ok(vc) => {
                                             if vc.status().is_success() {
                                                 if let Ok(info) = vc.json::<serde_json::Value>() {
