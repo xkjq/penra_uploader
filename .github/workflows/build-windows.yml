@@ -15,6 +15,7 @@ on:
 jobs:
   build-msvc:
     name: Build (Windows MSVC)
+    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.target != 'uploader' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -66,6 +67,7 @@ jobs:
 
   build-uploader-only:
     name: Build uploader_rs (Windows only)
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'uploader' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
