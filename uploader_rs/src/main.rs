@@ -268,9 +268,41 @@ impl AppState {
                             let _ = tx.send(format!("Failed to create anon dir {}: {}", anon_dir.display(), e));
                         }
 
-                        // collect .dcm files recursively so subfolders (e.g. InSightExport) are included
+                        // Move the current export contents into a timestamped processing directory
+                        // to avoid the exporter clearing the files before we can act on them.
+                        let processing_parent = export
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(|| PathBuf::from("."))
+                            .join("processing");
+                        let processing_dir = processing_parent.join(format!("run-{}", Utc::now().timestamp_millis()));
+                        if let Err(e) = fs::create_dir_all(&processing_dir) {
+                            let _ = tx.send(format!("Failed to create processing dir {}: {}", processing_dir.display(), e));
+                        } else {
+                            // move (rename) each top-level entry from export -> processing_dir
+                            if let Ok(entries) = fs::read_dir(&export) {
+                                for e in entries.flatten() {
+                                    let p = e.path();
+                                    if let Some(fname) = p.file_name() {
+                                        let dest = processing_dir.join(fname);
+                                        match fs::rename(&p, &dest) {
+                                            Ok(_) => { let _ = tx.send(format!("Moved {} -> {}", p.display(), dest.display())); },
+                                            Err(_) => {
+                                                // fallback: copy + remove (handles cross-device moves)
+                                                match fs::copy(&p, &dest) {
+                                                    Ok(_) => { let _ = fs::remove_file(&p); let _ = tx.send(format!("Copied+removed {} -> {}", p.display(), dest.display())); },
+                                                    Err(e) => { let _ = tx.send(format!("Failed to move {}: {}", p.display(), e)); }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // collect .dcm files recursively from the processing dir so subfolders are included
                         let mut dcm_files: Vec<std::path::PathBuf> = Vec::new();
-                        let all = upload::collect_files_recursive(&export);
+                        let all = upload::collect_files_recursive(&processing_dir);
                         for p in all.into_iter() {
                             if p.extension().map(|e| e == "dcm").unwrap_or(false) {
                                 dcm_files.push(p);

@@ -815,62 +815,7 @@ impl eframe::App for ReportApp {
                             }
                         });
 
-                        ui.horizontal(|ui| {
-                            if ui.button("New").clicked() {
-                                self.editing_template = Some(templates::Template {
-                                    id: None,
-                                    title: None,
-                                    applicable_codes: Vec::new(),
-                                    modalities: Vec::new(),
-                                    body: "".to_string(),
-                                });
-                                self.editing_index = None;
-                                self.show_template_editor = true;
-                            }
-                            if ui.button("Edit").clicked() {
-                                if let Some(i) = self.selected_template {
-                                    if i < self.templates.len() {
-                                        self.editing_template = Some(self.templates[i].clone());
-                                        self.editing_index = Some(i);
-                                        self.show_template_editor = true;
-                                    }
-                                }
-                            }
-                            if ui.button("Delete").clicked() {
-                                if let Some(i) = self.selected_template {
-                                    if i < self.templates.len() {
-                                        let t = &self.templates[i];
-                                        // Try to find matching user file and delete it
-                                        let user_dir = std::path::Path::new("templates/user");
-                                        if user_dir.exists() {
-                                            if let Ok(entries) = std::fs::read_dir(user_dir) {
-                                                for e in entries.flatten() {
-                                                    let path = e.path();
-                                                    if path.is_file() {
-                                                        if let Ok(txt) = std::fs::read_to_string(&path) {
-                                                            // match by id or by body
-                                                            let matched = if let Ok(parsed) = serde_yaml::from_str::<templates::Template>(&txt) {
-                                                                (t.id.is_some() && parsed.id == t.id) || parsed.body == t.body
-                                                            } else {
-                                                                // plain text template file -> match by body
-                                                                txt == t.body
-                                                            };
-                                                            if matched {
-                                                                let _ = std::fs::remove_file(&path);
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        // refresh templates
-                                        self.templates = templates::load_templates();
-                                        self.selected_template = None;
-                                    }
-                                }
-                            }
-                        });
+                        // Template creation/edit/delete buttons removed — view-only in main UI.
 
                         let nicips: Vec<String> = self
                             .template_nicip
