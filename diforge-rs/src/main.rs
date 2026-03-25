@@ -308,6 +308,8 @@ impl ReportApp {
                 let start_pos = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or_else(|| self.buffer.report.chars().count()).saturating_sub(insert_len);
                 templates::ensure_finish_after(&mut self.buffer.report, start_pos, insert_len);
             }
+            // End the grouped undo step for inline insertions as well
+            self.buffer.end_undo_group();
         } else {
             // block-mode insertion: ensure surrounding blank lines if requested
             let mut body = rendered.clone();
