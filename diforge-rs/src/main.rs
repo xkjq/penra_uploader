@@ -1066,24 +1066,18 @@ impl eframe::App for ReportApp {
                                 let num = pos + 1; // 1-based numbering for shortcut keys
                                 ui.horizontal(|ui| {
                                     ui.label(format!("[{}]", num));
-                                    // small insertion-mode indicator
+                                    // small insertion-mode icon
                                     if t.insert_inline {
-                                        ui.label("(inline)");
+                                        ui.label("🔡 Inline");
                                     } else if t.ensure_surrounding_newlines {
-                                        ui.label("(block)");
+                                        ui.label("📦 Block");
                                     } else {
-                                        ui.label("(soft)");
+                                        ui.label("↔️ Soft");
                                     }
                                     if ui.small_button("Insert").clicked() {
                                         self.insert_template_at_caret(t);
                                     }
-                                    if ui.small_button("Vars").clicked() {
-                                        let key = t.id.clone().unwrap_or_else(|| t.title.clone().unwrap_or_else(|| t.display_title()));
-                                        let existing = self.user_template_vars.get(&key).cloned().unwrap_or_else(HashMap::new);
-                                        let vars_text = existing.into_iter().map(|(k,v)| format!("{}: {}", k, v)).collect::<Vec<_>>().join("\n");
-                                        self.edit_vars_text = vars_text;
-                                        self.show_edit_vars_dialog = Some(key);
-                                    }
+                                    // per-template vars editing removed from this panel (use dedicated dialog)
                                     let selected = self.selected_template.map(|s| s == i).unwrap_or(false);
                                     if ui.selectable_label(selected, title).clicked() {
                                         if selected {
@@ -1131,13 +1125,7 @@ impl eframe::App for ReportApp {
                                     let mut preview = t.body.clone();
                                     ui.add(egui::TextEdit::multiline(&mut preview).desired_rows(8).font(egui::TextStyle::Monospace).interactive(false));
                                     ui.horizontal(|ui| {
-                                        if ui.button("Edit vars").clicked() {
-                                            let key = t.id.clone().unwrap_or_else(|| t.title.clone().unwrap_or_else(|| t.display_title()));
-                                            let existing = self.user_template_vars.get(&key).cloned().unwrap_or_else(HashMap::new);
-                                            let vars_text = existing.into_iter().map(|(k,v)| format!("{}: {}", k, v)).collect::<Vec<_>>().join("\n");
-                                            self.edit_vars_text = vars_text;
-                                            self.show_edit_vars_dialog = Some(key);
-                                        }
+                                        // per-template vars editing removed from this panel
                                     });
                                 });
                             }
