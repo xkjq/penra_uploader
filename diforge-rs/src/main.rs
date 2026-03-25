@@ -208,6 +208,50 @@ impl Default for ReportApp {
 }
 
 impl ReportApp {
+    fn collect_template_var_names(&self) -> Vec<String> {
+        use std::collections::HashSet;
+        let mut seen: HashSet<String> = HashSet::new();
+        for t in self.templates.iter() {
+            // include explicit template.vars keys
+            for k in t.vars.keys() {
+                seen.insert(k.clone());
+            }
+            // scan body for occurrences like {{key}} or {{key|default}} or {{> partial}}
+            let s = &t.body;
+            let mut i = 0usize;
+            while let Some(start) = s[i..].find("{{") {
+                i += start + 2;
+                if let Some(end_rel) = s[i..].find("}}") {
+                    let chunk = &s[i..i+end_rel];
+                    let mut name = chunk.trim();
+                    // skip partial includes
+                    if name.starts_with('>') {
+                        // skip
+                    } else {
+                        // take up to '|' if present
+                        if let Some(pipe) = name.find('|') {
+                            name = &name[..pipe];
+                        }
+                        // trim whitespace and quotes
+                        let nm = name.trim().trim_matches('"').trim_matches('\'');
+                        if !nm.is_empty() {
+                            // only accept reasonable var name chars
+                            let filtered = nm.chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect::<String>();
+                            if !filtered.is_empty() {
+                                seen.insert(filtered);
+                            }
+                        }
+                    }
+                    i = i + end_rel + 2;
+                } else {
+                    break;
+                }
+            }
+        }
+        let mut out: Vec<String> = seen.into_iter().collect();
+        out.sort();
+        out
+    }
     fn to_settings(&self) -> Settings {
         Settings {
             vim_enabled: self.vim_enabled,
@@ -1141,14 +1185,27 @@ impl eframe::App for ReportApp {
                 // Global variables dialog (centralised vars)
                 if self.show_global_vars_dialog {
                     let mut open = true;
-                    let txt = &mut self.global_vars_text;
+                    // collect names first to avoid simultaneous mutable/immutable borrows of self
+                    let var_names = self.collect_template_var_names();
                     egui::Window::new("Global Variables").open(&mut open).show(ctx, |ui| {
+                        ui.label("Variables referenced by templates (marked = present in global vars):");
+                        ui.horizontal_wrapped(|ui| {
+                            for name in var_names.iter() {
+                                let present = self.global_vars.contains_key(name);
+                                if present {
+                                    ui.colored_label(egui::Color32::LIGHT_GREEN, format!("{} ✓", name));
+                                } else {
+                                    ui.colored_label(egui::Color32::LIGHT_RED, format!("{}", name));
+                                }
+                            }
+                        });
+                        ui.separator();
                         ui.label("Enter one key: value per line:");
-                        ui.add(egui::TextEdit::multiline(txt).desired_rows(12));
+                        ui.add(egui::TextEdit::multiline(&mut self.global_vars_text).desired_rows(12));
                         ui.horizontal(|ui| {
                             if ui.button("Save").clicked() {
                                 let mut m = HashMap::new();
-                                for line in txt.lines() {
+                                for line in self.global_vars_text.lines() {
                                     if let Some(idx) = line.find(':') {
                                         let k = line[..idx].trim();
                                         let v = line[idx+1..].trim();
