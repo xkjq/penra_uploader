@@ -26,7 +26,9 @@ struct Template {
     pub inline_finish: InlineFinish,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 enum InlineFinish {
@@ -36,12 +38,20 @@ enum InlineFinish {
     Both,
 }
 
-impl Default for InlineFinish { fn default() -> Self { InlineFinish::None } }
+impl Default for InlineFinish {
+    fn default() -> Self {
+        InlineFinish::None
+    }
+}
 
 impl Template {
     fn display_title(&self) -> String {
-        if let Some(t) = &self.title { return t.clone(); }
-        if let Some(id) = &self.id { return id.clone(); }
+        if let Some(t) = &self.title {
+            return t.clone();
+        }
+        if let Some(id) = &self.id {
+            return id.clone();
+        }
         self.body.lines().next().unwrap_or("(template)").to_string()
     }
 }
@@ -70,7 +80,9 @@ fn find_all_templates_roots() -> Vec<PathBuf> {
             if candidate.exists() {
                 roots.push(candidate);
             }
-            if !dir.pop() { break; }
+            if !dir.pop() {
+                break;
+            }
         }
     }
     roots
@@ -90,9 +102,26 @@ fn load_templates() -> Vec<Template> {
                         if path.is_file() {
                             if let Ok(txt) = fs::read_to_string(&path) {
                                 match serde_yaml::from_str::<Template>(&txt) {
-                                    Ok(mut t) => { t.source = Some(path.clone()); out.push(t); },
+                                    Ok(mut t) => {
+                                        t.source = Some(path.clone());
+                                        out.push(t);
+                                    }
                                     Err(_) => {
-                                        let mut t = Template { id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()), title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: txt, vars: HashMap::new(), insert_inline: false, ensure_surrounding_newlines: true, inline_finish: InlineFinish::None, source: Some(path.clone()) };
+                                        let mut t = Template {
+                                            id: path
+                                                .file_stem()
+                                                .and_then(|s| s.to_str())
+                                                .map(|s| s.to_string()),
+                                            title: None,
+                                            applicable_codes: Vec::new(),
+                                            modalities: Vec::new(),
+                                            body: txt,
+                                            vars: HashMap::new(),
+                                            insert_inline: false,
+                                            ensure_surrounding_newlines: true,
+                                            inline_finish: InlineFinish::None,
+                                            source: Some(path.clone()),
+                                        };
                                         out.push(t);
                                     }
                                 }
@@ -115,9 +144,26 @@ fn load_templates() -> Vec<Template> {
                             if path.is_file() {
                                 if let Ok(txt) = fs::read_to_string(&path) {
                                     match serde_yaml::from_str::<Template>(&txt) {
-                                        Ok(mut t) => { t.source = Some(path.clone()); out.push(t); },
+                                        Ok(mut t) => {
+                                            t.source = Some(path.clone());
+                                            out.push(t);
+                                        }
                                         Err(_) => {
-                                            let mut t = Template { id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()), title: None, applicable_codes: Vec::new(), modalities: Vec::new(), body: txt, vars: HashMap::new(), insert_inline: false, ensure_surrounding_newlines: true, inline_finish: InlineFinish::None, source: Some(path.clone()) };
+                                            let mut t = Template {
+                                                id: path
+                                                    .file_stem()
+                                                    .and_then(|s| s.to_str())
+                                                    .map(|s| s.to_string()),
+                                                title: None,
+                                                applicable_codes: Vec::new(),
+                                                modalities: Vec::new(),
+                                                body: txt,
+                                                vars: HashMap::new(),
+                                                insert_inline: false,
+                                                ensure_surrounding_newlines: true,
+                                                inline_finish: InlineFinish::None,
+                                                source: Some(path.clone()),
+                                            };
                                             out.push(t);
                                         }
                                     }
@@ -132,7 +178,18 @@ fn load_templates() -> Vec<Template> {
     }
     eprintln!("[template_editor] total templates: {}", out.len());
     if out.is_empty() {
-        out.push(Template { id: Some("default1".to_string()), title: Some("Default Clinical".to_string()), applicable_codes: Vec::new(), modalities: Vec::new(), body: "Clinical details:\n\nImpression:\n".to_string(), vars: HashMap::new(), source: None, insert_inline: false, ensure_surrounding_newlines: true, inline_finish: InlineFinish::None });
+        out.push(Template {
+            id: Some("default1".to_string()),
+            title: Some("Default Clinical".to_string()),
+            applicable_codes: Vec::new(),
+            modalities: Vec::new(),
+            body: "Clinical details:\n\nImpression:\n".to_string(),
+            vars: HashMap::new(),
+            source: None,
+            insert_inline: false,
+            ensure_surrounding_newlines: true,
+            inline_finish: InlineFinish::None,
+        });
     }
     out
 }
@@ -150,7 +207,15 @@ struct AppState {
 
 impl Default for AppState {
     fn default() -> Self {
-        Self { templates: load_templates(), selected: None, show_editor: false, editing: None, search: String::new(), filter_nicip: String::new(), filter_modality: String::new() }
+        Self {
+            templates: load_templates(),
+            selected: None,
+            show_editor: false,
+            editing: None,
+            search: String::new(),
+            filter_nicip: String::new(),
+            filter_modality: String::new(),
+        }
     }
 }
 
@@ -368,5 +433,9 @@ impl eframe::App for AppState {
 
 fn main() {
     let opts = eframe::NativeOptions::default();
-    eframe::run_native("Template Editor", opts, Box::new(|_cc| Ok(Box::new(AppState::default()))));
+    eframe::run_native(
+        "Template Editor",
+        opts,
+        Box::new(|_cc| Ok(Box::new(AppState::default()))),
+    );
 }

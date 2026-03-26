@@ -1,6 +1,6 @@
+use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use chrono::Local;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -30,7 +30,9 @@ pub struct Template {
     pub inline_finish: InlineFinish,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 pub enum InlineFinish {
@@ -41,23 +43,33 @@ pub enum InlineFinish {
 }
 
 impl Default for InlineFinish {
-    fn default() -> Self { InlineFinish::None }
+    fn default() -> Self {
+        InlineFinish::None
+    }
 }
 
 fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
-    s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
 }
 
 /// If needed, ensure the text immediately before `pos` ends a sentence and is
 /// followed by a single space. Returns the updated insertion char index.
 pub fn ensure_finish_before(report: &mut String, pos: usize) -> usize {
-    if pos == 0 { return pos; }
+    if pos == 0 {
+        return pos;
+    }
     let orig_total_chars = report.chars().count();
     // find last non-whitespace char before pos
     let mut last = None;
     for i in (0..pos).rev() {
         if let Some(c) = report.chars().nth(i) {
-            if !c.is_whitespace() { last = Some((i, c)); break; }
+            if !c.is_whitespace() {
+                last = Some((i, c));
+                break;
+            }
         }
     }
     let mut new_pos = pos;
@@ -85,7 +97,11 @@ pub fn ensure_finish_before(report: &mut String, pos: usize) -> usize {
         // find char-range of whitespace that originally followed the insertion point
         let mut ws_end_char = ins_char + 1;
         while let Some(c) = report.chars().nth(ws_end_char) {
-            if c.is_whitespace() { ws_end_char += 1; } else { break; }
+            if c.is_whitespace() {
+                ws_end_char += 1;
+            } else {
+                break;
+            }
         }
         let ws_end_byte = char_to_byte_idx(report, ws_end_char);
         // replace whatever whitespace exists with a single ASCII space
@@ -122,7 +138,11 @@ pub fn ensure_finish_after(report: &mut String, pos: usize, inserted_len: usize)
     let mut ws_start = check_pos;
     let mut ws_end = check_pos;
     while let Some(c) = report.chars().nth(ws_end) {
-        if c.is_whitespace() { ws_end += 1; } else { break; }
+        if c.is_whitespace() {
+            ws_end += 1;
+        } else {
+            break;
+        }
     }
     if ws_end > ws_start {
         let start = char_to_byte_idx(report, ws_start);
@@ -140,7 +160,10 @@ pub fn ensure_finish_after(report: &mut String, pos: usize, inserted_len: usize)
     let mut first_nonspace = None;
     let mut i = check_pos + 1; // skip the single space we ensured
     while let Some(c) = report.chars().nth(i) {
-        if !c.is_whitespace() { first_nonspace = Some(i); break; }
+        if !c.is_whitespace() {
+            first_nonspace = Some(i);
+            break;
+        }
         i += 1;
     }
     if let Some(fi) = first_nonspace {
@@ -204,15 +227,18 @@ pub fn load_templates() -> Vec<Template> {
                                     }
                                     Err(_) => {
                                         out.push(Template {
-                                                id: path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_string()),
-                                                title: None,
-                                                applicable_codes: Vec::new(),
-                                                modalities: Vec::new(),
-                                                body: txt,
-                                                vars: HashMap::new(),
-                                                insert_inline: false,
-                                                ensure_surrounding_newlines: true,
-                                                inline_finish: InlineFinish::None,
+                                            id: path
+                                                .file_stem()
+                                                .and_then(|s| s.to_str())
+                                                .map(|s| s.to_string()),
+                                            title: None,
+                                            applicable_codes: Vec::new(),
+                                            modalities: Vec::new(),
+                                            body: txt,
+                                            vars: HashMap::new(),
+                                            insert_inline: false,
+                                            ensure_surrounding_newlines: true,
+                                            inline_finish: InlineFinish::None,
                                         });
                                     }
                                 }
@@ -267,7 +293,10 @@ pub fn matches_template(t: &Template, study_codes: &[String], modality: Option<&
     }
     // Otherwise require intersection
     for sc in study_codes {
-        if t.applicable_codes.iter().any(|ac| ac.eq_ignore_ascii_case(sc)) {
+        if t.applicable_codes
+            .iter()
+            .any(|ac| ac.eq_ignore_ascii_case(sc))
+        {
             return true;
         }
     }
@@ -278,16 +307,29 @@ pub fn matches_template(t: &Template, study_codes: &[String], modality: Option<&
 /// Render template by replacing `{{key}}` and `{{key|default}}` with values in the `vars` map.
 ///
 /// Supports including other templates with `{{> name}}` where `name` is a template `id` or title.
-pub fn render_template(template: &str, vars: &HashMap<String, String>, all_templates: &[Template]) -> String {
+pub fn render_template(
+    template: &str,
+    vars: &HashMap<String, String>,
+    all_templates: &[Template],
+) -> String {
     // Inject automatic variables (date/time) into a local vars map so templates
     // can reference `{{date}}` and `{{time}}` without the caller providing them.
     let mut vars_with_defaults = vars.clone();
     // If caller passed a special entry `_template_defaults` this will be ignored here;
     // callers should merge per-template defaults before calling `render_template`.
-    vars_with_defaults.entry("date".to_string()).or_insert_with(|| Local::now().format("%Y-%m-%d").to_string());
-    vars_with_defaults.entry("time".to_string()).or_insert_with(|| Local::now().format("%H:%M").to_string());
+    vars_with_defaults
+        .entry("date".to_string())
+        .or_insert_with(|| Local::now().format("%Y-%m-%d").to_string());
+    vars_with_defaults
+        .entry("time".to_string())
+        .or_insert_with(|| Local::now().format("%H:%M").to_string());
 
-    fn recurse(tmpl: &str, vars: &HashMap<String, String>, all: &[Template], depth: usize) -> String {
+    fn recurse(
+        tmpl: &str,
+        vars: &HashMap<String, String>,
+        all: &[Template],
+        depth: usize,
+    ) -> String {
         if depth > 8 {
             return "".to_string();
         }
@@ -300,7 +342,11 @@ pub fn render_template(template: &str, vars: &HashMap<String, String>, all_templ
                 // peek to see if this is an include (>)
                 // consume any whitespace after the '{{'
                 while let Some(&w) = chars.peek() {
-                    if w.is_whitespace() { chars.next(); } else { break; }
+                    if w.is_whitespace() {
+                        chars.next();
+                    } else {
+                        break;
+                    }
                 }
                 if chars.peek() == Some(&'>') {
                     // include
@@ -308,16 +354,32 @@ pub fn render_template(template: &str, vars: &HashMap<String, String>, all_templ
                     // read until '}}'
                     let mut name = String::new();
                     while let Some(&nc) = chars.peek() {
-                        if nc == '}' { break; }
+                        if nc == '}' {
+                            break;
+                        }
                         name.push(nc);
                         chars.next();
                     }
                     // consume trailing '}}'
-                    if chars.peek() == Some(&'}') { chars.next(); }
-                    if chars.peek() == Some(&'}') { chars.next(); }
+                    if chars.peek() == Some(&'}') {
+                        chars.next();
+                    }
+                    if chars.peek() == Some(&'}') {
+                        chars.next();
+                    }
                     let name = name.trim();
                     // find template by id or title
-                    if let Some(found) = all.iter().find(|tt| tt.id.as_deref().map(|s| s.eq_ignore_ascii_case(name)).unwrap_or(false) || tt.title.as_deref().map(|s| s.eq_ignore_ascii_case(name)).unwrap_or(false)) {
+                    if let Some(found) = all.iter().find(|tt| {
+                        tt.id
+                            .as_deref()
+                            .map(|s| s.eq_ignore_ascii_case(name))
+                            .unwrap_or(false)
+                            || tt
+                                .title
+                                .as_deref()
+                                .map(|s| s.eq_ignore_ascii_case(name))
+                                .unwrap_or(false)
+                    }) {
                         let included = recurse(&found.body, vars, all, depth + 1);
                         out.push_str(&included);
                     } else {
@@ -329,12 +391,18 @@ pub fn render_template(template: &str, vars: &HashMap<String, String>, all_templ
                 // otherwise parse a variable expression up to the first '}}'
                 let mut key = String::new();
                 while let Some(&nc) = chars.peek() {
-                    if nc == '}' { break; }
+                    if nc == '}' {
+                        break;
+                    }
                     key.push(nc);
                     chars.next();
                 }
-                if chars.peek() == Some(&'}') { chars.next(); }
-                if chars.peek() == Some(&'}') { chars.next(); }
+                if chars.peek() == Some(&'}') {
+                    chars.next();
+                }
+                if chars.peek() == Some(&'}') {
+                    chars.next();
+                }
                 let key = key.trim();
                 let mut parts = key.splitn(2, '|');
                 let k = parts.next().unwrap_or("").trim();
@@ -354,7 +422,6 @@ pub fn render_template(template: &str, vars: &HashMap<String, String>, all_templ
     recurse(template, &vars_with_defaults, all_templates, 0)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,7 +430,7 @@ mod tests {
     fn test_ensure_finish_before_inserts_period_and_space() {
         let mut s = "This is a testand more".to_string();
         // position between 'test' and 'and' (char index 14)
-        let pos = s.chars().take_while(|&c| { true }).count();
+        let pos = s.chars().take_while(|&c| true).count();
         // compute pos for substring: find index of "and"
         let pos = s.find("and").unwrap();
         // convert byte index to char index
@@ -387,8 +454,28 @@ mod tests {
     #[test]
     fn test_render_template_includes_and_vars() {
         let mut all = Vec::new();
-        all.push(Template { id: Some("sig".to_string()), title: Some("Signature".to_string()), applicable_codes: Vec::new(), modalities: Vec::new(), body: "--\n{{name}}\n".to_string(), vars: HashMap::new(), insert_inline: true, ensure_surrounding_newlines: false, inline_finish: InlineFinish::None });
-        all.push(Template { id: Some("main".to_string()), title: Some("Main".to_string()), applicable_codes: Vec::new(), modalities: Vec::new(), body: "Findings... {{> sig }} Report by {{author|unknown}}.".to_string(), vars: HashMap::new(), insert_inline: true, ensure_surrounding_newlines: false, inline_finish: InlineFinish::None });
+        all.push(Template {
+            id: Some("sig".to_string()),
+            title: Some("Signature".to_string()),
+            applicable_codes: Vec::new(),
+            modalities: Vec::new(),
+            body: "--\n{{name}}\n".to_string(),
+            vars: HashMap::new(),
+            insert_inline: true,
+            ensure_surrounding_newlines: false,
+            inline_finish: InlineFinish::None,
+        });
+        all.push(Template {
+            id: Some("main".to_string()),
+            title: Some("Main".to_string()),
+            applicable_codes: Vec::new(),
+            modalities: Vec::new(),
+            body: "Findings... {{> sig }} Report by {{author|unknown}}.".to_string(),
+            vars: HashMap::new(),
+            insert_inline: true,
+            ensure_surrounding_newlines: false,
+            inline_finish: InlineFinish::None,
+        });
 
         let mut vars = HashMap::new();
         vars.insert("name".to_string(), "Dr Test".to_string());
@@ -482,7 +569,12 @@ mod tests {
         buf.insert_at_caret("ins");
         let insert_len = "ins".chars().count();
         // post
-        let start_pos = buf.caret_char_range.as_ref().map(|r| r.start).unwrap_or_else(|| buf.report.chars().count()).saturating_sub(insert_len);
+        let start_pos = buf
+            .caret_char_range
+            .as_ref()
+            .map(|r| r.start)
+            .unwrap_or_else(|| buf.report.chars().count())
+            .saturating_sub(insert_len);
         ensure_finish_after(&mut buf.report, start_pos, insert_len);
 
         let s = buf.report.clone();
@@ -501,7 +593,11 @@ mod tests {
         // caret at end
         buf.goto_end_of_file();
         let mut body = "Inserted block\n".to_string();
-        let pos = buf.caret_char_range.as_ref().map(|r| r.start).unwrap_or_else(|| buf.report.chars().count());
+        let pos = buf
+            .caret_char_range
+            .as_ref()
+            .map(|r| r.start)
+            .unwrap_or_else(|| buf.report.chars().count());
         // ensure_surrounding_newlines true -> prefix with newline if previous char != '\n'
         if pos > 0 {
             if let Some(ch) = buf.report.chars().nth(pos.saturating_sub(1)) {
@@ -511,7 +607,10 @@ mod tests {
             }
         }
         buf.insert_at_caret(&body);
-        assert!(buf.report.contains("Line two\nInserted block\n") || buf.report.contains("Line two\n\nInserted block\n"));
+        assert!(
+            buf.report.contains("Line two\nInserted block\n")
+                || buf.report.contains("Line two\n\nInserted block\n")
+        );
     }
 
     #[test]
@@ -534,4 +633,3 @@ mod tests {
         assert_eq!(buf.report, "hello. test you");
     }
 }
-

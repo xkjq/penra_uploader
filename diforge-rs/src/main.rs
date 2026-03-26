@@ -1,20 +1,20 @@
-use eframe::egui;
-use std::fs;
-use crossbeam_channel::{unbounded, Receiver};
 use anyhow::Result;
-use serde_json::Value;
+use crossbeam_channel::{unbounded, Receiver};
+use eframe::egui;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 
+mod dragon_ipc;
 mod speech;
 mod templates;
-mod dragon_ipc;
 mod vim;
 use speech::{create_vosk_engine, SpeechEngine};
 
-use std::ops::Range;
 use egui::text::{CCursor, CCursorRange};
+use std::ops::Range;
 
 // Simple Levenshtein distance implementation for fallback suggestions
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -22,18 +22,19 @@ fn levenshtein(a: &str, b: &str) -> usize {
     let b_chars: Vec<char> = b.chars().collect();
     let m = a_chars.len();
     let n = b_chars.len();
-    if m == 0 { return n; }
-    if n == 0 { return m; }
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
     let mut prev: Vec<usize> = (0..=n).collect();
-    let mut cur: Vec<usize> = vec![0; n+1];
+    let mut cur: Vec<usize> = vec![0; n + 1];
     for i in 0..m {
         cur[0] = i + 1;
         for j in 0..n {
             let cost = if a_chars[i] == b_chars[j] { 0 } else { 1 };
-            cur[j+1] = std::cmp::min(
-                std::cmp::min(prev[j+1] + 1, cur[j] + 1),
-                prev[j] + cost,
-            );
+            cur[j + 1] = std::cmp::min(std::cmp::min(prev[j + 1] + 1, cur[j] + 1), prev[j] + cost);
         }
         prev.clone_from(&cur);
     }
@@ -78,7 +79,11 @@ impl ReportApp {
         let w = word.trim().to_lowercase();
         if !set.contains(&w) {
             // append to file
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&user_dict) {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&user_dict)
+            {
                 use std::io::Write;
                 let _ = writeln!(f, "{}", w);
             }
@@ -152,7 +157,6 @@ fn save_settings(s: &Settings) -> Result<()> {
     fs::write(p, txt)?;
     Ok(())
 }
-
 
 struct ReportApp {
     buffer: vim::ReportBuffer,
@@ -244,7 +248,8 @@ impl Default for ReportApp {
 
         let mut app = Self {
             templates: templates::load_templates(),
-            engine: create_vosk_engine("models/vosk-small").unwrap_or_else(|_| create_vosk_engine("").unwrap()),
+            engine: create_vosk_engine("models/vosk-small")
+                .unwrap_or_else(|_| create_vosk_engine("").unwrap()),
             dictating: false,
             interim: String::new(),
             rx: Some(rx_local),
@@ -278,7 +283,11 @@ impl Default for ReportApp {
             spell_dict: {
                 // try loading a system wordlist if available
                 let mut set = std::collections::HashSet::new();
-                let candidates = ["/usr/share/dict/words", "/usr/dict/words", "/usr/share/dict/web2" ];
+                let candidates = [
+                    "/usr/share/dict/words",
+                    "/usr/dict/words",
+                    "/usr/share/dict/web2",
+                ];
                 for p in candidates.iter() {
                     if let Ok(txt) = std::fs::read_to_string(p) {
                         for ln in txt.lines() {
@@ -304,18 +313,26 @@ impl Default for ReportApp {
                         match std::panic::catch_unwind(|| hunspell::Hunspell::new(aff, dic)) {
                             Ok(hs) => Some(hs),
                             Err(_) => {
-                                eprintln!("[dbg] hunspell::Hunspell::new panicked for {} {}", aff, dic);
+                                eprintln!(
+                                    "[dbg] hunspell::Hunspell::new panicked for {} {}",
+                                    aff, dic
+                                );
                                 None
                             }
                         }
                     };
 
                     // 1) Env vars
-                    if let (Ok(aff), Ok(dic)) = (std::env::var("HUNSPELL_AFF"), std::env::var("HUNSPELL_DIC")) {
+                    if let (Ok(aff), Ok(dic)) =
+                        (std::env::var("HUNSPELL_AFF"), std::env::var("HUNSPELL_DIC"))
+                    {
                         if PathBuf::from(&aff).exists() && PathBuf::from(&dic).exists() {
                             h = try_init(&aff, &dic);
                         } else {
-                            eprintln!("[dbg] HUNSPELL_AFF/DIC env set but files missing: {} {}", aff, dic);
+                            eprintln!(
+                                "[dbg] HUNSPELL_AFF/DIC env set but files missing: {} {}",
+                                aff, dic
+                            );
                         }
                     }
 
@@ -329,7 +346,9 @@ impl Default for ReportApp {
                                 let aff = system_dir.join(format!("{}.aff", cand));
                                 let dic = system_dir.join(format!("{}.dic", cand));
                                 if aff.exists() && dic.exists() {
-                                    if let Some(hs) = try_init(&aff.to_string_lossy(), &dic.to_string_lossy()) {
+                                    if let Some(hs) =
+                                        try_init(&aff.to_string_lossy(), &dic.to_string_lossy())
+                                    {
                                         h = Some(hs);
                                         break;
                                     }
@@ -351,7 +370,9 @@ impl Default for ReportApp {
                                     let aff = vd.join("en_GB.aff");
                                     let dic = vd.join("en_GB.dic");
                                     if aff.exists() && dic.exists() {
-                                        if let Some(hs) = try_init(&aff.to_string_lossy(), &dic.to_string_lossy()) {
+                                        if let Some(hs) =
+                                            try_init(&aff.to_string_lossy(), &dic.to_string_lossy())
+                                        {
                                             h = Some(hs);
                                             break;
                                         }
@@ -385,10 +406,28 @@ impl Default for ReportApp {
         // Debug: print hunspell env and initialization status before applying settings
         let aff_env = std::env::var("HUNSPELL_AFF").ok();
         let dic_env = std::env::var("HUNSPELL_DIC").ok();
-        eprintln!("[dbg] HUNSPELL_AFF={:?}", aff_env.as_ref().map(|s| s.as_str()));
-        eprintln!("[dbg] HUNSPELL_DIC={:?}", dic_env.as_ref().map(|s| s.as_str()));
-        eprintln!("[dbg] HUNSPELL_AFF exists={}", aff_env.as_ref().map(|p| std::path::Path::new(p).exists()).unwrap_or(false));
-        eprintln!("[dbg] HUNSPELL_DIC exists={}", dic_env.as_ref().map(|p| std::path::Path::new(p).exists()).unwrap_or(false));
+        eprintln!(
+            "[dbg] HUNSPELL_AFF={:?}",
+            aff_env.as_ref().map(|s| s.as_str())
+        );
+        eprintln!(
+            "[dbg] HUNSPELL_DIC={:?}",
+            dic_env.as_ref().map(|s| s.as_str())
+        );
+        eprintln!(
+            "[dbg] HUNSPELL_AFF exists={}",
+            aff_env
+                .as_ref()
+                .map(|p| std::path::Path::new(p).exists())
+                .unwrap_or(false)
+        );
+        eprintln!(
+            "[dbg] HUNSPELL_DIC exists={}",
+            dic_env
+                .as_ref()
+                .map(|p| std::path::Path::new(p).exists())
+                .unwrap_or(false)
+        );
         eprintln!("[dbg] hunspell_present={}", app.hunspell.is_some());
 
         // Load persisted settings (if any) and apply
@@ -411,38 +450,45 @@ impl ReportApp {
     fn show_spell_window(&mut self, ctx: &egui::Context) {
         if let Some(c) = self.spell_context.clone() {
             let mut open = true;
-            egui::Window::new("Spelling").open(&mut open).fixed_pos(c.screen_pos).collapsible(false).resizable(false).show(ctx, |ui| {
-                ui.label(format!("Suggestions for: {}", c.word));
-                ui.separator();
-                if !c.suggestions.is_empty() {
-                    for s in c.suggestions.iter().take(8) {
-                        if ui.button(s).clicked() {
-                            // apply suggestion
-                            let mut rep = self.buffer.report.clone();
-                            rep.replace_range(c.start_byte..c.end_byte, s);
-                            self.buffer.report = rep;
-                            // attempt to set caret near replacement start
-                            let pos = self.buffer.report[..].chars().take(c.start_byte).count();
-                            self.buffer.caret_char_range = Some(pos..pos);
-                            self.spell_context = None;
+            egui::Window::new("Spelling")
+                .open(&mut open)
+                .fixed_pos(c.screen_pos)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!("Suggestions for: {}", c.word));
+                    ui.separator();
+                    if !c.suggestions.is_empty() {
+                        for s in c.suggestions.iter().take(8) {
+                            if ui.button(s).clicked() {
+                                // apply suggestion
+                                let mut rep = self.buffer.report.clone();
+                                rep.replace_range(c.start_byte..c.end_byte, s);
+                                self.buffer.report = rep;
+                                // attempt to set caret near replacement start
+                                let pos = self.buffer.report[..].chars().take(c.start_byte).count();
+                                self.buffer.caret_char_range = Some(pos..pos);
+                                self.spell_context = None;
+                            }
                         }
+                    } else {
+                        ui.label("No suggestions");
                     }
-                } else {
-                    ui.label("No suggestions");
-                }
-                ui.separator();
-                if ui.button("Add to dictionary").clicked() {
-                    let w = c.word.clone();
-                    self.add_word_to_user_dict(&w);
-                    self.spell_context = None;
-                }
-                if ui.button("Ignore").clicked() {
-                    self.spell_dict.insert(c.word.clone());
-                    let _ = save_settings(&self.to_settings());
-                    self.spell_context = None;
-                }
-            });
-            if !open { self.spell_context = None; }
+                    ui.separator();
+                    if ui.button("Add to dictionary").clicked() {
+                        let w = c.word.clone();
+                        self.add_word_to_user_dict(&w);
+                        self.spell_context = None;
+                    }
+                    if ui.button("Ignore").clicked() {
+                        self.spell_dict.insert(c.word.clone());
+                        let _ = save_settings(&self.to_settings());
+                        self.spell_context = None;
+                    }
+                });
+            if !open {
+                self.spell_context = None;
+            }
         }
     }
 }
@@ -462,7 +508,7 @@ impl ReportApp {
             while let Some(start) = s[i..].find("{{") {
                 i += start + 2;
                 if let Some(end_rel) = s[i..].find("}}") {
-                    let chunk = &s[i..i+end_rel];
+                    let chunk = &s[i..i + end_rel];
                     let mut name = chunk.trim();
                     // skip partial includes
                     if name.starts_with('>') {
@@ -476,7 +522,10 @@ impl ReportApp {
                         let nm = name.trim().trim_matches('"').trim_matches('\'');
                         if !nm.is_empty() {
                             // only accept reasonable var name chars
-                            let filtered = nm.chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect::<String>();
+                            let filtered = nm
+                                .chars()
+                                .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                                .collect::<String>();
                             if !filtered.is_empty() {
                                 seen.insert(filtered);
                             }
@@ -537,7 +586,9 @@ impl ReportApp {
         // start with per-template defaults
         let mut vars: std::collections::HashMap<String, String> = t.vars.clone();
         // overlay user overrides from settings (per-user saved values)
-        let key = t.id.clone().unwrap_or_else(|| t.title.clone().unwrap_or_else(|| t.display_title()));
+        let key =
+            t.id.clone()
+                .unwrap_or_else(|| t.title.clone().unwrap_or_else(|| t.display_title()));
         if let Some(user_map) = self.user_template_vars.get(&key) {
             for (k, v) in user_map.iter() {
                 vars.insert(k.clone(), v.clone());
@@ -552,9 +603,16 @@ impl ReportApp {
         let rendered = templates::render_template(&t.body, &vars, &self.templates);
 
         if t.insert_inline {
-            let mut pos = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or_else(|| self.buffer.report.chars().count());
+            let mut pos = self
+                .buffer
+                .caret_char_range
+                .as_ref()
+                .map(|r| r.start)
+                .unwrap_or_else(|| self.buffer.report.chars().count());
             // apply pre-finish if requested
-            if t.inline_finish == templates::InlineFinish::Pre || t.inline_finish == templates::InlineFinish::Both {
+            if t.inline_finish == templates::InlineFinish::Pre
+                || t.inline_finish == templates::InlineFinish::Both
+            {
                 pos = templates::ensure_finish_before(&mut self.buffer.report, pos);
                 self.buffer.set_caret_pos(pos);
             }
@@ -563,9 +621,17 @@ impl ReportApp {
             self.buffer.insert_at_caret(&rendered);
 
             // apply post-finish if requested (pos is insertion start)
-            if t.inline_finish == templates::InlineFinish::Post || t.inline_finish == templates::InlineFinish::Both {
+            if t.inline_finish == templates::InlineFinish::Post
+                || t.inline_finish == templates::InlineFinish::Both
+            {
                 let insert_len = rendered.chars().count();
-                let start_pos = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or_else(|| self.buffer.report.chars().count()).saturating_sub(insert_len);
+                let start_pos = self
+                    .buffer
+                    .caret_char_range
+                    .as_ref()
+                    .map(|r| r.start)
+                    .unwrap_or_else(|| self.buffer.report.chars().count())
+                    .saturating_sub(insert_len);
                 templates::ensure_finish_after(&mut self.buffer.report, start_pos, insert_len);
             }
             // End the grouped undo step for inline insertions as well
@@ -573,7 +639,12 @@ impl ReportApp {
         } else {
             // block-mode insertion: ensure surrounding blank lines if requested
             let mut body = rendered.clone();
-            let pos = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or_else(|| self.buffer.report.chars().count());
+            let pos = self
+                .buffer
+                .caret_char_range
+                .as_ref()
+                .map(|r| r.start)
+                .unwrap_or_else(|| self.buffer.report.chars().count());
             if t.ensure_surrounding_newlines {
                 // prefix
                 if pos > 0 {
@@ -631,7 +702,12 @@ impl ReportApp {
         self.mouse_dragging = false;
         self.mouse_drag_anchor = None;
         // collapse any selection into a canonical caret
-        let cur = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+        let cur = self
+            .buffer
+            .caret_char_range
+            .as_ref()
+            .map(|r| r.start)
+            .unwrap_or(0);
         self.buffer.caret_char_range = Some(cur..cur);
     }
 
@@ -654,18 +730,28 @@ impl ReportApp {
                 if !t.applicable_codes.is_empty() {
                     let mut matched = false;
                     for sc in &nicips {
-                        if t.applicable_codes.iter().any(|ac| ac.eq_ignore_ascii_case(sc)) {
+                        if t.applicable_codes
+                            .iter()
+                            .any(|ac| ac.eq_ignore_ascii_case(sc))
+                        {
                             matched = true;
                             break;
                         }
                     }
-                    if !matched { continue; }
+                    if !matched {
+                        continue;
+                    }
                 }
             }
             let title = t.display_title();
             if !self.template_search.is_empty()
-                && !title.to_lowercase().contains(&self.template_search.to_lowercase())
-                && !t.body.to_lowercase().contains(&self.template_search.to_lowercase())
+                && !title
+                    .to_lowercase()
+                    .contains(&self.template_search.to_lowercase())
+                && !t
+                    .body
+                    .to_lowercase()
+                    .contains(&self.template_search.to_lowercase())
             {
                 continue;
             }
@@ -719,13 +805,25 @@ impl eframe::App for ReportApp {
             use egui::Event;
             let mut remove_idxs: Vec<usize> = Vec::new();
             for (idx, ev) in i.events.iter().enumerate() {
-                if let Event::Key { key, pressed: true, modifiers, .. } = ev {
+                if let Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = ev
+                {
                     if modifiers.alt {
                         match key {
-                            egui::Key::Num1 | egui::Key::Num2 | egui::Key::Num3 |
-                            egui::Key::Num4 | egui::Key::Num5 | egui::Key::Num6 |
-                            egui::Key::Num7 | egui::Key::Num8 | egui::Key::Num9 |
-                            egui::Key::Num0 => {
+                            egui::Key::Num1
+                            | egui::Key::Num2
+                            | egui::Key::Num3
+                            | egui::Key::Num4
+                            | egui::Key::Num5
+                            | egui::Key::Num6
+                            | egui::Key::Num7
+                            | egui::Key::Num8
+                            | egui::Key::Num9
+                            | egui::Key::Num0 => {
                                 // record key for handling after we leave input_mut
                                 removed_alt_keys.push(*key);
                                 remove_idxs.push(idx);
@@ -1032,7 +1130,7 @@ impl eframe::App for ReportApp {
                                     _ => {}
                                 }
                             }
-                            
+
                         }
                     }
 
@@ -1850,4 +1948,3 @@ fn main() {
         Box::new(|_cc| Ok(Box::new(ReportApp::default()))),
     );
 }
-

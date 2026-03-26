@@ -1,5 +1,5 @@
 use super::*;
-use egui::{Rect, Pos2};
+use egui::{Pos2, Rect};
 
 // Helper used by tests to reproduce the galley-based nearest-char mapping
 // without requiring a full egui runloop. `pos_from_cursor` should return
@@ -63,7 +63,9 @@ mod selection_tests {
         assert_eq!(e, 6);
 
         // Now check visual sync computation used in UI: display_end adds 1 when e > s
-        let display_end = (anchor.max(cur)).min(total).saturating_add(if anchor.max(cur) > s { 1 } else { 0 });
+        let display_end = (anchor.max(cur))
+            .min(total)
+            .saturating_add(if anchor.max(cur) > s { 1 } else { 0 });
         assert_eq!(display_end, 6);
 
         // Toggle visual mode via the public handler and ensure caret range initialized
@@ -127,15 +129,62 @@ mod selection_tests {
         let mut obj: Option<char> = None;
         let mut anchor: Option<usize> = None;
 
-        eprintln!("before v: report='{}' caret={:?} mode={:?}", b.report, b.caret_char_range, mode);
-        crate::vim::ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'v');
-        eprintln!("after v: report='{}' caret={:?} mode={:?} anchor={:?}", b.report, b.caret_char_range, mode, anchor);
-        crate::vim::ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'l');
-        eprintln!("after l1: report='{}' caret={:?} mode={:?} anchor={:?}", b.report, b.caret_char_range, mode, anchor);
-        crate::vim::ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'l');
-        eprintln!("after l2: report='{}' caret={:?} mode={:?} anchor={:?}", b.report, b.caret_char_range, mode, anchor);
-        crate::vim::ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
-        eprintln!("after d: report='{}' caret={:?} mode={:?} anchor={:?}", b.report, b.caret_char_range, mode, anchor);
+        eprintln!(
+            "before v: report='{}' caret={:?} mode={:?}",
+            b.report, b.caret_char_range, mode
+        );
+        crate::vim::ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'v',
+        );
+        eprintln!(
+            "after v: report='{}' caret={:?} mode={:?} anchor={:?}",
+            b.report, b.caret_char_range, mode, anchor
+        );
+        crate::vim::ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'l',
+        );
+        eprintln!(
+            "after l1: report='{}' caret={:?} mode={:?} anchor={:?}",
+            b.report, b.caret_char_range, mode, anchor
+        );
+        crate::vim::ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'l',
+        );
+        eprintln!(
+            "after l2: report='{}' caret={:?} mode={:?} anchor={:?}",
+            b.report, b.caret_char_range, mode, anchor
+        );
+        crate::vim::ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'd',
+        );
+        eprintln!(
+            "after d: report='{}' caret={:?} mode={:?} anchor={:?}",
+            b.report, b.caret_char_range, mode, anchor
+        );
         assert_eq!(b.report, "adef");
     }
 }
