@@ -735,7 +735,6 @@ impl eframe::App for ReportApp {
                     if is_interactive {
                         if let Some(ccr) = output.cursor_range {
                             let sorted = ccr.as_sorted_char_range();
-                            eprintln!("[dbg] widget.cursor_range -> {:?}", sorted);
                             self.buffer.caret_char_range = Some(sorted);
                         }
                     }
