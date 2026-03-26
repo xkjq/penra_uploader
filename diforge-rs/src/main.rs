@@ -364,6 +364,65 @@ impl ReportApp {
         let cur = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
         self.buffer.caret_char_range = Some(cur..cur);
     }
+
+    // Replicate the Alt+Number quick-insert behavior as performed in the
+    // UI event handler. This helper intentionally does NOT attempt to
+    // remove any numeric character that the TextEdit may have inserted; it
+    // reproduces the raw sequence so tests can assert the original buggy
+    // behaviour.
+    pub fn alt_number_quick_insert(&mut self, key: egui::Key) {
+        // Build visible template index list using current filters
+        let nicips: Vec<String> = self
+            .template_nicip
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let mut visible_indices: Vec<usize> = Vec::new();
+        for (i, t) in self.templates.iter().enumerate() {
+            if !nicips.is_empty() {
+                if !t.applicable_codes.is_empty() {
+                    let mut matched = false;
+                    for sc in &nicips {
+                        if t.applicable_codes.iter().any(|ac| ac.eq_ignore_ascii_case(sc)) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if !matched { continue; }
+                }
+            }
+            let title = t.display_title();
+            if !self.template_search.is_empty()
+                && !title.to_lowercase().contains(&self.template_search.to_lowercase())
+                && !t.body.to_lowercase().contains(&self.template_search.to_lowercase())
+            {
+                continue;
+            }
+            visible_indices.push(i);
+        }
+
+        let target_opt = match key {
+            egui::Key::Num1 => Some(0usize),
+            egui::Key::Num2 => Some(1usize),
+            egui::Key::Num3 => Some(2usize),
+            egui::Key::Num4 => Some(3usize),
+            egui::Key::Num5 => Some(4usize),
+            egui::Key::Num6 => Some(5usize),
+            egui::Key::Num7 => Some(6usize),
+            egui::Key::Num8 => Some(7usize),
+            egui::Key::Num9 => Some(8usize),
+            egui::Key::Num0 => Some(9usize),
+            _ => None,
+        };
+
+        if let Some(pos) = target_opt {
+            if let Some(&tmpl_i) = visible_indices.get(pos) {
+                let t = self.templates[tmpl_i].clone();
+                self.insert_template_at_caret(&t);
+            }
+        }
+    }
 }
 
 impl eframe::App for ReportApp {
@@ -378,6 +437,44 @@ impl eframe::App for ReportApp {
             }
         }
         // (removed SidePanel overlay; templates render inline when requested)
+
+        // Intercept Alt+Number key events before widgets (e.g. TextEdit)
+        // handle them here and remove the event so the TextEdit doesn't
+        // receive and insert the numeric character.
+        // Collect and remove Alt+Number events, recording which keys were seen
+        // so we can handle insertion while ensuring widgets (TextEdit) don't
+        // receive the numeric character.
+        let mut removed_alt_keys: Vec<egui::Key> = Vec::new();
+        ctx.input_mut(|i| {
+            use egui::Event;
+            let mut remove_idxs: Vec<usize> = Vec::new();
+            for (idx, ev) in i.events.iter().enumerate() {
+                if let Event::Key { key, pressed: true, modifiers, .. } = ev {
+                    if modifiers.alt {
+                        match key {
+                            egui::Key::Num1 | egui::Key::Num2 | egui::Key::Num3 |
+                            egui::Key::Num4 | egui::Key::Num5 | egui::Key::Num6 |
+                            egui::Key::Num7 | egui::Key::Num8 | egui::Key::Num9 |
+                            egui::Key::Num0 => {
+                                // record key for handling after we leave input_mut
+                                removed_alt_keys.push(*key);
+                                remove_idxs.push(idx);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            // Remove matched events in reverse so indices remain valid
+            for &r in remove_idxs.iter().rev() {
+                i.events.remove(r);
+            }
+        });
+
+        // Now perform quick-insert for each removed Alt+number key
+        for key in removed_alt_keys.into_iter() {
+            self.alt_number_quick_insert(key);
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // Build a two-column layout: left = main report area, right = templates (fixed width)
@@ -439,7 +536,11 @@ impl eframe::App for ReportApp {
                     if !self.vim_enabled {
                         self.ensure_vim_disabled_state();
                     }
-                    let is_interactive = !self.vim_enabled || self.vim_mode == VimMode::Insert;
+                    // If Alt is currently pressed, make the TextEdit non-interactive
+                    // so it doesn't receive/insert the numeric character while we
+                    // intercept Alt+Number events.
+                    let alt_pressed = ctx.input(|i| i.modifiers.alt);
+                    let is_interactive = (!self.vim_enabled || self.vim_mode == VimMode::Insert) && !alt_pressed;
                     let mut text_edit = egui::TextEdit::multiline(&mut self.buffer.report)
                         .desired_rows(20)
                         .desired_width(left_w)
@@ -497,86 +598,7 @@ impl eframe::App for ReportApp {
                                     _ => {}
                                 }
                             }
-                            // Alt + number quick-insert handling. Map Num1..Num9 to visible templates 1..9.
-                            if modifiers.alt {
-                                // Build visible template index list on-demand (same filtering rules as rendering)
-                                let nicips: Vec<String> = self
-                                    .template_nicip
-                                    .split(',')
-                                    .map(|s| s.trim().to_string())
-                                    .filter(|s| !s.is_empty())
-                                    .collect();
-                                let mut visible_indices: Vec<usize> = Vec::new();
-                                for (i, t) in self.templates.iter().enumerate() {
-                                    if !nicips.is_empty() {
-                                        if !t.applicable_codes.is_empty() {
-                                            let mut matched = false;
-                                            for sc in &nicips {
-                                                if t.applicable_codes.iter().any(|ac| ac.eq_ignore_ascii_case(sc)) {
-                                                    matched = true;
-                                                    break;
-                                                }
-                                            }
-                                            if !matched { continue; }
-                                        }
-                                    }
-                                    let title = t.display_title();
-                                    if !self.template_search.is_empty()
-                                        && !title.to_lowercase().contains(&self.template_search.to_lowercase())
-                                        && !t.body.to_lowercase().contains(&self.template_search.to_lowercase())
-                                    {
-                                        continue;
-                                    }
-                                    visible_indices.push(i);
-                                }
-
-                                let target_opt = match key {
-                                    egui::Key::Num1 => Some(0usize),
-                                    egui::Key::Num2 => Some(1usize),
-                                    egui::Key::Num3 => Some(2usize),
-                                    egui::Key::Num4 => Some(3usize),
-                                    egui::Key::Num5 => Some(4usize),
-                                    egui::Key::Num6 => Some(5usize),
-                                    egui::Key::Num7 => Some(6usize),
-                                    egui::Key::Num8 => Some(7usize),
-                                    egui::Key::Num9 => Some(8usize),
-                                    egui::Key::Num0 => Some(9usize),
-                                    _ => None,
-                                };
-
-                                if let Some(pos) = target_opt {
-                                        if let Some(&tmpl_i) = visible_indices.get(pos) {
-                                        let t = self.templates[tmpl_i].clone();
-                                        self.insert_template_at_caret(&t);
-                                        // If vim emulation is disabled the TextEdit may also
-                                        // have inserted the numeric key. Remove that extra
-                                        // character (if present) at the original caret
-                                        // position to avoid the digit appearing before
-                                        // the template.
-                                        if !self.vim_enabled {
-                                            if let Some(orig_pos) = caret_before_events {
-                                                // map key -> digit char
-                                                let digit_char = match key {
-                                                    egui::Key::Num1 => '1', egui::Key::Num2 => '2', egui::Key::Num3 => '3',
-                                                    egui::Key::Num4 => '4', egui::Key::Num5 => '5', egui::Key::Num6 => '6',
-                                                    egui::Key::Num7 => '7', egui::Key::Num8 => '8', egui::Key::Num9 => '9', egui::Key::Num0 => '0',
-                                                    _ => '\0',
-                                                };
-                                                if digit_char != '\0' {
-                                                    // remove char at orig_pos if it matches
-                                                    let mut chars: Vec<char> = self.buffer.report.chars().collect();
-                                                    if orig_pos < chars.len() && chars[orig_pos] == digit_char {
-                                                        chars.remove(orig_pos);
-                                                        self.buffer.report = chars.into_iter().collect();
-                                                        // ensure caret remains at insertion start
-                                                        self.buffer.caret_char_range = Some(orig_pos..orig_pos);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            
                         }
                     }
 
