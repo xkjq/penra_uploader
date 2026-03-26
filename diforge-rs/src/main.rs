@@ -484,6 +484,9 @@ impl eframe::App for ReportApp {
                     // when Vim emulation is disabled by handling Ctrl-Z / Ctrl-Y
                     // here unconditionally.
                     let events = ctx.input(|i| i.events.clone());
+                    // remember canonical caret before events so we can clean up any
+                    // accidental character insertions caused by modifier shortcuts
+                    let caret_before_events = self.buffer.caret_char_range.as_ref().map(|r| r.start);
 
                     for ev in events.iter() {
                         if let Event::Key { key, pressed: true, modifiers, .. } = ev {
@@ -544,8 +547,33 @@ impl eframe::App for ReportApp {
                                 if let Some(pos) = target_opt {
                                         if let Some(&tmpl_i) = visible_indices.get(pos) {
                                         let t = self.templates[tmpl_i].clone();
-                                        let vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
                                         self.insert_template_at_caret(&t);
+                                        // If vim emulation is disabled the TextEdit may also
+                                        // have inserted the numeric key. Remove that extra
+                                        // character (if present) at the original caret
+                                        // position to avoid the digit appearing before
+                                        // the template.
+                                        if !self.vim_enabled {
+                                            if let Some(orig_pos) = caret_before_events {
+                                                // map key -> digit char
+                                                let digit_char = match key {
+                                                    egui::Key::Num1 => '1', egui::Key::Num2 => '2', egui::Key::Num3 => '3',
+                                                    egui::Key::Num4 => '4', egui::Key::Num5 => '5', egui::Key::Num6 => '6',
+                                                    egui::Key::Num7 => '7', egui::Key::Num8 => '8', egui::Key::Num9 => '9', egui::Key::Num0 => '0',
+                                                    _ => '\0',
+                                                };
+                                                if digit_char != '\0' {
+                                                    // remove char at orig_pos if it matches
+                                                    let mut chars: Vec<char> = self.buffer.report.chars().collect();
+                                                    if orig_pos < chars.len() && chars[orig_pos] == digit_char {
+                                                        chars.remove(orig_pos);
+                                                        self.buffer.report = chars.into_iter().collect();
+                                                        // ensure caret remains at insertion start
+                                                        self.buffer.caret_char_range = Some(orig_pos..orig_pos);
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -892,19 +920,22 @@ impl eframe::App for ReportApp {
                                 }
                             }
                             // No visible drag handles (selection is shown in-text).
-                            // Draw a visible caret as a filled rectangle the width of a character.
+                            // Draw a visible caret. When Vim emulation is enabled draw a thick block;
+                            // otherwise draw a thin caret marker so it doesn't persist as a wide indicator.
                             let caret_height = 18.0_f32;
                             // Use the galley cursor rect width as a best-effort char width; fallback to 8.0
                             let mut char_w = (galley_pos.max.x - galley_pos.min.x).abs();
                             if char_w <= 0.1 {
                                 char_w = 8.0;
                             }
+                            // If vim is disabled use a narrow caret (1.0-2.0 px) instead of block width
+                            let caret_w = if self.vim_enabled { char_w } else { 1.5_f32 };
                             // Nudge the caret slightly right for visual alignment
                             let nudge = 2.0_f32;
                             let x = (screen_pos.x + self.caret_x_offset + nudge).clamp(output.response.rect.min.x, output.response.rect.max.x - 1.0);
                             let y0 = screen_pos.y.clamp(output.response.rect.min.y, output.response.rect.max.y - caret_height);
                             let y1 = y0 + caret_height;
-                            let x2 = (x + char_w).min(output.response.rect.max.x - 1.0);
+                            let x2 = (x + caret_w).min(output.response.rect.max.x - 1.0);
                             let rect = egui::Rect::from_min_max(egui::pos2(x, y0), egui::pos2(x2, y1));
                             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(255, 80, 80));
                             if self.show_caret_debug {
