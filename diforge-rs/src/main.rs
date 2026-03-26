@@ -794,7 +794,10 @@ impl eframe::App for ReportApp {
                     if self.spell_enabled {
                         // Use the response's context menu so it only opens when right-clicking the TextEdit
                         let _ = output.response.context_menu(|ui| {
-                            if let Some(pointer_pos) = ui.input(|i| i.pointer.interact_pos()) {
+                            // force a minimum width so the menu doesn't shrink on reopen
+                            let menu_width = 300.0f32;
+                            ui.set_min_width(menu_width);
+                            if let Some(pointer_pos) = ui.input(|i| i.pointer.press_origin().or(i.pointer.interact_pos())) {
                                 // Find which word (if any) under the pointer is misspelled
                                 let re = regex::Regex::new(r"[A-Za-z']{2,}").unwrap();
                                 let text = &self.buffer.report;
@@ -826,7 +829,7 @@ impl eframe::App for ReportApp {
                                             if let Some(hs) = &self.hunspell {
                                                 let suggests = hs.suggest(&word);
                                                 for s in suggests.iter().take(6) {
-                                                    if ui.button(s).clicked() {
+                                                    if ui.add_sized(egui::vec2(menu_width, 0.0), egui::Button::new(s)).clicked() {
                                                         // replace first occurrence at this match with suggestion
                                                         let mut rep = self.buffer.report.clone();
                                                         // replace by byte indices
