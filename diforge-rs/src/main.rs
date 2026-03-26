@@ -351,6 +351,19 @@ impl ReportApp {
         self.user_template_vars = s.user_template_vars;
         self.global_vars = s.global_vars;
     }
+
+    // Ensure all vim-related runtime state is cleared so emulation is fully disabled.
+    pub fn ensure_vim_disabled_state(&mut self) {
+        self.vim_mode = VimMode::Normal;
+        self.last_vim_key = None;
+        self.last_vim_object = None;
+        self.visual_anchor = None;
+        self.mouse_dragging = false;
+        self.mouse_drag_anchor = None;
+        // collapse any selection into a canonical caret
+        let cur = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+        self.buffer.caret_char_range = Some(cur..cur);
+    }
 }
 
 impl eframe::App for ReportApp {
@@ -422,6 +435,10 @@ impl eframe::App for ReportApp {
                     // If Vim emulation is enabled and we are NOT in Insert mode, prevent the TextEdit
                     // from applying direct edits by restoring any accidental changes.
                     let prev_report = self.buffer.report.clone();
+                    // If vim emulation is disabled, ensure no vim runtime state persists.
+                    if !self.vim_enabled {
+                        self.ensure_vim_disabled_state();
+                    }
                     let is_interactive = !self.vim_enabled || self.vim_mode == VimMode::Insert;
                     let mut text_edit = egui::TextEdit::multiline(&mut self.buffer.report)
                         .desired_rows(20)
@@ -940,9 +957,22 @@ impl eframe::App for ReportApp {
                         ui.checkbox(&mut self.show_caret_debug, "Debug caret pos");
                         let vim_resp = ui.checkbox(&mut self.vim_enabled, "Vim emulation");
                         if vim_resp.changed() {
+                            // ensure we always reset modal state when toggling
                             if self.vim_enabled {
+                                // enabling vim: start in Normal mode
                                 self.vim_mode = VimMode::Normal;
                                 self.last_vim_key = None;
+                                self.last_vim_object = None;
+                                // preserve caret selection as-is
+                            } else {
+                                // disabling vim: clear any visual-mode artifacts
+                                self.vim_mode = VimMode::Normal;
+                                self.last_vim_key = None;
+                                self.last_vim_object = None;
+                                self.visual_anchor = None;
+                                // collapse any selection to a canonical caret position
+                                let cur = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                                self.buffer.caret_char_range = Some(cur..cur);
                             }
                             // persist settings when user toggles Vim emulation
                             let _ = save_settings(&self.to_settings());

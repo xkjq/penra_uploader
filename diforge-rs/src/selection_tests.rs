@@ -92,6 +92,28 @@ mod selection_tests {
     }
 
     #[test]
+    fn ensure_vim_disabled_clears_state() {
+        // create app and set some vim state
+        let mut app = ReportApp::default();
+        app.vim_enabled = true;
+        app.vim_mode = crate::VimMode::Visual;
+        app.visual_anchor = Some(3);
+        app.buffer.caret_char_range = Some(3..7);
+        app.mouse_dragging = true;
+        app.mouse_drag_anchor = Some(3);
+
+        // now disable and ensure helper clears everything
+        app.vim_enabled = false;
+        app.ensure_vim_disabled_state();
+
+        assert_eq!(app.vim_mode, crate::VimMode::Normal);
+        assert_eq!(app.visual_anchor, None);
+        assert_eq!(app.buffer.caret_char_range, Some(3..3));
+        assert_eq!(app.mouse_dragging, false);
+        assert_eq!(app.mouse_drag_anchor, None);
+    }
+
+    #[test]
     #[ignore]
     fn reproduce_visual_d_failure_trace() {
         // Reproduce the failing test steps and print intermediate states for debugging.
