@@ -186,6 +186,8 @@ struct ReportApp {
     // mouse drag tracking for click-and-drag selection when TextEdit is non-interactive
     mouse_dragging: bool,
     mouse_drag_anchor: Option<usize>,
+    // remember last right-click position so context menus can remain anchored
+    last_right_click_pos: Option<egui::Pos2>,
     // numeric prefix for vim commands (e.g., `3dw`)
     vim_count: Option<usize>,
     // Spellchecking
@@ -243,6 +245,7 @@ impl Default for ReportApp {
             visual_anchor: None,
             mouse_dragging: false,
             mouse_drag_anchor: None,
+            last_right_click_pos: None,
             vim_count: None,
             spell_enabled: false,
             spell_dict: {
@@ -797,7 +800,13 @@ impl eframe::App for ReportApp {
                             // force a minimum width so the menu doesn't shrink on reopen
                             let menu_width = 300.0f32;
                             ui.set_min_width(menu_width);
-                            if let Some(pointer_pos) = ui.input(|i| i.pointer.press_origin().or(i.pointer.interact_pos())) {
+                            // Prefer the original press origin (frame of click), then any stored
+                            // right-click pos. Avoid using the live interact_pos alone because
+                            // that causes the menu contents to change as the mouse moves.
+                            if let Some(pointer_pos) = ui.input(|i| i.pointer.press_origin())
+                                .or(self.last_right_click_pos)
+                                .or_else(|| ui.input(|i| i.pointer.interact_pos()))
+                            {
                                 // Find which word (if any) under the pointer is misspelled
                                 let re = regex::Regex::new(r"[A-Za-z']{2,}").unwrap();
                                 let text = &self.buffer.report;
@@ -914,6 +923,17 @@ impl eframe::App for ReportApp {
                     // from the laid-out galley so the caret still moves without
                     // giving the widget keyboard focus.
                     for ev in events.iter() {
+                        // Capture right-click position so context menus can be anchored
+                        if let Event::PointerButton { pos, pressed, button, .. } = ev {
+                            if *button == egui::PointerButton::Secondary && *pressed {
+                                if output.response.rect.contains(*pos) {
+                                    self.last_right_click_pos = Some(*pos);
+                                } else {
+                                    self.last_right_click_pos = None;
+                                }
+                            }
+                        }
+
                         if let Event::PointerButton { pos, pressed, button, .. } = ev {
                             if *button != egui::PointerButton::Primary { continue; }
                             // No special handle hit-testing; fall through to normal logic
