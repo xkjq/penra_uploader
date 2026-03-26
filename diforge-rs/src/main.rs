@@ -16,6 +16,30 @@ use speech::{create_vosk_engine, SpeechEngine};
 use std::ops::Range;
 use egui::text::{CCursor, CCursorRange};
 
+// Simple Levenshtein distance implementation for fallback suggestions
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let m = a_chars.len();
+    let n = b_chars.len();
+    if m == 0 { return n; }
+    if n == 0 { return m; }
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut cur: Vec<usize> = vec![0; n+1];
+    for i in 0..m {
+        cur[0] = i + 1;
+        for j in 0..n {
+            let cost = if a_chars[i] == b_chars[j] { 0 } else { 1 };
+            cur[j+1] = std::cmp::min(
+                std::cmp::min(prev[j+1] + 1, cur[j] + 1),
+                prev[j] + cost,
+            );
+        }
+        prev.clone_from(&cur);
+    }
+    cur[n]
+}
+
 #[cfg(test)]
 mod selection_tests;
 #[derive(PartialEq, Eq, Serialize, Deserialize, Clone, Copy, Debug)]
@@ -265,14 +289,79 @@ impl Default for ReportApp {
             spell_dict_path: None,
             #[cfg(feature = "hunspell")]
             hunspell: {
-                // Try to initialize Hunspell from env vars HUNSPELL_AFF and HUNSPELL_DIC
+                // Try to initialize Hunspell from env vars, common system locations,
+                // or a project-local vendor directory (e.g. third_party/hunspell/en_GB/)
                 let mut h = None;
                 #[cfg(feature = "hunspell")]
                 {
+                    use std::path::PathBuf;
+                    // Helper to attempt initialization and log failures
+                    let try_init = |aff: &str, dic: &str| -> Option<hunspell::Hunspell> {
+                        eprintln!("[dbg] trying hunspell aff='{}' dic='{}'", aff, dic);
+                        match std::panic::catch_unwind(|| hunspell::Hunspell::new(aff, dic)) {
+                            Ok(hs) => Some(hs),
+                            Err(_) => {
+                                eprintln!("[dbg] hunspell::Hunspell::new panicked for {} {}", aff, dic);
+                                None
+                            }
+                        }
+                    };
+
+                    // 1) Env vars
                     if let (Ok(aff), Ok(dic)) = (std::env::var("HUNSPELL_AFF"), std::env::var("HUNSPELL_DIC")) {
-                        // `hunspell::Hunspell::new` in the bundled crate returns a Hunspell
-                        // instance directly; construct and store it.
-                        h = Some(hunspell::Hunspell::new(&aff, &dic));
+                        if PathBuf::from(&aff).exists() && PathBuf::from(&dic).exists() {
+                            h = try_init(&aff, &dic);
+                        } else {
+                            eprintln!("[dbg] HUNSPELL_AFF/DIC env set but files missing: {} {}", aff, dic);
+                        }
+                    }
+
+                    // 2) Common system locations
+                    if h.is_none() {
+                        let system_dir = PathBuf::from("/usr/share/hunspell");
+                        if system_dir.exists() {
+                            // pick en_GB then en_US as fallback
+                            let candidates = ["en_GB", "en_GB-oxford", "en_US", "en_US-large"];
+                            for cand in candidates.iter() {
+                                let aff = system_dir.join(format!("{}.aff", cand));
+                                let dic = system_dir.join(format!("{}.dic", cand));
+                                if aff.exists() && dic.exists() {
+                                    if let Some(hs) = try_init(&aff.to_string_lossy(), &dic.to_string_lossy()) {
+                                        h = Some(hs);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 3) Project-local vendor directory (where you can place en_GB.aff/.dic)
+                    if h.is_none() {
+                        if let Ok(exe) = std::env::current_exe() {
+                            if let Some(root) = exe.parent() {
+                                let vend_dirs = [
+                                    root.join("../third_party/hunspell/en_GB"),
+                                    root.join("../../third_party/hunspell/en_GB"),
+                                    root.join("third_party/hunspell/en_GB"),
+                                ];
+                                for vd in vend_dirs.iter() {
+                                    let aff = vd.join("en_GB.aff");
+                                    let dic = vd.join("en_GB.dic");
+                                    if aff.exists() && dic.exists() {
+                                        if let Some(hs) = try_init(&aff.to_string_lossy(), &dic.to_string_lossy()) {
+                                            h = Some(hs);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if h.is_none() {
+                        eprintln!("[dbg] Hunspell not initialized (no usable aff/dic found or initialization failed)");
+                    } else {
+                        eprintln!("[dbg] Hunspell initialized successfully");
                     }
                 }
                 h
@@ -288,6 +377,15 @@ impl Default for ReportApp {
             global_vars_dirty: false,
             preview_replace_vars: true,
         };
+
+        // Debug: print hunspell env and initialization status before applying settings
+        let aff_env = std::env::var("HUNSPELL_AFF").ok();
+        let dic_env = std::env::var("HUNSPELL_DIC").ok();
+        eprintln!("[dbg] HUNSPELL_AFF={:?}", aff_env.as_ref().map(|s| s.as_str()));
+        eprintln!("[dbg] HUNSPELL_DIC={:?}", dic_env.as_ref().map(|s| s.as_str()));
+        eprintln!("[dbg] HUNSPELL_AFF exists={}", aff_env.as_ref().map(|p| std::path::Path::new(p).exists()).unwrap_or(false));
+        eprintln!("[dbg] HUNSPELL_DIC exists={}", dic_env.as_ref().map(|p| std::path::Path::new(p).exists()).unwrap_or(false));
+        eprintln!("[dbg] hunspell_present={}", app.hunspell.is_some());
 
         // Load persisted settings (if any) and apply
         let settings = load_settings();
@@ -831,36 +929,60 @@ impl eframe::App for ReportApp {
                                         let word = m.as_str().to_string();
                                         if self.check_word_correct(&word) { break; }
 
-                                        // Show suggestions (if hunspell available) - feature-gated
+                                        // compute suggestions once
+                                        let mut suggestions: Vec<String> = Vec::new();
                                         #[cfg(feature = "hunspell")]
-                                        {
-                                            if let Some(hs) = &self.hunspell {
-                                                let suggests = hs.suggest(&word);
-                                                for s in suggests.iter().take(6) {
-                                                    if ui.add_sized(egui::vec2(menu_width, 0.0), egui::Button::new(s)).clicked() {
-                                                        // replace first occurrence at this match with suggestion
-                                                        let mut rep = self.buffer.report.clone();
-                                                        // replace by byte indices
-                                                        rep.replace_range(start_byte..end_byte, s);
-                                                        self.buffer.report = rep;
-                                                        // update caret
-                                                        let pos = start_char + s.chars().count();
-                                                        self.buffer.caret_char_range = Some(pos..pos);
-                                                        let _ = save_settings(&self.to_settings());
-                                                    }
+                                        if let Some(hs) = &self.hunspell {
+                                            suggestions = hs.suggest(&word).clone();
+                                        }
+                                        // Fallback: if hunspell not present or returned no suggestions,
+                                        // use the in-memory `spell_dict` and simple Levenshtein distance.
+                                        if suggestions.is_empty() {
+                                            let target = word.to_lowercase();
+                                            // collect candidates with small length difference to limit work
+                                            let mut cand: Vec<(usize, String)> = self.spell_dict.iter()
+                                                .filter(|w| {
+                                                    let lw = w.len();
+                                                    let lt = target.len();
+                                                    (lw as isize - lt as isize).abs() <= 3
+                                                })
+                                                .map(|w| (levenshtein(&target, w), w.clone()))
+                                                .collect();
+                                            // sort by distance then alphabetically
+                                            cand.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+                                            for (d, s) in cand.into_iter().take(8) {
+                                                // only include reasonably close matches
+                                                if d <= 4 {
+                                                    suggestions.push(s);
                                                 }
                                             }
                                         }
 
-                                        if ui.button("Add to dictionary").clicked() {
-                                            // create suggestions window instead of performing action inline
-                                            // build suggestions (hunspell if available)
-                                            let mut suggestions: Vec<String> = Vec::new();
-                                            #[cfg(feature = "hunspell")]
-                                            if let Some(hs) = &self.hunspell {
-                                                suggestions = hs.suggest(&word).clone();
+                                        // Log for debugging: which word and suggestions were found
+                                        eprintln!("[dbg] context menu word='{}' suggestions={:?}", word, suggestions);
+                                        if suggestions.is_empty() {
+                                            eprintln!("[dbg] no suggestions for '{}' (hunspell_present={})", word, self.hunspell.is_some());
+                                        }
+
+                                        for s in suggestions.iter().take(6) {
+                                            if ui.add_sized(egui::vec2(menu_width, 0.0), egui::Button::new(s)).clicked() {
+                                                // replace first occurrence at this match with suggestion
+                                                let mut rep = self.buffer.report.clone();
+                                                // replace by byte indices
+                                                rep.replace_range(start_byte..end_byte, s);
+                                                self.buffer.report = rep;
+                                                // update caret
+                                                let pos = start_char + s.chars().count();
+                                                self.buffer.caret_char_range = Some(pos..pos);
+                                                let _ = save_settings(&self.to_settings());
+                                                ui.close_menu();
+                                                // clear stored right-click position so menu content won't persist
+                                                self.last_right_click_pos = None;
                                             }
-                                            self.spell_context = Some(SpellContext { word: word.clone(), start_byte, end_byte, screen_pos: egui::pos2(pointer_pos.x, pointer_pos.y + 6.0), suggestions });
+                                        }
+
+                                        if ui.button("Add to dictionary").clicked() {
+                                            self.spell_context = Some(SpellContext { word: word.clone(), start_byte, end_byte, screen_pos: egui::pos2(pointer_pos.x, pointer_pos.y + 6.0), suggestions: suggestions.clone() });
                                             ui.close_menu();
                                         }
                                         if ui.button("Ignore").clicked() {
