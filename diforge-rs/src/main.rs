@@ -12,6 +12,10 @@ mod speech;
 mod templates;
 mod vim;
 use speech::{create_vosk_engine, SpeechEngine};
+#[cfg(feature = "hunspell")]
+mod hun_wrapper;
+#[cfg(feature = "hunspell")]
+use hun_wrapper::RawHunspell;
 
 use egui::text::{CCursor, CCursorRange};
 use std::ops::Range;
@@ -123,14 +127,16 @@ impl ReportApp {
         // Log the updated user dictionary contents for debugging/auditing
         eprintln!("[info] user_dict '{}' updated ({} entries): {:?}", user_dict, lines.len(), lines);
 
-        // If hunspell is active, note it. The current hunspell crate binding
-        // used here does not expose a runtime `add` method on the wrapper,
-        // so we maintain the in-memory `spell_dict` for runtime checks and
-        // suggestions instead.
+        // If hunspell is active, add the newly-inserted word into its session
         #[cfg(feature = "hunspell")]
         {
-            if self.hunspell.is_some() {
-                eprintln!("[dbg] hunspell present; word '{}' added to program spell_dict (runtime add not available via crate binding)", w);
+            if let Some(hs) = &mut self.hunspell {
+                let w_clone = w.clone();
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hs.add(&w_clone)));
+                match res {
+                    Ok(v) => eprintln!("[dbg] hunspell add('{}') returned {}", w_clone, v),
+                    Err(_) => eprintln!("[err] hunspell add('{}') panicked", w_clone),
+                }
             }
         }
     }
@@ -264,7 +270,7 @@ struct ReportApp {
     spell_dict: std::collections::HashSet<String>,
     spell_dict_path: Option<String>,
     #[cfg(feature = "hunspell")]
-    hunspell: Option<hunspell::Hunspell>,
+    hunspell: Option<hun_wrapper::RawHunspell>,
     // transient context for spell suggestion popup
     spell_context: Option<SpellContext>,
     // when true, skip reverting widget-applied edits (used when we intentionally
@@ -349,19 +355,19 @@ impl Default for ReportApp {
                 {
                     use std::path::PathBuf;
                     // Helper to attempt initialization and log failures
-                    let try_init = |aff: &str, dic: &str| -> Option<hunspell::Hunspell> {
-                        eprintln!("[dbg] trying hunspell aff='{}' dic='{}'", aff, dic);
-                        match std::panic::catch_unwind(|| hunspell::Hunspell::new(aff, dic)) {
-                            Ok(hs) => Some(hs),
-                            Err(_) => {
-                                eprintln!(
-                                    "[dbg] hunspell::Hunspell::new panicked for {} {}",
-                                    aff, dic
-                                );
-                                None
+                        let try_init = |aff: &str, dic: &str| -> Option<RawHunspell> {
+                            eprintln!("[dbg] trying hunspell aff='{}' dic='{}'", aff, dic);
+                            match std::panic::catch_unwind(|| RawHunspell::new(aff, dic)) {
+                                Ok(hs) => Some(hs),
+                                Err(_) => {
+                                    eprintln!(
+                                        "[dbg] RawHunspell::new panicked for {} {}",
+                                        aff, dic
+                                    );
+                                    None
+                                }
                             }
-                        }
-                    };
+                        };
 
                     // 1) Env vars
                     if let (Ok(aff), Ok(dic)) =
@@ -736,11 +742,16 @@ impl ReportApp {
                 #[cfg(feature = "hunspell")]
                 {
                     if let Some(hs) = &mut self.hunspell {
-                                // The hunspell crate used here does not expose an API to add
-                                // words into the running `Hunspell` instance. We rely on
-                                // `self.spell_dict` for lookup/suggestions. Log the loaded
-                                // count for diagnostics.
-                                eprintln!("[info] loaded {} user words into program spell_dict (hunspell runtime add not available)", self.spell_dict.len());
+                                        // Add persisted words into the running hunspell session
+                                        // so runtime checks/suggestions include them.
+                                        for w in self.spell_dict.iter() {
+                                            let w_clone = w.clone();
+                                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                                let r = hs.add(&w_clone);
+                                                eprintln!("[dbg] hunspell add('{}') returned {}", w_clone, r);
+                                            }));
+                                        }
+                                        eprintln!("[info] loaded {} user words into program spell_dict and hunspell session", self.spell_dict.len());
                     }
                 }
             }
