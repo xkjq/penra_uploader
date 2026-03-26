@@ -53,13 +53,12 @@ enum VimMode {
 
 impl ReportApp {
     fn add_word_to_user_dict(&mut self, word: &str) {
-        // ensure settings dir exists
+        // ensure settings dir exists and determine user dict path
         let p = settings_path();
         if let Some(parent) = p.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        // default user dict path next to settings file
-        let user_dict = if let Some(mut sp) = self.spell_dict_path.clone() {
+        let user_dict = if let Some(sp) = self.spell_dict_path.clone() {
             sp
         } else {
             let mut d = p.clone();
@@ -76,22 +75,64 @@ impl ReportApp {
                 set.insert(ln.trim().to_lowercase());
             }
         }
+
+        // normalize and check the new word
         let w = word.trim().to_lowercase();
-        if !set.contains(&w) {
-            // append to file
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&user_dict)
-            {
-                use std::io::Write;
-                let _ = writeln!(f, "{}", w);
-            }
-            set.insert(w.clone());
+        if set.contains(&w) {
+            return; // nothing to do
         }
-        // replace in-memory dict and persist
+
+        // insert into set and write the full sorted file atomically
+        set.insert(w.clone());
+        let mut lines: Vec<String> = set.iter().cloned().collect();
+        lines.sort();
+        let tmp_path = format!("{}.tmp", &user_dict);
+        match std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&tmp_path) {
+            Ok(mut tf) => {
+                use std::io::Write;
+                for ln in &lines {
+                    if let Err(e) = writeln!(tf, "{}", ln) {
+                        eprintln!("[err] writing temp user_dict '{}': {}", tmp_path, e);
+                        let _ = std::fs::remove_file(&tmp_path);
+                        return;
+                    }
+                }
+                if let Err(e) = tf.flush() {
+                    eprintln!("[err] flushing temp user_dict '{}': {}", tmp_path, e);
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return;
+                }
+                if let Err(e) = std::fs::rename(&tmp_path, &user_dict) {
+                    eprintln!("[err] renaming '{}' -> '{}': {}", tmp_path, user_dict, e);
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return;
+                }
+            }
+            Err(e) => {
+                eprintln!("[err] creating temp user_dict '{}': {}", tmp_path, e);
+                return;
+            }
+        }
+
+        // replace in-memory dict and persist settings
         self.spell_dict = set;
-        let _ = save_settings(&self.to_settings());
+        if let Err(e) = save_settings(&self.to_settings()) {
+            eprintln!("[err] saving settings after updating user_dict '{}': {}", user_dict, e);
+        }
+
+        // Log the updated user dictionary contents for debugging/auditing
+        eprintln!("[info] user_dict '{}' updated ({} entries): {:?}", user_dict, lines.len(), lines);
+
+        // If hunspell is active, note it. The current hunspell crate binding
+        // used here does not expose a runtime `add` method on the wrapper,
+        // so we maintain the in-memory `spell_dict` for runtime checks and
+        // suggestions instead.
+        #[cfg(feature = "hunspell")]
+        {
+            if self.hunspell.is_some() {
+                eprintln!("[dbg] hunspell present; word '{}' added to program spell_dict (runtime add not available via crate binding)", w);
+            }
+        }
     }
 }
 
@@ -690,6 +731,18 @@ impl ReportApp {
                     set.insert(ln.trim().to_lowercase());
                 }
                 self.spell_dict = set;
+                // If hunspell is available, add these words into its session so
+                // runtime spell checks and suggestions take user words into account.
+                #[cfg(feature = "hunspell")]
+                {
+                    if let Some(hs) = &mut self.hunspell {
+                                // The hunspell crate used here does not expose an API to add
+                                // words into the running `Hunspell` instance. We rely on
+                                // `self.spell_dict` for lookup/suggestions. Log the loaded
+                                // count for diagnostics.
+                                eprintln!("[info] loaded {} user words into program spell_dict (hunspell runtime add not available)", self.spell_dict.len());
+                    }
+                }
             }
         }
     }
@@ -1089,10 +1142,11 @@ impl eframe::App for ReportApp {
                                             screen_pos: egui::pos2(pointer_pos.x, pointer_pos.y + 6.0),
                                             suggestions: suggestions.clone(),
                                         });
-                                        ui.close_menu();
                                         self.last_right_click_pos = None;
+                                        ui.close_menu();
 
                                         if ui.button("Add to dictionary").clicked() {
+                                            eprintln!("[dbg] adding '{}' to user dictionary", word);
                                             self.spell_context = Some(SpellContext { word: word.clone(), start_byte, end_byte, screen_pos: egui::pos2(pointer_pos.x, pointer_pos.y + 6.0), suggestions: suggestions.clone() });
                                             ui.close_menu();
                                         }
