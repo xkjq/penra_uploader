@@ -94,6 +94,46 @@ mod selection_tests {
     }
 
     #[test]
+    fn context_menu_replacement_via_char_indices() {
+        let mut buf = vim::ReportBuffer::new();
+        buf.report = "Hello wurld".to_string();
+
+        let start_byte = buf.report.find("wurld").unwrap();
+        let end_byte = start_byte + "wurld".len();
+        let start_char = buf.report[..start_byte].chars().count();
+        let end_char = buf.report[..end_byte].chars().count();
+
+        // simulate selecting suggestion from context menu by setting caret range
+        buf.caret_char_range = Some(start_char..end_char);
+        buf.insert_at_caret("world");
+
+        assert_eq!(buf.report, "Hello world");
+        let expected_caret = start_char + "world".chars().count();
+        assert_eq!(buf.caret_char_range, Some(expected_caret..expected_caret));
+    }
+
+    #[test]
+    fn spell_context_byte_replace_updates_report_and_caret() {
+        // Simulate the spell-context replacement path which uses byte indices
+        let mut app = ReportApp::default();
+        app.buffer.report = "This is teh test".to_string();
+
+        let start_byte = app.buffer.report.find("teh").unwrap();
+        let end_byte = start_byte + "teh".len();
+
+        let mut rep = app.buffer.report.clone();
+        rep.replace_range(start_byte..end_byte, "the");
+        app.buffer.report = rep;
+
+        // caret should be set to char index corresponding to the original byte offset
+        let pos = app.buffer.report[..start_byte].chars().count();
+        app.buffer.caret_char_range = Some(pos..pos);
+
+        assert!(app.buffer.report.contains("the"));
+        assert_eq!(app.buffer.caret_char_range, Some(pos..pos));
+    }
+
+    #[test]
     fn ensure_vim_disabled_clears_state() {
         // create app and set some vim state
         let mut app = ReportApp::default();

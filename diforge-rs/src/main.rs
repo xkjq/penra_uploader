@@ -466,7 +466,8 @@ impl ReportApp {
                                 rep.replace_range(c.start_byte..c.end_byte, s);
                                 self.buffer.report = rep;
                                 // attempt to set caret near replacement start
-                                let pos = self.buffer.report[..].chars().take(c.start_byte).count();
+                                // `c.start_byte` is a byte index, convert to char index correctly
+                                let pos = self.buffer.report[..c.start_byte].chars().count();
                                 self.buffer.caret_char_range = Some(pos..pos);
                                 self.spell_context = None;
                             }
@@ -1011,6 +1012,11 @@ impl eframe::App for ReportApp {
                                 .or(self.last_right_click_pos)
                                 .or_else(|| ui.input(|i| i.pointer.interact_pos()))
                             {
+                                // debug: log pointer state when showing menu
+                                let press_origin = ui.input(|i| i.pointer.press_origin());
+                                let interact_pos = ui.input(|i| i.pointer.interact_pos());
+                                let primary_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+                                eprintln!("[dbg] context menu show press_origin={:?} interact_pos={:?} primary_down={}", press_origin, interact_pos, primary_down);
                                 // Find which word (if any) under the pointer is misspelled
                                 let re = regex::Regex::new(r"[A-Za-z']{2,}").unwrap();
                                 let text = &self.buffer.report;
@@ -1071,22 +1077,20 @@ impl eframe::App for ReportApp {
                                             eprintln!("[dbg] no suggestions for '{}' (hunspell_present={})", word, self.hunspell.is_some());
                                         }
 
-                                        for s in suggestions.iter().take(6) {
-                                            if ui.add_sized(egui::vec2(menu_width, 0.0), egui::Button::new(s)).clicked() {
-                                                // Use ReportBuffer API to replace by character indices (safer for UTF-8)
-                                                let start_ch = start_char;
-                                                let end_ch = end_char;
-                                                // set selection and insert at caret which will replace selection
-                                                // mark this as an intentional widget edit so it isn't reverted
-                                                self.skip_revert_on_widget_edit = true;
-                                                self.buffer.caret_char_range = Some(start_ch..end_ch);
-                                                self.buffer.insert_at_caret(s);
-                                                let _ = save_settings(&self.to_settings());
-                                                ui.close_menu();
-                                                // clear stored right-click position so menu content won't persist
-                                                self.last_right_click_pos = None;
-                                            }
-                                        }
+                                        // Instead of rendering interactive buttons inside the context menu
+                                        // (which on some platforms may not receive click events reliably),
+                                        // open the dedicated SpellContext window which already implements
+                                        // working suggestion buttons and replacements. This also keeps
+                                        // a consistent UI path for 'Add to dictionary' / 'Ignore'.
+                                        self.spell_context = Some(SpellContext {
+                                            word: word.clone(),
+                                            start_byte,
+                                            end_byte,
+                                            screen_pos: egui::pos2(pointer_pos.x, pointer_pos.y + 6.0),
+                                            suggestions: suggestions.clone(),
+                                        });
+                                        ui.close_menu();
+                                        self.last_right_click_pos = None;
 
                                         if ui.button("Add to dictionary").clicked() {
                                             self.spell_context = Some(SpellContext { word: word.clone(), start_byte, end_byte, screen_pos: egui::pos2(pointer_pos.x, pointer_pos.y + 6.0), suggestions: suggestions.clone() });
