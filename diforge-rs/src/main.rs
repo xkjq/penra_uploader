@@ -194,6 +194,17 @@ struct ReportApp {
     spell_dict_path: Option<String>,
     #[cfg(feature = "hunspell")]
     hunspell: Option<hunspell::Hunspell>,
+    // transient context for spell suggestion popup
+    spell_context: Option<SpellContext>,
+}
+
+#[derive(Clone)]
+struct SpellContext {
+    word: String,
+    start_byte: usize,
+    end_byte: usize,
+    screen_pos: egui::Pos2,
+    suggestions: Vec<String>,
 }
 
 impl Default for ReportApp {
@@ -263,6 +274,7 @@ impl Default for ReportApp {
                 }
                 h
             },
+            spell_context: None,
             user_template_vars: HashMap::new(),
             show_edit_vars_dialog: None,
             edit_vars_text: String::new(),
@@ -287,6 +299,46 @@ impl Default for ReportApp {
         }
 
         app
+    }
+}
+
+impl ReportApp {
+    fn show_spell_window(&mut self, ctx: &egui::Context) {
+        if let Some(c) = self.spell_context.clone() {
+            let mut open = true;
+            egui::Window::new("Spelling").open(&mut open).fixed_pos(c.screen_pos).collapsible(false).resizable(false).show(ctx, |ui| {
+                ui.label(format!("Suggestions for: {}", c.word));
+                ui.separator();
+                if !c.suggestions.is_empty() {
+                    for s in c.suggestions.iter().take(8) {
+                        if ui.button(s).clicked() {
+                            // apply suggestion
+                            let mut rep = self.buffer.report.clone();
+                            rep.replace_range(c.start_byte..c.end_byte, s);
+                            self.buffer.report = rep;
+                            // attempt to set caret near replacement start
+                            let pos = self.buffer.report[..].chars().take(c.start_byte).count();
+                            self.buffer.caret_char_range = Some(pos..pos);
+                            self.spell_context = None;
+                        }
+                    }
+                } else {
+                    ui.label("No suggestions");
+                }
+                ui.separator();
+                if ui.button("Add to dictionary").clicked() {
+                    let w = c.word.clone();
+                    self.add_word_to_user_dict(&w);
+                    self.spell_context = None;
+                }
+                if ui.button("Ignore").clicked() {
+                    self.spell_dict.insert(c.word.clone());
+                    let _ = save_settings(&self.to_settings());
+                    self.spell_context = None;
+                }
+            });
+            if !open { self.spell_context = None; }
+        }
     }
 }
 
@@ -790,11 +842,18 @@ impl eframe::App for ReportApp {
                                         }
 
                                         if ui.button("Add to dictionary").clicked() {
-                                            self.add_word_to_user_dict(&word);
+                                            // create suggestions window instead of performing action inline
+                                            // build suggestions (hunspell if available)
+                                            let mut suggestions: Vec<String> = Vec::new();
+                                            #[cfg(feature = "hunspell")]
+                                            if let Some(hs) = &self.hunspell {
+                                                suggestions = hs.suggest(&word).clone();
+                                            }
+                                            self.spell_context = Some(SpellContext { word: word.clone(), start_byte, end_byte, screen_pos: egui::pos2(pointer_pos.x, pointer_pos.y + 6.0), suggestions });
                                             ui.close_menu();
                                         }
                                         if ui.button("Ignore").clicked() {
-                                            // add to in-memory set so it's ignored during this run
+                                            // ignore immediately and persist
                                             self.spell_dict.insert(word.clone());
                                             let _ = save_settings(&self.to_settings());
                                             ui.close_menu();
@@ -1310,6 +1369,9 @@ impl eframe::App for ReportApp {
                     });
                 });
             });
+
+            // show spell suggestion window (if any)
+            self.show_spell_window(ctx);
 
             // Templates area: render in the right column when requested
             if self.show_templates_window {
