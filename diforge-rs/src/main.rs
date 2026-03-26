@@ -26,6 +26,46 @@ enum VimMode {
     VisualLine,
 }
 
+impl ReportApp {
+    fn add_word_to_user_dict(&mut self, word: &str) {
+        // ensure settings dir exists
+        let p = settings_path();
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        // default user dict path next to settings file
+        let user_dict = if let Some(mut sp) = self.spell_dict_path.clone() {
+            sp
+        } else {
+            let mut d = p.clone();
+            d.set_file_name("user_dict.txt");
+            let s = d.to_string_lossy().to_string();
+            self.spell_dict_path = Some(s.clone());
+            s
+        };
+
+        // load existing words into set (if file exists)
+        let mut set = std::collections::HashSet::new();
+        if let Ok(txt) = std::fs::read_to_string(&user_dict) {
+            for ln in txt.lines() {
+                set.insert(ln.trim().to_lowercase());
+            }
+        }
+        let w = word.trim().to_lowercase();
+        if !set.contains(&w) {
+            // append to file
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&user_dict) {
+                use std::io::Write;
+                let _ = writeln!(f, "{}", w);
+            }
+            set.insert(w.clone());
+        }
+        // replace in-memory dict and persist
+        self.spell_dict = set;
+        let _ = save_settings(&self.to_settings());
+    }
+}
+
 impl Default for VimMode {
     fn default() -> Self {
         VimMode::Normal
@@ -46,6 +86,10 @@ struct Settings {
     user_template_vars: HashMap<String, HashMap<String, String>>,
     // centralized global variables that apply to all templates unless overridden
     global_vars: HashMap<String, String>,
+    // persist spellcheck preference
+    spell_enabled: bool,
+    // optional path to a custom wordlist used as fallback dictionary
+    spell_dict_path: Option<String>,
 }
 
 fn settings_path() -> PathBuf {
@@ -212,9 +256,9 @@ impl Default for ReportApp {
                 #[cfg(feature = "hunspell")]
                 {
                     if let (Ok(aff), Ok(dic)) = (std::env::var("HUNSPELL_AFF"), std::env::var("HUNSPELL_DIC")) {
-                        if let Ok(hs) = hunspell::Hunspell::new(&aff, &dic) {
-                            h = Some(hs);
-                        }
+                        // `hunspell::Hunspell::new` in the bundled crate returns a Hunspell
+                        // instance directly; construct and store it.
+                        h = Some(hunspell::Hunspell::new(&aff, &dic));
                     }
                 }
                 h
@@ -321,6 +365,8 @@ impl ReportApp {
             overlay_h: self.overlay_h,
             user_template_vars: self.user_template_vars.clone(),
             global_vars: self.global_vars.clone(),
+            spell_enabled: self.spell_enabled,
+            spell_dict_path: self.spell_dict_path.clone(),
         }
     }
 
@@ -404,6 +450,19 @@ impl ReportApp {
         self.overlay_h = s.overlay_h;
         self.user_template_vars = s.user_template_vars;
         self.global_vars = s.global_vars;
+        // apply persisted spell settings
+        self.spell_enabled = s.spell_enabled;
+        self.spell_dict_path = s.spell_dict_path.clone();
+        // if a custom wordlist path is provided, try to load it as the spell_dict
+        if let Some(p) = &self.spell_dict_path {
+            if let Ok(txt) = std::fs::read_to_string(p) {
+                let mut set = std::collections::HashSet::new();
+                for ln in txt.lines() {
+                    set.insert(ln.trim().to_lowercase());
+                }
+                self.spell_dict = set;
+            }
+        }
     }
 
     // Ensure all vim-related runtime state is cleared so emulation is fully disabled.
@@ -564,7 +623,10 @@ impl eframe::App for ReportApp {
                             self.attach_requested = true;
                         }
                         ui.separator();
-                        ui.checkbox(&mut self.spell_enabled, "Spellcheck");
+                        let spell_resp = ui.checkbox(&mut self.spell_enabled, "Spellcheck");
+                        if spell_resp.changed() {
+                            let _ = save_settings(&self.to_settings());
+                        }
                         ui.separator();
                         // Clone templates to avoid borrowing `self` across UI calls so we can mutably borrow later
                         let templates_top = self.templates.clone();
@@ -674,6 +736,76 @@ impl eframe::App for ReportApp {
                                 painter.line(pts, egui::Stroke::new(1.5, egui::Color32::from_rgb(220, 40, 40)));
                             }
                         }
+                    }
+
+                    // Context menu for spellcheck: right-click on a misspelled word
+                    if self.spell_enabled {
+                        // Use the response's context menu so it only opens when right-clicking the TextEdit
+                        let _ = output.response.context_menu(|ui| {
+                            if let Some(pointer_pos) = ui.input(|i| i.pointer.interact_pos()) {
+                                // Find which word (if any) under the pointer is misspelled
+                                let re = regex::Regex::new(r"[A-Za-z']{2,}").unwrap();
+                                let text = &self.buffer.report;
+                                for m in re.find_iter(text) {
+                                    let start_byte = m.start();
+                                    let end_byte = m.end();
+                                    let start_char = text[..start_byte].chars().count();
+                                    let word_len_chars = text[start_byte..end_byte].chars().count();
+                                    let end_char = start_char + word_len_chars;
+
+                                    let start_cursor = CCursor::new(start_char);
+                                    let end_cursor = CCursor::new(end_char.saturating_sub(1));
+                                    let start_rect = output.galley.pos_from_cursor(start_cursor);
+                                    let end_rect = output.galley.pos_from_cursor(end_cursor);
+                                    let start_x = output.response.rect.min.x + start_rect.min.x;
+                                    let end_x = output.response.rect.min.x + end_rect.max.x;
+                                    let baseline_y = output.response.rect.min.y + start_rect.max.y + 2.0;
+
+                                    // crude hit test: pointer inside horizontal bounds and near baseline
+                                    if pointer_pos.x >= start_x && pointer_pos.x <= end_x
+                                        && pointer_pos.y >= baseline_y - 10.0 && pointer_pos.y <= baseline_y + 10.0
+                                    {
+                                        let word = m.as_str().to_string();
+                                        if self.check_word_correct(&word) { break; }
+
+                                        // Show suggestions (if hunspell available) - feature-gated
+                                        #[cfg(feature = "hunspell")]
+                                        {
+                                            if let Some(hs) = &self.hunspell {
+                                                let suggests = hs.suggest(&word);
+                                                for s in suggests.iter().take(6) {
+                                                    if ui.button(s).clicked() {
+                                                        // replace first occurrence at this match with suggestion
+                                                        let mut rep = self.buffer.report.clone();
+                                                        // replace by byte indices
+                                                        rep.replace_range(start_byte..end_byte, s);
+                                                        self.buffer.report = rep;
+                                                        // update caret
+                                                        let pos = start_char + s.chars().count();
+                                                        self.buffer.caret_char_range = Some(pos..pos);
+                                                        let _ = save_settings(&self.to_settings());
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        if ui.button("Add to dictionary").clicked() {
+                                            self.add_word_to_user_dict(&word);
+                                            ui.close_menu();
+                                        }
+                                        if ui.button("Ignore").clicked() {
+                                            // add to in-memory set so it's ignored during this run
+                                            self.spell_dict.insert(word.clone());
+                                            let _ = save_settings(&self.to_settings());
+                                            ui.close_menu();
+                                        }
+
+                                        // stop after first matching word
+                                        break;
+                                    }
+                                }
+                            }
+                        });
                     }
 
                     use egui::Event;
