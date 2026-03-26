@@ -144,6 +144,12 @@ struct ReportApp {
     mouse_drag_anchor: Option<usize>,
     // numeric prefix for vim commands (e.g., `3dw`)
     vim_count: Option<usize>,
+    // Spellchecking
+    spell_enabled: bool,
+    spell_dict: std::collections::HashSet<String>,
+    spell_dict_path: Option<String>,
+    #[cfg(feature = "hunspell")]
+    hunspell: Option<hunspell::Hunspell>,
 }
 
 impl Default for ReportApp {
@@ -183,6 +189,36 @@ impl Default for ReportApp {
             mouse_dragging: false,
             mouse_drag_anchor: None,
             vim_count: None,
+            spell_enabled: false,
+            spell_dict: {
+                // try loading a system wordlist if available
+                let mut set = std::collections::HashSet::new();
+                let candidates = ["/usr/share/dict/words", "/usr/dict/words", "/usr/share/dict/web2" ];
+                for p in candidates.iter() {
+                    if let Ok(txt) = std::fs::read_to_string(p) {
+                        for ln in txt.lines() {
+                            set.insert(ln.trim().to_lowercase());
+                        }
+                        break;
+                    }
+                }
+                set
+            },
+            spell_dict_path: None,
+            #[cfg(feature = "hunspell")]
+            hunspell: {
+                // Try to initialize Hunspell from env vars HUNSPELL_AFF and HUNSPELL_DIC
+                let mut h = None;
+                #[cfg(feature = "hunspell")]
+                {
+                    if let (Ok(aff), Ok(dic)) = (std::env::var("HUNSPELL_AFF"), std::env::var("HUNSPELL_DIC")) {
+                        if let Ok(hs) = hunspell::Hunspell::new(&aff, &dic) {
+                            h = Some(hs);
+                        }
+                    }
+                }
+                h
+            },
             user_template_vars: HashMap::new(),
             show_edit_vars_dialog: None,
             edit_vars_text: String::new(),
@@ -254,6 +290,24 @@ impl ReportApp {
         let mut out: Vec<String> = seen.into_iter().collect();
         out.sort();
         out
+    }
+    // check a single word for correctness using hunspell if available,
+    // otherwise fallback to in-memory dictionary lookup
+    fn check_word_correct(&self, word: &str) -> bool {
+        let key = word.to_lowercase();
+        #[cfg(feature = "hunspell")]
+        {
+            if let Some(hs) = &self.hunspell {
+                // hunspell::Hunspell API: spell(word) -> bool
+                if hs.check(word) {
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+        }
+        // fallback to simple dictionary
+        self.spell_dict.contains(&key)
     }
     fn to_settings(&self) -> Settings {
         Settings {
@@ -510,6 +564,8 @@ impl eframe::App for ReportApp {
                             self.attach_requested = true;
                         }
                         ui.separator();
+                        ui.checkbox(&mut self.spell_enabled, "Spellcheck");
+                        ui.separator();
                         // Clone templates to avoid borrowing `self` across UI calls so we can mutably borrow later
                         let templates_top = self.templates.clone();
                         for (i, t) in templates_top.iter().enumerate() {
@@ -573,6 +629,51 @@ impl eframe::App for ReportApp {
                     if self.vim_enabled && self.vim_mode != VimMode::Insert && self.buffer.report != prev_report {
                         eprintln!("[dbg] reverting buffer.report due to non-Insert vim mode (widget tried to edit)");
                         self.buffer.report = prev_report;
+                    }
+
+                    // Spellchecking: find words not in dictionary and draw squiggly underlines
+                            if self.spell_enabled {
+                        // simple word regex: letters and apostrophes, length >= 2
+                        let re = regex::Regex::new(r"[A-Za-z']{2,}").unwrap();
+                        let text = &self.buffer.report;
+                        let painter = ui.painter();
+                        for m in re.find_iter(text) {
+                            let word = m.as_str();
+                            if self.check_word_correct(word) { continue; }
+                            // map byte offsets to char indices
+                            let start_byte = m.start();
+                            let end_byte = m.end();
+                            let start_char = text[..start_byte].chars().count();
+                            let word_len_chars = text[start_byte..end_byte].chars().count();
+                            let end_char = start_char + word_len_chars;
+
+                            // compute screen coords for start and end using galley
+                            let start_cursor = CCursor::new(start_char);
+                            let end_cursor = CCursor::new(end_char.saturating_sub(1));
+                            let start_rect = output.galley.pos_from_cursor(start_cursor);
+                            let end_rect = output.galley.pos_from_cursor(end_cursor);
+                            let start_x = output.response.rect.min.x + start_rect.min.x;
+                            let end_x = output.response.rect.min.x + end_rect.max.x;
+                            // baseline y just below glyph area
+                            let baseline_y = output.response.rect.min.y + start_rect.max.y + 2.0;
+
+                            // draw a simple zig-zag squiggly underline
+                            let mut pts: Vec<egui::Pos2> = Vec::new();
+                            let step = 6.0_f32;
+                            if end_x > start_x + 2.0 {
+                                let mut x = start_x;
+                                let mut up = false;
+                                while x < end_x {
+                                    let y = if up { baseline_y - 2.0 } else { baseline_y + 2.0 };
+                                    pts.push(egui::pos2(x, y));
+                                    x += step;
+                                    up = !up;
+                                }
+                                // ensure last point at end_x
+                                pts.push(egui::pos2(end_x, baseline_y));
+                                painter.line(pts, egui::Stroke::new(1.5, egui::Color32::from_rgb(220, 40, 40)));
+                            }
+                        }
                     }
 
                     use egui::Event;
