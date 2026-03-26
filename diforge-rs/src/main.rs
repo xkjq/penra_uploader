@@ -115,6 +115,8 @@ struct ReportApp {
     global_vars_text: String,
     global_vars_dirty: bool,
     user_template_vars_dirty: bool,
+    // preview option: whether to show variables replaced in template preview
+    preview_replace_vars: bool,
     attach_requested: bool,
     // overlay position (for helper)
     overlay_x: i32,
@@ -189,6 +191,7 @@ impl Default for ReportApp {
             show_global_vars_dialog: false,
             global_vars_text: String::new(),
             global_vars_dirty: false,
+            preview_replace_vars: true,
         };
 
         // Load persisted settings (if any) and apply
@@ -1121,8 +1124,26 @@ impl eframe::App for ReportApp {
                                         ui.label("Ensure surrounding newlines:");
                                         ui.label(if t.ensure_surrounding_newlines { "yes" } else { "no" });
                                     });
-                                    ui.label("Body preview:");
-                                    let mut preview = t.body.clone();
+                                    ui.horizontal(|ui| {
+                                        ui.label("Body preview:");
+                                        ui.checkbox(&mut self.preview_replace_vars, "Replace variables");
+                                    });
+                                    let mut preview = if self.preview_replace_vars {
+                                        // build merged vars: template defaults <- user overrides <- global vars (fallback)
+                                        let mut vars: std::collections::HashMap<String, String> = t.vars.clone();
+                                        let key = t.id.clone().unwrap_or_else(|| t.title.clone().unwrap_or_else(|| t.display_title()));
+                                        if let Some(user_map) = self.user_template_vars.get(&key) {
+                                            for (k, v) in user_map.iter() {
+                                                vars.insert(k.clone(), v.clone());
+                                            }
+                                        }
+                                        for (k, v) in self.global_vars.iter() {
+                                            vars.entry(k.clone()).or_insert_with(|| v.clone());
+                                        }
+                                        templates::render_template(&t.body, &vars, &self.templates)
+                                    } else {
+                                        t.body.clone()
+                                    };
                                     ui.add(egui::TextEdit::multiline(&mut preview).desired_rows(8).font(egui::TextStyle::Monospace).interactive(false));
                                     ui.horizontal(|ui| {
                                         // per-template vars editing removed from this panel
