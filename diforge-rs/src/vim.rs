@@ -9,6 +9,8 @@ pub enum VimMode {
         VisualLine,
 }
 
+
+
 impl Default for VimMode {
     fn default() -> Self {
         VimMode::Normal

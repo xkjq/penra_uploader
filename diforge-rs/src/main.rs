@@ -222,6 +222,9 @@ struct ReportApp {
     hunspell: Option<hunspell::Hunspell>,
     // transient context for spell suggestion popup
     spell_context: Option<SpellContext>,
+    // when true, skip reverting widget-applied edits (used when we intentionally
+    // update `buffer.report` from UI actions like choosing a suggestion)
+    skip_revert_on_widget_edit: bool,
 }
 
 #[derive(Clone)]
@@ -367,6 +370,7 @@ impl Default for ReportApp {
                 h
             },
             spell_context: None,
+            skip_revert_on_widget_edit: false,
             user_template_vars: HashMap::new(),
             show_edit_vars_dialog: None,
             edit_vars_text: String::new(),
@@ -841,8 +845,13 @@ impl eframe::App for ReportApp {
                     // direct text changes the TextEdit may have applied (so Normal mode
                     // keystrokes are handled by our modal logic instead).
                     if self.vim_enabled && self.vim_mode != VimMode::Insert && self.buffer.report != prev_report {
-                        eprintln!("[dbg] reverting buffer.report due to non-Insert vim mode (widget tried to edit)");
-                        self.buffer.report = prev_report;
+                        if self.skip_revert_on_widget_edit {
+                            eprintln!("[dbg] accepting intentional widget edit (skip revert)");
+                            self.skip_revert_on_widget_edit = false;
+                        } else {
+                            eprintln!("[dbg] reverting buffer.report due to non-Insert vim mode (widget tried to edit)");
+                            self.buffer.report = prev_report;
+                        }
                     }
 
                     // Spellchecking: find words not in dictionary and draw squiggly underlines
@@ -966,14 +975,14 @@ impl eframe::App for ReportApp {
 
                                         for s in suggestions.iter().take(6) {
                                             if ui.add_sized(egui::vec2(menu_width, 0.0), egui::Button::new(s)).clicked() {
-                                                // replace first occurrence at this match with suggestion
-                                                let mut rep = self.buffer.report.clone();
-                                                // replace by byte indices
-                                                rep.replace_range(start_byte..end_byte, s);
-                                                self.buffer.report = rep;
-                                                // update caret
-                                                let pos = start_char + s.chars().count();
-                                                self.buffer.caret_char_range = Some(pos..pos);
+                                                // Use ReportBuffer API to replace by character indices (safer for UTF-8)
+                                                let start_ch = start_char;
+                                                let end_ch = end_char;
+                                                // set selection and insert at caret which will replace selection
+                                                // mark this as an intentional widget edit so it isn't reverted
+                                                self.skip_revert_on_widget_edit = true;
+                                                self.buffer.caret_char_range = Some(start_ch..end_ch);
+                                                self.buffer.insert_at_caret(s);
                                                 let _ = save_settings(&self.to_settings());
                                                 ui.close_menu();
                                                 // clear stored right-click position so menu content won't persist
