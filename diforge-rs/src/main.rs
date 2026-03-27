@@ -1018,6 +1018,7 @@ impl eframe::App for ReportApp {
                     }
 
                     // Spellchecking: find words not in dictionary and draw squiggly underlines
+                    // Spellchecking: find words not in dictionary and draw squiggly underlines
                             if self.spell_enabled {
                         // simple word regex: letters and apostrophes, length >= 2
                         let re = regex::Regex::new(r"[A-Za-z']{2,}").unwrap();
@@ -1227,6 +1228,73 @@ impl eframe::App for ReportApp {
                                     self.last_right_click_pos = Some(*pos);
                                 } else {
                                     self.last_right_click_pos = None;
+                                }
+                            }
+                            // If the TextEdit is non-interactive (vim Normal mode),
+                            // handle right-clicks ourselves so the spellcheck context
+                            // menu still works in Vim mode.
+                            if *button == egui::PointerButton::Secondary && *pressed && !is_interactive {
+                                if output.response.rect.contains(*pos) {
+                                    let pointer_pos = *pos;
+                                    let re = regex::Regex::new(r"[A-Za-z']{2,}").unwrap();
+                                    let text = &self.buffer.report;
+                                    for m in re.find_iter(text) {
+                                        let start_byte = m.start();
+                                        let end_byte = m.end();
+                                        let start_char = text[..start_byte].chars().count();
+                                        let word_len_chars = text[start_byte..end_byte].chars().count();
+                                        let end_char = start_char + word_len_chars;
+
+                                        let start_cursor = CCursor::new(start_char);
+                                        let end_cursor = CCursor::new(end_char.saturating_sub(1));
+                                        let start_rect = output.galley.pos_from_cursor(start_cursor);
+                                        let end_rect = output.galley.pos_from_cursor(end_cursor);
+                                        let start_x = output.response.rect.min.x + start_rect.min.x;
+                                        let end_x = output.response.rect.min.x + end_rect.max.x;
+                                        let baseline_y = output.response.rect.min.y + start_rect.max.y + 2.0;
+
+                                        if pointer_pos.x >= start_x && pointer_pos.x <= end_x
+                                            && pointer_pos.y >= baseline_y - 10.0 && pointer_pos.y <= baseline_y + 10.0
+                                        {
+                                            let word = m.as_str().to_string();
+                                            if self.check_word_correct(&word) { break; }
+
+                                            // gather suggestions
+                                            let mut suggestions: Vec<String> = Vec::new();
+                                            #[cfg(feature = "hunspell")]
+                                            if let Some(hs) = &self.hunspell {
+                                                suggestions = hs.suggest(&word).clone();
+                                            }
+                                            if suggestions.is_empty() {
+                                                let target = word.to_lowercase();
+                                                let mut cand: Vec<(usize, String)> = self.spell_dict.iter()
+                                                    .filter(|w| {
+                                                        let lw = w.len();
+                                                        let lt = target.len();
+                                                        (lw as isize - lt as isize).abs() <= 3
+                                                    })
+                                                    .map(|w| (levenshtein(&target, w), w.clone()))
+                                                    .collect();
+                                                cand.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+                                                for (d, s) in cand.into_iter().take(8) {
+                                                    if d <= 4 {
+                                                        suggestions.push(s);
+                                                    }
+                                                }
+                                            }
+
+                                            eprintln!("[dbg] vim-mode context word='{}' suggestions={:?}", word, suggestions);
+                                            self.spell_context = Some(SpellContext {
+                                                word: word.clone(),
+                                                start_byte,
+                                                end_byte,
+                                                screen_pos: egui::pos2(pointer_pos.x, pointer_pos.y + 6.0),
+                                                suggestions: suggestions.clone(),
+                                            });
+                                            self.last_right_click_pos = None;
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
