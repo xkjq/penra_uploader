@@ -29,6 +29,10 @@ use tracing_subscriber::prelude::*;
 
 static FILTER_RELOADER: OnceCell<Box<dyn Fn(EnvFilter) -> Result<(), String> + Send + Sync>> = OnceCell::new();
 
+const MAX_UI_MESSAGES_PER_FRAME: usize = 256;
+const MAX_PROCESSED_MESSAGES: usize = 5_000;
+const LOG_CACHE_REFRESH_INTERVAL: Duration = Duration::from_millis(800);
+
 use once_cell::sync::Lazy;
 use std::sync::mpsc as std_mpsc;
 
@@ -73,16 +77,15 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                     .and_then(|p| p.parent().map(|pp| pp.join("anon")))
                     .unwrap_or_else(|| PathBuf::from("anon"));
 
-                // collect .dcm files recursively from the processing dir
-                let mut dcm_files: Vec<std::path::PathBuf> = Vec::new();
-                let all = upload::collect_files_recursive(&processing_dir);
-                for p in all.into_iter() {
-                    if p.extension().map(|e| e == "dcm").unwrap_or(false) {
-                        dcm_files.push(p);
-                    }
-                }
+                // collect all files recursively from the processing dir and attempt
+                // to anonymize them regardless of extension — the anonymizer will
+                // return an error for non-DICOM files which are logged at debug level.
+                let dcm_files: Vec<std::path::PathBuf> = upload::collect_files_recursive(&processing_dir)
+                    .into_iter()
+                    .filter(|p| p.is_file())
+                    .collect();
                 if dcm_files.is_empty() {
-                    let _ = tx.send("No export dir or no .dcm files found".to_string());
+                    let _ = tx.send("No files found in export dir".to_string());
                 }
 
                 let total = dcm_files.len();
@@ -103,7 +106,8 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                                 }
                             }
                             Err(e) => {
-                                let _ = tx.send(format!("Anon failed {}: {}", p.display(), e));
+                                // Log non-DICOM / unrecognised files quietly; don't flood the UI.
+                                upload::log_rpc_debug(&format!("Anon skipped {}: {}", p.display(), e));
                             }
                         }
                         let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -240,6 +244,9 @@ struct AppState {
     exit_at: Option<Instant>,
     // in-app toast messages (message, expire_at)
     toasts: Vec<(String, Instant)>,
+    // expanded request/response logs cached for UI windows
+    log_cache: String,
+    log_cache_last_refresh: Option<Instant>,
 }
 
 impl Default for AppState {
@@ -312,6 +319,8 @@ impl Default for AppState {
             exit_requested: None,
             exit_at: None,
             toasts: Vec::new(),
+            log_cache: String::new(),
+            log_cache_last_refresh: None,
             log_level: std::env::var("RUST_LOG").ok().or_else(|| upload::load_log_level()).unwrap_or_else(|| "info".to_string()),
             logo_tex: None,
         }
@@ -322,6 +331,50 @@ impl AppState {
     fn add_toast(&mut self, msg: String, duration_ms: u64) {
         let expire = Instant::now() + Duration::from_millis(duration_ms);
         self.toasts.push((msg, expire));
+    }
+
+    fn trim_processed_messages(&mut self) {
+        if self.processed.len() > MAX_PROCESSED_MESSAGES {
+            let overflow = self.processed.len() - MAX_PROCESSED_MESSAGES;
+            self.processed.drain(0..overflow);
+        }
+    }
+
+    fn refresh_log_cache(&mut self, force: bool) {
+        let now = Instant::now();
+        if !force {
+            if let Some(last) = self.log_cache_last_refresh {
+                if now.saturating_duration_since(last) < LOG_CACHE_REFRESH_INTERVAL {
+                    return;
+                }
+            }
+        }
+
+        let p = upload::log_file_path();
+        let contents = std::fs::read_to_string(&p).unwrap_or_else(|_| "(no logs)".to_string());
+        let mut display = String::new();
+        for line in contents.lines() {
+            display.push_str(line);
+            display.push('\n');
+            if let Some(idx) = line.find("BODY_FILE:") {
+                let path = line[idx + "BODY_FILE:".len()..].trim();
+                if !path.is_empty() {
+                    if let Ok(body) = std::fs::read_to_string(path) {
+                        display.push_str("---- BODY START ----\n");
+                        display.push_str(&body);
+                        if !body.ends_with('\n') {
+                            display.push('\n');
+                        }
+                        display.push_str("---- BODY END ----\n");
+                    } else {
+                        display.push_str("(failed to read body file)\n");
+                    }
+                }
+            }
+        }
+
+        self.log_cache = display;
+        self.log_cache_last_refresh = Some(now);
     }
 
     fn spawn_login(&mut self, user: String, pass: String) {
@@ -566,6 +619,7 @@ impl AppState {
             }
         } else {
             self.processed.push(m.to_string());
+            self.trim_processed_messages();
             self.last_msg = m.to_string();
         }
     }
@@ -573,6 +627,10 @@ impl AppState {
 
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.log_window_open || self.about_open {
+            self.refresh_log_cache(false);
+        }
+
         // apply visuals based on saved theme
         if self.theme_dark {
             ctx.set_visuals(egui::Visuals::dark());
@@ -719,7 +777,7 @@ impl eframe::App for AppState {
                         });
 
                         ui.horizontal(|ui| {
-                            ui.label("Extension filter (empty = try all files):");
+                            ui.label("Extension filter (empty = attempt all files as DICOM):");
                             ui.text_edit_singleline(&mut self.ext_filter);
                         });
 
@@ -840,12 +898,22 @@ impl eframe::App for AppState {
                 }
 
             });
-            
             // Temporarily take ownership of the receiver so `handle_message` can
             // mutably borrow `self` while we drain pending messages.
             if let Some(rx) = self.rx.take() {
-                while let Ok(m) = rx.try_recv() {
-                    self.handle_message(&m);
+                let mut drained = 0usize;
+                while drained < MAX_UI_MESSAGES_PER_FRAME {
+                    match rx.try_recv() {
+                        Ok(m) => {
+                            self.handle_message(&m);
+                            drained += 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if drained == MAX_UI_MESSAGES_PER_FRAME {
+                    // Keep pumping quickly if there is a backlog without stalling a frame.
+                    ctx.request_repaint();
                 }
                 self.rx = Some(rx);
             }
@@ -1399,107 +1467,46 @@ impl eframe::App for AppState {
 
             // Logs window
             if self.log_window_open {
-                egui::Window::new("Request/Response Logs").open(&mut self.log_window_open).show(ctx, |ui| {
-                    let p = upload::log_file_path();
-                    let contents = std::fs::read_to_string(&p).unwrap_or_else(|_| "(no logs)".to_string());
-                    // expand BODY_FILE entries to inline the saved body contents for easier copy
-                    let mut display = String::new();
-                    for line in contents.lines() {
-                        display.push_str(line);
-                        display.push('\n');
-                        if let Some(idx) = line.find("BODY_FILE:") {
-                            let path = line[idx+"BODY_FILE:".len()..].trim();
-                            if !path.is_empty() {
-                                if let Ok(body) = std::fs::read_to_string(path) {
-                                    display.push_str("---- BODY START ----\n");
-                                    display.push_str(&body);
-                                    if !body.ends_with('\n') { display.push('\n'); }
-                                    display.push_str("---- BODY END ----\n");
-                                } else {
-                                    display.push_str("(failed to read body file)\n");
-                                }
-                            }
-                        }
-                    }
-                    let mut txt = display;
+                let mut log_open = self.log_window_open;
+                let mut do_refresh_logs = false;
+                let mut do_clear_logs = false;
+                egui::Window::new("Request/Response Logs").open(&mut log_open).show(ctx, |ui| {
+                    let mut txt = self.log_cache.clone();
                     egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
                         ui.add(egui::TextEdit::multiline(&mut txt).desired_rows(20).desired_width(ui.available_width()));
                     });
                     ui.horizontal(|ui| {
                         if ui.button("Refresh").clicked() {
-                            // force UI to re-open (content read each frame, so nothing else required)
-                            self.last_msg = "Logs refreshed".to_string();
+                            do_refresh_logs = true;
                         }
                         if ui.button("Clear").clicked() {
-                            let _ = std::fs::write(p.clone(), "");
-                            self.last_msg = "Logs cleared".to_string();
+                            do_clear_logs = true;
                         }
                     });
                 });
-
-            // About window (includes summary info and the application log)
-            if self.about_open {
-                egui::Window::new("About Uploader")
-                    .open(&mut self.about_open)
-                    .default_width(600.0)
-                    .resizable(true)
-                    .show(ctx, |ui| {
-                    ui.heading("Uploader (Rust)");
-                    ui.label(format!("Version: {}", env!("CARGO_PKG_VERSION")));
-                    ui.label(format!("Base URL: {}", upload::base_site_url()));
-                    ui.label(format!("Logged in: {}", self.logged_in_user.as_deref().unwrap_or("(not logged in)")));
-                    ui.separator();
-                    ui.label("Application logs:");
-                    let p = upload::log_file_path();
-                    let contents = std::fs::read_to_string(&p).unwrap_or_else(|_| "(no logs)".to_string());
-                    // expand BODY_FILE entries similar to the Logs window
-                    let mut display = String::new();
-                    for line in contents.lines() {
-                        display.push_str(line);
-                        display.push('\n');
-                        if let Some(idx) = line.find("BODY_FILE:") {
-                            let path = line[idx+"BODY_FILE:".len()..].trim();
-                            if !path.is_empty() {
-                                if let Ok(body) = std::fs::read_to_string(path) {
-                                    display.push_str("---- BODY START ----\n");
-                                    display.push_str(&body);
-                                    if !body.ends_with('\n') { display.push('\n'); }
-                                    display.push_str("---- BODY END ----\n");
-                                } else {
-                                    display.push_str("(failed to read body file)\n");
-                                }
-                            }
-                        }
-                    }
-                    let mut txt = display;
-                    egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
-                        ui.add(egui::TextEdit::multiline(&mut txt).desired_rows(10).desired_width(ui.available_width()));
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("Refresh").clicked() {
-                            self.last_msg = "Logs refreshed".to_string();
-                        }
-                        if ui.button("Clear").clicked() {
-                            let _ = std::fs::write(p.clone(), "");
-                            self.last_msg = "Logs cleared".to_string();
-                        }
-                    });
-                });
-            }
+                self.log_window_open = log_open;
+                if do_clear_logs {
+                    let _ = std::fs::write(upload::log_file_path(), "");
+                    self.refresh_log_cache(true);
+                    self.last_msg = "Logs cleared".to_string();
+                } else if do_refresh_logs {
+                    self.refresh_log_cache(true);
+                    self.last_msg = "Logs refreshed".to_string();
+                }
             }
 
             // Metadata compare window (side-by-side)
             if self.metadata_compare_open {
-                let comps = self.metadata_compare.clone();
-                egui::Window::new("Compare metadata").open(&mut self.metadata_compare_open).show(ctx, |ui| {
-                    if comps.is_empty() {
+                let mut compare_open = self.metadata_compare_open;
+                egui::Window::new("Compare metadata").open(&mut compare_open).show(ctx, |ui| {
+                    if self.metadata_compare.is_empty() {
                         ui.label("No files to compare");
                         return;
                     }
                     // build union of keys
                     let mut keys: Vec<String> = Vec::new();
                     let mut keyset: HashSet<String> = HashSet::new();
-                    for (_name, map) in &comps {
+                    for (_name, map) in &self.metadata_compare {
                         for k in map.keys() {
                             if !keyset.contains(k) { keyset.insert(k.clone()); keys.push(k.clone()); }
                         }
@@ -1507,7 +1514,7 @@ impl eframe::App for AppState {
                     // header row
                     ui.horizontal(|ui| {
                         ui.label("");
-                        for (name, _map) in &comps {
+                        for (name, _map) in &self.metadata_compare {
                             ui.label(name);
                         }
                     });
@@ -1518,7 +1525,7 @@ impl eframe::App for AppState {
                                 ui.label(k);
                                 // collect values for this key
                                 let mut vals: Vec<Option<String>> = Vec::new();
-                                for (_name, map) in &comps {
+                                for (_name, map) in &self.metadata_compare {
                                     vals.push(map.get(k).cloned());
                                 }
                                 // detect differences
@@ -1543,6 +1550,7 @@ impl eframe::App for AppState {
                         }
                     });
                 });
+                self.metadata_compare_open = compare_open;
             }
             });
         });
@@ -1570,8 +1578,11 @@ impl eframe::App for AppState {
                 }
             }
 
+            let mut about_open = self.about_open;
+            let mut do_refresh_logs = false;
+            let mut do_clear_logs = false;
             egui::Window::new("About Uploader")
-                .open(&mut self.about_open)
+                .open(&mut about_open)
                 .anchor(egui::Align2::RIGHT_TOP, egui::Vec2::new(-10.0, 40.0))
                 .default_size(egui::vec2(600.0, 400.0))
                 .resizable(true)
@@ -1590,41 +1601,28 @@ impl eframe::App for AppState {
                     });
                     ui.separator();
                     ui.label("Application logs:");
-                    let p = upload::log_file_path();
-                    let contents = std::fs::read_to_string(&p).unwrap_or_else(|_| "(no logs)".to_string());
-                    // expand BODY_FILE entries similar to the Logs window
-                    let mut display = String::new();
-                    for line in contents.lines() {
-                        display.push_str(line);
-                        display.push('\n');
-                        if let Some(idx) = line.find("BODY_FILE:") {
-                            let path = line[idx+"BODY_FILE:".len()..].trim();
-                            if !path.is_empty() {
-                                if let Ok(body) = std::fs::read_to_string(path) {
-                                    display.push_str("---- BODY START ----\n");
-                                    display.push_str(&body);
-                                    if !body.ends_with('\n') { display.push('\n'); }
-                                    display.push_str("---- BODY END ----\n");
-                                } else {
-                                    display.push_str("(failed to read body file)\n");
-                                }
-                            }
-                        }
-                    }
-                    let mut txt = display;
+                    let mut txt = self.log_cache.clone();
                     egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
                         ui.add(egui::TextEdit::multiline(&mut txt).desired_rows(10).desired_width(ui.available_width()));
                     });
                     ui.horizontal(|ui| {
                         if ui.button("Refresh").clicked() {
-                            self.last_msg = "Logs refreshed".to_string();
+                            do_refresh_logs = true;
                         }
                         if ui.button("Clear").clicked() {
-                            let _ = std::fs::write(p.clone(), "");
-                            self.last_msg = "Logs cleared".to_string();
+                            do_clear_logs = true;
                         }
                     });
                 });
+            self.about_open = about_open;
+            if do_clear_logs {
+                let _ = std::fs::write(upload::log_file_path(), "");
+                self.refresh_log_cache(true);
+                self.last_msg = "Logs cleared".to_string();
+            } else if do_refresh_logs {
+                self.refresh_log_cache(true);
+                self.last_msg = "Logs refreshed".to_string();
+            }
         }
 
         // Render toasts in a top-right area and drop expired ones.

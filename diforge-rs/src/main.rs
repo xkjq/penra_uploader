@@ -278,6 +278,8 @@ struct ReportApp {
     skip_revert_on_widget_edit: bool,
     // set when Paste is chosen from our custom context menu; consumed on Event::Paste
     context_paste_requested: bool,
+    // preserve non-Vim selection while context menu is open
+    context_menu_selection: Option<std::ops::Range<usize>>,
 }
 
 #[derive(Clone)]
@@ -441,6 +443,7 @@ impl Default for ReportApp {
             spell_context: None,
             skip_revert_on_widget_edit: false,
             context_paste_requested: false,
+            context_menu_selection: None,
             user_template_vars: HashMap::new(),
             show_edit_vars_dialog: None,
             edit_vars_text: String::new(),
@@ -1003,6 +1006,9 @@ impl eframe::App for ReportApp {
                         ui.ctx().fonts_mut(|f| f.layout_job(job))
                     };
 
+                    // Capture char_len before the mutable borrow of self.buffer.report.
+                    let report_char_len = self.buffer.char_len();
+
                     // Attach the layouter to the TextEdit builder
                     let mut text_edit = egui::TextEdit::multiline(&mut self.buffer.report)
                         .desired_rows(20)
@@ -1012,17 +1018,89 @@ impl eframe::App for ReportApp {
                         // make the widget non-interactive when Vim is active but not in Insert,
                         // so clicks don't hand keyboard focus to the TextEdit unexpectedly.
                         .interactive(is_interactive)
-                        .layouter(&mut layouter_closure);
+                        .layouter(&mut layouter_closure)
+                        // stable ID so we can pre-load and patch its state before show()
+                        .id_source("diforge_report");
 
                     // Use monospace font when Vim emulation is active for consistent fixed-width behavior
                     if self.vim_enabled {
                         text_edit = text_edit.font(egui::TextStyle::Monospace);
                     }
 
+                    use egui::Event;
+
+                    // Capture events now (before show) so undo/redo and secondary-press
+                    // detection are available both before and after the widget runs.
+                    let events = ctx.input(|i| i.events.clone());
+
+                    // Snapshot selection before TextEdit handles pointer events in this frame.
+                    let prev_selection_before_context = self.buffer.caret_char_range.clone();
+
+                    // Pre-inject the preserved non-Vim selection into TextEditState BEFORE
+                    // show() runs.  TextEdit reads its persisted state at the start of render,
+                    // so setting it here means the highlight is visible on THIS frame even
+                    // while the context-menu popup holds keyboard focus.
+                    if !self.vim_enabled {
+                        if let Some(sel) = self.context_menu_selection.clone() {
+                            let textedit_id = ui.make_persistent_id("diforge_report");
+                            let s = sel.start.min(sel.end).min(report_char_len);
+                            let e = sel.start.max(sel.end).min(report_char_len);
+                            if e > s {
+                                if let Some(mut te_state) =
+                                    egui::TextEdit::load_state(ctx, textedit_id)
+                                {
+                                    te_state.cursor.set_char_range(Some(CCursorRange::two(
+                                        CCursor::new(s),
+                                        CCursor::new(e),
+                                    )));
+                                    egui::TextEdit::store_state(ctx, textedit_id, te_state);
+                                }
+                            }
+                        }
+                    }
+
                     let mut output = text_edit.show(ui);
 
+                    let secondary_press_in_editor = events.iter().any(|ev| {
+                        if let Event::PointerButton {
+                            pos,
+                            pressed,
+                            button,
+                            ..
+                        } = ev
+                        {
+                            *pressed
+                                && *button == egui::PointerButton::Secondary
+                                && output.response.rect.contains(*pos)
+                        } else {
+                            false
+                        }
+                    });
+
+                    // Capture current non-empty selection before right-click opens the menu,
+                    // then keep reusing it while the menu is visible.
+                    // Use only prev_selection_before_context (pre-show snapshot) — this correctly
+                    // reflects the selection the user had before clicking, with no stale cache.
+                    if !self.vim_enabled && secondary_press_in_editor {
+                        if let Some(prev) = prev_selection_before_context.clone() {
+                            let s = prev.start.min(prev.end);
+                            let e = prev.start.max(prev.end);
+                            if e > s {
+                                self.context_menu_selection = Some(s..e);
+                            } else {
+                                // User had no selection when they right-clicked — clear any
+                                // previously captured menu selection so Copy is correctly disabled.
+                                self.context_menu_selection = None;
+                            }
+                        } else {
+                            self.context_menu_selection = None;
+                        }
+                    }
+
                     // Text context menu actions available in both Vim and non-Vim modes.
+                    let mut text_context_menu_open = false;
                     output.response.context_menu(|ui| {
+                        text_context_menu_open = true;
                         let copy_text = if self.vim_enabled
                             && (self.vim_mode == VimMode::Visual || self.vim_mode == VimMode::VisualLine)
                         {
@@ -1059,7 +1137,11 @@ impl eframe::App for ReportApp {
                             } else {
                                 None
                             }
-                        } else if let Some(r) = &self.buffer.caret_char_range {
+                        } else if let Some(r) = self
+                            .context_menu_selection
+                            .as_ref()
+                            .or(self.buffer.caret_char_range.as_ref())
+                        {
                             let s = r.start.min(r.end).min(self.buffer.char_len());
                             let e = r.start.max(r.end).min(self.buffer.char_len());
                             if e > s {
@@ -1125,10 +1207,21 @@ impl eframe::App for ReportApp {
                         }
                     });
 
-                    // Update stored caret char range from the widget's reported cursor_range
-                    // Only trust the widget when the TextEdit is interactive (Insert mode or Vim disabled).
+                    if !text_context_menu_open && !self.vim_enabled {
+                        self.context_menu_selection = None;
+                    }
+
+                    // Update stored caret char range from the widget's reported cursor_range.
+                    // Only trust the widget when interactive and not preserving a menu selection.
                     if is_interactive {
-                        if let Some(ccr) = output.cursor_range {
+                        if !self.vim_enabled && self.context_menu_selection.is_some() {
+                            // Context menu is open: keep buffer in sync with the preserved
+                            // selection; do NOT overwrite from output.cursor_range which may
+                            // be None because the popup holds focus.
+                            if let Some(sel) = self.context_menu_selection.clone() {
+                                self.buffer.caret_char_range = Some(sel);
+                            }
+                        } else if let Some(ccr) = output.cursor_range {
                             let sorted = ccr.as_sorted_char_range();
                             self.buffer.caret_char_range = Some(sorted);
                         }
@@ -1183,16 +1276,11 @@ impl eframe::App for ReportApp {
                         }
                     }
 
-                    use egui::Event;
-
                     // (No visible drag handles; mouse selection is handled via
                     // galley-based mapping and pointer drag logic below.)
 
-                    // Capture events once and use them both for global handling and
-                    // vim-specific handling below. Make undo/redo available even
-                    // when Vim emulation is disabled by handling Ctrl-Z / Ctrl-Y
-                    // here unconditionally.
-                    let events = ctx.input(|i| i.events.clone());
+                    // Make undo/redo available even when Vim emulation is disabled
+                    // by handling Ctrl-Z / Ctrl-Y here unconditionally.
 
                     for ev in events.iter() {
                         if let Event::Key { key, pressed: true, modifiers, .. } = ev {
