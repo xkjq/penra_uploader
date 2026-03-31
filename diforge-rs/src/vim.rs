@@ -18,6 +18,10 @@ impl Default for VimMode {
 pub struct ReportBuffer {
     pub report: String,
     pub caret_char_range: Option<Range<usize>>,
+    // Internal Vim yank register (unnamed register).
+    yank_buffer: String,
+    yank_linewise: bool,
+    yank_changed: bool,
     // undo/redo stacks store previous buffer states
     history: Vec<(String, Option<Range<usize>>)>,
     redo: Vec<(String, Option<Range<usize>>)>,
@@ -30,6 +34,9 @@ impl ReportBuffer {
         Self {
             report: String::new(),
             caret_char_range: None,
+            yank_buffer: String::new(),
+            yank_linewise: false,
+            yank_changed: false,
             history: Vec::new(),
             redo: Vec::new(),
             in_undo_group: false,
@@ -153,6 +160,74 @@ impl ReportBuffer {
             self.report.replace_range(start_byte..end_byte, "");
             self.caret_char_range = Some(start_char..start_char);
         }
+    }
+
+    fn text_for_char_range(&self, start_char: usize, end_char: usize) -> String {
+        if start_char >= end_char {
+            return String::new();
+        }
+        self.report
+            .chars()
+            .skip(start_char)
+            .take(end_char - start_char)
+            .collect::<String>()
+    }
+
+    pub fn yank_range(&mut self, start_char: usize, end_char: usize, linewise: bool) {
+        if start_char >= end_char {
+            self.yank_buffer.clear();
+            self.yank_linewise = linewise;
+            self.yank_changed = true;
+            return;
+        }
+        self.yank_buffer = self.text_for_char_range(start_char, end_char);
+        self.yank_linewise = linewise;
+        self.yank_changed = true;
+    }
+
+    pub fn take_yank_for_clipboard(&mut self) -> Option<String> {
+        if self.yank_changed {
+            self.yank_changed = false;
+            Some(self.yank_buffer.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn yank_current_line(&mut self) {
+        let cur = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+        let (s, e) = self.line_bounds_at(cur);
+        self.yank_range(s, e, true);
+    }
+
+    pub fn paste_after(&mut self) {
+        if self.yank_buffer.is_empty() {
+            return;
+        }
+        let cur = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+        let insert_pos = if self.yank_linewise {
+            let (_s, e) = self.line_bounds_at(cur);
+            e
+        } else {
+            (cur + 1).min(self.char_len())
+        };
+        self.set_caret_pos(insert_pos);
+        self.insert_at_caret(&self.yank_buffer.clone());
+    }
+
+    pub fn paste_before(&mut self) {
+        if self.yank_buffer.is_empty() {
+            return;
+        }
+        let cur = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+        let insert_pos = if self.yank_linewise {
+            let (s, _e) = self.line_bounds_at(cur);
+            s
+        } else {
+            cur.min(self.char_len())
+        };
+        self.set_caret_pos(insert_pos);
+        self.insert_at_caret(&self.yank_buffer.clone());
     }
 
     fn next_word_start_from(&self, pos: usize) -> usize {
@@ -808,6 +883,24 @@ impl ReportBuffer {
                     *last_vim_key = None;
                     *vim_mode = crate::VimMode::Insert;
                     true
+                } else if *last_vim_key == Some('y') {
+                    let start = buffer.move_to_line_bounds().0;
+                    let op_count = last_vim_count.take().unwrap_or(1);
+                    let mut end = start;
+                    let chars: Vec<char> = buffer.report.chars().collect();
+                    let n = chars.len();
+                    let mut lines_yanked = 0usize;
+                    while end < n && lines_yanked < op_count {
+                        if let Some(pos) = chars[end..].iter().position(|&c| c == '\n') {
+                            end = end + pos + 1;
+                        } else {
+                            end = n;
+                        }
+                        lines_yanked += 1;
+                    }
+                    buffer.yank_range(start, end, true);
+                    *last_vim_key = None;
+                    false
                 } else {
                     let repeats = last_vim_count.take().unwrap_or(1);
                     for _ in 0..repeats {
@@ -840,6 +933,16 @@ impl ReportBuffer {
                     *last_vim_key = None;
                     *vim_mode = crate::VimMode::Insert;
                     true
+                } else if *last_vim_key == Some('y') {
+                    let end = buffer.move_to_line_bounds().0;
+                    let op_count = last_vim_count.take().unwrap_or(1);
+                    let mut start = end;
+                    for _ in 0..op_count {
+                        start = buffer.prev_line_start_from(start);
+                    }
+                    buffer.yank_range(start, end, true);
+                    *last_vim_key = None;
+                    false
                 } else {
                     let repeats = last_vim_count.take().unwrap_or(1);
                     for _ in 0..repeats {
@@ -924,6 +1027,23 @@ impl ReportBuffer {
                     return true;
                 }
 
+                // operator 'y' (yank words)
+                if *last_vim_key == Some('y') {
+                    let start = buffer
+                        .caret_char_range
+                        .as_ref()
+                        .map(|r| r.start)
+                        .unwrap_or(0);
+                    let mut end = start;
+                    let op_count = last_vim_count.take().unwrap_or(1);
+                    for _ in 0..op_count {
+                        end = buffer.next_word_start_from(end);
+                    }
+                    buffer.yank_range(start, end, false);
+                    *last_vim_key = None;
+                    return false;
+                }
+
                 // default: move by words
                 let repeats = last_vim_count.take().unwrap_or(1);
                 for _ in 0..repeats {
@@ -963,6 +1083,20 @@ impl ReportBuffer {
                     *last_vim_key = None;
                     *vim_mode = crate::VimMode::Insert;
                     true
+                } else if *last_vim_key == Some('y') {
+                    let end = buffer
+                        .caret_char_range
+                        .as_ref()
+                        .map(|r| r.start)
+                        .unwrap_or(0);
+                    let mut start = end;
+                    let op_count = last_vim_count.take().unwrap_or(1);
+                    for _ in 0..op_count {
+                        start = buffer.prev_word_start_from(start);
+                    }
+                    buffer.yank_range(start, end, false);
+                    *last_vim_key = None;
+                    false
                 } else {
                     let repeats = last_vim_count.take().unwrap_or(1);
                     for _ in 0..repeats {
@@ -1003,6 +1137,20 @@ impl ReportBuffer {
                     *last_vim_key = None;
                     *vim_mode = crate::VimMode::Insert;
                     true
+                } else if *last_vim_key == Some('y') {
+                    let start = buffer
+                        .caret_char_range
+                        .as_ref()
+                        .map(|r| r.start)
+                        .unwrap_or(0);
+                    let mut end_char = start;
+                    let op_count = last_vim_count.take().unwrap_or(1);
+                    for _ in 0..op_count {
+                        end_char = buffer.word_end_from(end_char).saturating_add(1);
+                    }
+                    buffer.yank_range(start, end_char, false);
+                    *last_vim_key = None;
+                    false
                 } else {
                     let repeats = last_vim_count.take().unwrap_or(1);
                     for _ in 0..repeats {
@@ -1046,6 +1194,21 @@ impl ReportBuffer {
                     *last_vim_key = None;
                     *vim_mode = crate::VimMode::Insert;
                     true
+                } else if *last_vim_key == Some('y') {
+                    let cur = buffer
+                        .caret_char_range
+                        .as_ref()
+                        .map(|r| r.start)
+                        .unwrap_or(0);
+                    let op_count = last_vim_count.take().unwrap_or(1);
+                    let (start, end) = if ch == 'h' {
+                        (cur.saturating_sub(op_count), cur)
+                    } else {
+                        (cur, (cur + op_count).min(buffer.char_len()))
+                    };
+                    buffer.yank_range(start, end, false);
+                    *last_vim_key = None;
+                    false
                 } else {
                     let repeats = last_vim_count.take().unwrap_or(1);
                     for _ in 0..repeats {
@@ -1161,6 +1324,10 @@ impl ReportBuffer {
                     *last_vim_key = None;
                     *vim_mode = crate::VimMode::Insert;
                     true
+                } else if *last_vim_key == Some('y') {
+                    buffer.yank_range(start, end_char, false);
+                    *last_vim_key = None;
+                    false
                 } else {
                     buffer.set_caret_pos(end_char);
                     *last_vim_key = None;
@@ -1185,6 +1352,10 @@ impl ReportBuffer {
                     *last_vim_key = None;
                     *vim_mode = crate::VimMode::Insert;
                     true
+                } else if *last_vim_key == Some('y') {
+                    buffer.yank_range(line_start, cur, false);
+                    *last_vim_key = None;
+                    false
                 } else {
                     buffer.set_caret_pos(line_start);
                     *last_vim_key = None;
@@ -1264,6 +1435,16 @@ impl ReportBuffer {
                 *last_vim_key = None;
                 false
             }
+            'p' => {
+                buffer.paste_after();
+                *last_vim_key = None;
+                false
+            }
+            'P' => {
+                buffer.paste_before();
+                *last_vim_key = None;
+                false
+            }
             'd' => {
                 // If we're in Visual mode (char or line), "d" should delete the visual selection.
                 if *vim_mode == crate::VimMode::Visual || *vim_mode == crate::VimMode::VisualLine {
@@ -1299,6 +1480,62 @@ impl ReportBuffer {
                     *last_vim_key = None;
                 } else {
                     *last_vim_key = Some('d');
+                }
+                false
+            }
+            'y' => {
+                // Visual yanks selection and returns to Normal mode.
+                if *vim_mode == crate::VimMode::Visual || *vim_mode == crate::VimMode::VisualLine {
+                    if let Some(anchor) = visual_anchor.take() {
+                        let cur = buffer
+                            .caret_char_range
+                            .as_ref()
+                            .map(|r| r.start)
+                            .unwrap_or(0);
+                        if *vim_mode == crate::VimMode::VisualLine {
+                            let (as_, ae) = buffer.line_bounds_at(anchor);
+                            let (cs, ce) = buffer.line_bounds_at(cur);
+                            let s = as_.min(cs);
+                            let e = ae.max(ce).min(buffer.char_len());
+                            buffer.yank_range(s, e, true);
+                        } else {
+                            let s = anchor.min(cur);
+                            // Visual char mode is inclusive in Vim, so convert
+                            // to an end-exclusive range by adding one.
+                            let e = anchor
+                                .max(cur)
+                                .min(buffer.char_len())
+                                .saturating_add(1)
+                                .min(buffer.char_len());
+                            buffer.yank_range(s, e, false);
+                        }
+                        *last_vim_key = None;
+                        *vim_mode = crate::VimMode::Normal;
+                        buffer.set_caret_pos(cur.min(buffer.char_len()));
+                        return false;
+                    }
+                }
+
+                if *last_vim_key == Some('y') {
+                    // yy / Nyy: yank whole lines
+                    let count = last_vim_count.take().unwrap_or(1);
+                    let start = buffer.move_to_line_bounds().0;
+                    let chars: Vec<char> = buffer.report.chars().collect();
+                    let n = chars.len();
+                    let mut end = start;
+                    let mut lines_yanked = 0usize;
+                    while end < n && lines_yanked < count {
+                        if let Some(pos) = chars[end..].iter().position(|&c| c == '\n') {
+                            end = end + pos + 1;
+                        } else {
+                            end = n;
+                        }
+                        lines_yanked += 1;
+                    }
+                    buffer.yank_range(start, end, true);
+                    *last_vim_key = None;
+                } else {
+                    *last_vim_key = Some('y');
                 }
                 false
             }

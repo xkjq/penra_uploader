@@ -1599,6 +1599,11 @@ impl eframe::App for ReportApp {
                                 _ => {}
                             }
                         }
+
+                        // Mirror Vim's internal yank register to the OS clipboard by default.
+                        if let Some(yanked_text) = self.buffer.take_yank_for_clipboard() {
+                            ctx.copy_text(yanked_text);
+                        }
                     }
 
                     // If we already have a desired caret position (e.g. from an insert earlier this frame),
