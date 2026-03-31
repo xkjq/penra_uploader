@@ -497,7 +497,7 @@ impl ReportApp {
     fn show_spell_window(&mut self, ctx: &egui::Context) {
         if let Some(c) = self.spell_context.clone() {
             let mut open = true;
-            egui::Window::new("Spelling")
+            let shown = egui::Window::new("Spelling")
                 .open(&mut open)
                 .fixed_pos(c.screen_pos)
                 .collapsible(false)
@@ -534,6 +534,25 @@ impl ReportApp {
                         self.spell_context = None;
                     }
                 });
+
+            if let Some(inner) = shown {
+                let win_rect = inner.response.rect;
+                let clicked_outside = ctx.input(|i| {
+                    if i.pointer.button_pressed(egui::PointerButton::Primary) {
+                        if let Some(pos) = i.pointer.press_origin() {
+                            !win_rect.contains(pos)
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                });
+                if clicked_outside {
+                    open = false;
+                }
+            }
+
             if !open {
                 self.spell_context = None;
             }
@@ -993,6 +1012,7 @@ impl eframe::App for ReportApp {
                         }
                     }
 
+                    let mut miss_ranges_for_paint = miss_ranges.clone();
                     let mut layouter_closure = move |ui: &egui::Ui, text: &dyn TextBuffer, wrap_width: f32| {
                         let mut job = egui::text::LayoutJob::default();
                         job.wrap.max_width = wrap_width;
@@ -1019,7 +1039,7 @@ impl eframe::App for ReportApp {
                                     },
                                 );
                             }
-                            let miss_color = egui::Color32::from_rgb(40, 120, 220);
+                            let miss_color = egui::Color32::from_rgb(220, 40, 40);
                             // Check if this match overlaps any precomputed miss_range
                             let is_miss = miss_ranges.iter().any(|r| r.start == start && r.end == end);
                             if is_miss {
@@ -1029,7 +1049,8 @@ impl eframe::App for ReportApp {
                                     egui::text::TextFormat {
                                         font_id: font_id.clone(),
                                         color: ui.visuals().text_color(),
-                                        underline: egui::Stroke::new(1.5, miss_color),
+                                        // Spell squiggle is custom-painted after TextEdit so it can be wavy.
+                                        underline: egui::Stroke::NONE,
                                         ..Default::default()
                                     },
                                 );
@@ -1101,118 +1122,40 @@ impl eframe::App for ReportApp {
                         }
                     }
 
-                    // Context menu for spellcheck: right-click on a misspelled word
+                    // Paint red squiggly spell underlines based on misspelled ranges.
                     if self.spell_enabled {
-                        // Use the response's context menu so it only opens when right-clicking the TextEdit
-                        let _ = output.response.context_menu(|ui| {
-                            // force a minimum width so the menu doesn't shrink on reopen
-                            let menu_width = 300.0f32;
-                            ui.set_min_width(menu_width);
-                            // Prefer the original press origin (frame of click), then any stored
-                            // right-click pos. Avoid using the live interact_pos alone because
-                            // that causes the menu contents to change as the mouse moves.
-                            if let Some(pointer_pos) = ui.input(|i| i.pointer.press_origin())
-                                .or(self.last_right_click_pos)
-                                .or_else(|| ui.input(|i| i.pointer.interact_pos()))
-                            {
-                                // debug: log pointer state when showing menu
-                                let press_origin = ui.input(|i| i.pointer.press_origin());
-                                let interact_pos = ui.input(|i| i.pointer.interact_pos());
-                                let primary_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
-                                eprintln!("[dbg] context menu show press_origin={:?} interact_pos={:?} primary_down={}", press_origin, interact_pos, primary_down);
-                                // Find which word (if any) under the pointer is misspelled
-                                let re = regex::Regex::new(r"[A-Za-z']{2,}").unwrap();
-                                let text = &self.buffer.report;
-                                for m in re.find_iter(text) {
-                                    let start_byte = m.start();
-                                    let end_byte = m.end();
-                                    let start_char = text[..start_byte].chars().count();
-                                    let word_len_chars = text[start_byte..end_byte].chars().count();
-                                    let end_char = start_char + word_len_chars;
+                        let painter = ui.painter();
+                        let text = &self.buffer.report;
+                        for r in miss_ranges_for_paint.iter() {
+                            let start_char = text[..r.start].chars().count();
+                            let word_len_chars = text[r.start..r.end].chars().count();
+                            let end_char = start_char + word_len_chars;
 
-                                    let start_cursor = CCursor::new(start_char);
-                                    let end_cursor = CCursor::new(end_char);
-                                    let start_rect = output.galley.pos_from_cursor(start_cursor);
-                                    let end_rect = output.galley.pos_from_cursor(end_cursor);
-                                    let start_x = output.galley_pos.x + start_rect.min.x;
-                                    let end_x = output.galley_pos.x + end_rect.min.x;
-                                    let baseline_y = output.galley_pos.y + start_rect.max.y + 2.0;
-
-                                    // crude hit test: pointer inside horizontal bounds and near baseline
-                                    if pointer_pos.x >= start_x && pointer_pos.x <= end_x
-                                        && pointer_pos.y >= baseline_y - 10.0 && pointer_pos.y <= baseline_y + 10.0
-                                    {
-                                        let word = m.as_str().to_string();
-                                        if self.check_word_correct(&word) { break; }
-
-                                        // compute suggestions once
-                                        let mut suggestions: Vec<String> = Vec::new();
-                                        #[cfg(feature = "hunspell")]
-                                        if let Some(hs) = &self.hunspell {
-                                            suggestions = hs.suggest(&word).clone();
-                                        }
-                                        // Fallback: if hunspell not present or returned no suggestions,
-                                        // use the in-memory `spell_dict` and simple Levenshtein distance.
-                                        if suggestions.is_empty() {
-                                            let target = word.to_lowercase();
-                                            // collect candidates with small length difference to limit work
-                                            let mut cand: Vec<(usize, String)> = self.spell_dict.iter()
-                                                .filter(|w| {
-                                                    let lw = w.len();
-                                                    let lt = target.len();
-                                                    (lw as isize - lt as isize).abs() <= 3
-                                                })
-                                                .map(|w| (levenshtein(&target, w), w.clone()))
-                                                .collect();
-                                            // sort by distance then alphabetically
-                                            cand.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-                                            for (d, s) in cand.into_iter().take(8) {
-                                                // only include reasonably close matches
-                                                if d <= 4 {
-                                                    suggestions.push(s);
-                                                }
-                                            }
-                                        }
-
-                                        // Log for debugging: which word and suggestions were found
-                                        eprintln!("[dbg] context menu word='{}' suggestions={:?}", word, suggestions);
-                                        if suggestions.is_empty() {
-                                            eprintln!("[dbg] no suggestions for '{}' (hunspell_present={})", word, self.hunspell.is_some());
-                                        }
-
-                                        // Instead of rendering interactive buttons inside the context menu
-                                        // (which on some platforms may not receive click events reliably),
-                                        // open the dedicated SpellContext window which already implements
-                                        // working suggestion buttons and replacements. This also keeps
-                                        // a consistent UI path for 'Add to dictionary' / 'Ignore'.
-                                        self.spell_context = Some(SpellContext {
-                                            word: word.clone(),
-                                            start_byte,
-                                            end_byte,
-                                            screen_pos: egui::pos2(pointer_pos.x, pointer_pos.y + 6.0),
-                                            suggestions: suggestions.clone(),
-                                        });
-                                        self.last_right_click_pos = None;
-                                        ui.close_menu();
-
-                                        if ui.button("Add to dictionary").clicked() {
-                                            eprintln!("[dbg] adding '{}' to user dictionary", word);
-                                            self.spell_context = Some(SpellContext { word: word.clone(), start_byte, end_byte, screen_pos: egui::pos2(pointer_pos.x, pointer_pos.y + 6.0), suggestions: suggestions.clone() });
-                                            ui.close_menu();
-                                        }
-                                        if ui.button("Ignore").clicked() {
-                                            // ignore immediately and persist
-                                            self.spell_dict.insert(word.clone());
-                                            let _ = save_settings(&self.to_settings());
-                                            ui.close_menu();
-                                        }
-
-                                        // stop after first matching word
-                                        break;
-                                    }
-                                }
+                            let start_rect = output.galley.pos_from_cursor(CCursor::new(start_char));
+                            let end_rect = output.galley.pos_from_cursor(CCursor::new(end_char));
+                            let start_x = output.galley_pos.x + start_rect.min.x;
+                            let mut end_x = output.galley_pos.x + end_rect.min.x;
+                            if end_x <= start_x {
+                                end_x = output.galley_pos.x + end_rect.max.x;
                             }
-                        });
+                            let baseline_y = output.galley_pos.y + start_rect.max.y + 1.5;
+
+                            let mut pts: Vec<egui::Pos2> = Vec::new();
+                            let mut x = start_x;
+                            let step = 3.5_f32;
+                            let amp = 1.8_f32;
+                            let mut up = false;
+                            while x < end_x {
+                                let y = if up { baseline_y - amp } else { baseline_y + amp };
+                                pts.push(egui::pos2(x, y));
+                                x += step;
+                                up = !up;
+                            }
+                            pts.push(egui::pos2(end_x, baseline_y));
+                            if pts.len() >= 2 {
+                                painter.line(pts, egui::Stroke::new(1.5, egui::Color32::from_rgb(220, 40, 40)));
+                            }
+                        }
                     }
 
                     use egui::Event;
@@ -1265,10 +1208,8 @@ impl eframe::App for ReportApp {
                                     self.last_right_click_pos = None;
                                 }
                             }
-                            // If the TextEdit is non-interactive (vim Normal mode),
-                            // handle right-clicks ourselves so the spellcheck context
-                            // menu still works in Vim mode.
-                            if *button == egui::PointerButton::Secondary && *pressed && !is_interactive {
+                            // Spell menu open: right-click any misspelled word glyph area in either mode.
+                            if *button == egui::PointerButton::Secondary && *pressed && self.spell_enabled {
                                 if output.response.rect.contains(*pos) {
                                     let pointer_pos = *pos;
                                     let re = regex::Regex::new(r"[A-Za-z']{2,}").unwrap();
@@ -1285,11 +1226,15 @@ impl eframe::App for ReportApp {
                                         let start_rect = output.galley.pos_from_cursor(start_cursor);
                                         let end_rect = output.galley.pos_from_cursor(end_cursor);
                                         let start_x = output.galley_pos.x + start_rect.min.x;
-                                        let end_x = output.galley_pos.x + end_rect.min.x;
-                                        let baseline_y = output.galley_pos.y + start_rect.max.y + 2.0;
+                                        let mut end_x = output.galley_pos.x + end_rect.min.x;
+                                        if end_x <= start_x {
+                                            end_x = output.galley_pos.x + end_rect.max.x;
+                                        }
+                                        let top_y = output.galley_pos.y + start_rect.min.y;
+                                        let bottom_y = output.galley_pos.y + start_rect.max.y;
 
                                         if pointer_pos.x >= start_x && pointer_pos.x <= end_x
-                                            && pointer_pos.y >= baseline_y - 10.0 && pointer_pos.y <= baseline_y + 10.0
+                                            && pointer_pos.y >= top_y && pointer_pos.y <= bottom_y
                                         {
                                             let word = m.as_str().to_string();
                                             if self.check_word_correct(&word) { break; }
@@ -1323,7 +1268,7 @@ impl eframe::App for ReportApp {
                                                 word: word.clone(),
                                                 start_byte,
                                                 end_byte,
-                                                screen_pos: egui::pos2(pointer_pos.x, pointer_pos.y + 6.0),
+                                                screen_pos: egui::pos2(pointer_pos.x, pointer_pos.y + 8.0),
                                                 suggestions: suggestions.clone(),
                                             });
                                             self.last_right_click_pos = None;
