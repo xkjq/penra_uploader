@@ -67,6 +67,16 @@ impl ReportBuffer {
         }
     }
 
+    /// Replace the byte range `start_byte..end_byte` in `report` with `replacement`,
+    /// recording an undo snapshot first. Updates `caret_char_range` to the start
+    /// of the replaced region.
+    pub fn replace_bytes(&mut self, start_byte: usize, end_byte: usize, replacement: &str) {
+        self.push_undo_snapshot();
+        self.report.replace_range(start_byte..end_byte, replacement);
+        let pos = self.report[..start_byte].chars().count();
+        self.caret_char_range = Some(pos..pos);
+    }
+
     pub fn undo(&mut self) {
         if let Some(prev) = self.history.pop() {
             let cur = self.snapshot();

@@ -508,14 +508,8 @@ impl ReportApp {
                     if !c.suggestions.is_empty() {
                         for s in c.suggestions.iter().take(8) {
                             if ui.button(s).clicked() {
-                                // apply suggestion
-                                let mut rep = self.buffer.report.clone();
-                                rep.replace_range(c.start_byte..c.end_byte, s);
-                                self.buffer.report = rep;
-                                // attempt to set caret near replacement start
-                                // `c.start_byte` is a byte index, convert to char index correctly
-                                let pos = self.buffer.report[..c.start_byte].chars().count();
-                                self.buffer.caret_char_range = Some(pos..pos);
+                                // apply suggestion via undo-gated replacement
+                                self.buffer.replace_bytes(c.start_byte, c.end_byte, s);
                                 self.spell_context = None;
                             }
                         }
