@@ -316,7 +316,7 @@ impl Default for ReportApp {
             overlay_h: 200,
             buffer: vim::ReportBuffer::new(),
             show_caret_debug: false,
-            caret_x_offset: 3.0,
+            caret_x_offset: 0.0,
             vim_enabled: false,
             vim_mode: VimMode::Normal,
             last_vim_key: None,
@@ -1659,25 +1659,25 @@ impl eframe::App for ReportApp {
                                 }
                             }
 
-                            // Draw a visible caret. Use a Vim-style block in non-Insert modes.
-                            let caret_height = 18.0_f32;
-                            // Use the galley cursor rect width as a best-effort char width; fallback to 8.0
+                            // Draw a visible caret aligned to the galley cursor rect.
                             let mut char_w = (galley_pos.max.x - galley_pos.min.x).abs();
                             if char_w <= 0.1 {
                                 char_w = 8.0;
                             }
+                            let caret_h = (galley_pos.max.y - galley_pos.min.y).abs().max(14.0);
                             let caret_w = if self.vim_mode == VimMode::Insert { 1.5_f32 } else { char_w };
-                            // Nudge the caret slightly right for visual alignment
-                            let nudge = 2.0_f32;
-                            let x = (screen_pos.x + self.caret_x_offset + nudge).clamp(output.response.rect.min.x, output.response.rect.max.x - 1.0);
-                            let y0 = screen_pos.y.clamp(output.response.rect.min.y, output.response.rect.max.y - caret_height);
-                            let y1 = y0 + caret_height;
+                            let effective_x_offset = if self.show_caret_debug { self.caret_x_offset } else { 0.0 };
+                            let x = (screen_pos.x + effective_x_offset)
+                                .clamp(output.response.rect.min.x, output.response.rect.max.x - 1.0);
+                            let y0 = (output.galley_pos.y + galley_pos.min.y)
+                                .clamp(output.response.rect.min.y, output.response.rect.max.y - caret_h);
+                            let y1 = y0 + caret_h;
                             let x2 = (x + caret_w).min(output.response.rect.max.x - 1.0);
                             let rect = egui::Rect::from_min_max(egui::pos2(x, y0), egui::pos2(x2, y1));
                             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(255, 80, 80));
                             if self.show_caret_debug {
                                 painter.circle_filled(egui::pos2(x, y0), 4.0, egui::Color32::from_rgb(80, 200, 255));
-                                let info = format!("screen: {:.1},{:.1}  char_range: {:?}", screen_pos.x + self.caret_x_offset, screen_pos.y, self.buffer.caret_char_range);
+                                let info = format!("screen: {:.1},{:.1}  char_range: {:?}", screen_pos.x + effective_x_offset, screen_pos.y, self.buffer.caret_char_range);
                                 painter.text(
                                     egui::pos2(output.response.rect.min.x + 6.0, output.response.rect.min.y + 6.0),
                                     egui::Align2::LEFT_TOP,
