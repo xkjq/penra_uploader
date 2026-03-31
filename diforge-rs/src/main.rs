@@ -960,20 +960,6 @@ impl eframe::App for ReportApp {
                         if spell_resp.changed() {
                             let _ = save_settings(&self.to_settings());
                         }
-                        ui.separator();
-                        // Clone templates to avoid borrowing `self` across UI calls so we can mutably borrow later
-                        let templates_top = self.templates.clone();
-                        for (i, t) in templates_top.iter().enumerate() {
-                            if ui.small_button(format!("T{}", i + 1)).clicked() {
-                                    // Insert at caret (or append)
-                                    let mut body = t.body.clone();
-                                    if !self.buffer.report.is_empty() && !self.buffer.report.ends_with('\n') && self.buffer.caret_char_range.is_none() {
-                                        // if no caret known, preserve previous append behavior and add newline
-                                        body = format!("\n{}", body);
-                                    }
-                                    self.buffer.insert_at_caret(&body);
-                                }
-                        }
                     });
 
                     ui.separator();
