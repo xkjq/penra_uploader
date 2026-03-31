@@ -276,6 +276,8 @@ struct ReportApp {
     // when true, skip reverting widget-applied edits (used when we intentionally
     // update `buffer.report` from UI actions like choosing a suggestion)
     skip_revert_on_widget_edit: bool,
+    // set when Paste is chosen from our custom context menu; consumed on Event::Paste
+    context_paste_requested: bool,
 }
 
 #[derive(Clone)]
@@ -283,7 +285,6 @@ struct SpellContext {
     word: String,
     start_byte: usize,
     end_byte: usize,
-    screen_pos: egui::Pos2,
     suggestions: Vec<String>,
 }
 
@@ -439,6 +440,7 @@ impl Default for ReportApp {
             },
             spell_context: None,
             skip_revert_on_widget_edit: false,
+            context_paste_requested: false,
             user_template_vars: HashMap::new(),
             show_edit_vars_dialog: None,
             edit_vars_text: String::new(),
@@ -490,67 +492,6 @@ impl Default for ReportApp {
         }
 
         app
-    }
-}
-
-impl ReportApp {
-    fn show_spell_window(&mut self, ctx: &egui::Context) {
-        if let Some(c) = self.spell_context.clone() {
-            let mut open = true;
-            let shown = egui::Window::new("Spelling")
-                .open(&mut open)
-                .fixed_pos(c.screen_pos)
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.label(format!("Suggestions for: {}", c.word));
-                    ui.separator();
-                    if !c.suggestions.is_empty() {
-                        for s in c.suggestions.iter().take(8) {
-                            if ui.button(s).clicked() {
-                                // apply suggestion via undo-gated replacement
-                                self.buffer.replace_bytes(c.start_byte, c.end_byte, s);
-                                self.spell_context = None;
-                            }
-                        }
-                    } else {
-                        ui.label("No suggestions");
-                    }
-                    ui.separator();
-                    if ui.button("Add to dictionary").clicked() {
-                        let w = c.word.clone();
-                        self.add_word_to_user_dict(&w);
-                        self.spell_context = None;
-                    }
-                    if ui.button("Ignore").clicked() {
-                        self.spell_dict.insert(c.word.clone());
-                        let _ = save_settings(&self.to_settings());
-                        self.spell_context = None;
-                    }
-                });
-
-            if let Some(inner) = shown {
-                let win_rect = inner.response.rect;
-                let clicked_outside = ctx.input(|i| {
-                    if i.pointer.button_pressed(egui::PointerButton::Primary) {
-                        if let Some(pos) = i.pointer.press_origin() {
-                            !win_rect.contains(pos)
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                });
-                if clicked_outside {
-                    open = false;
-                }
-            }
-
-            if !open {
-                self.spell_context = None;
-            }
-        }
     }
 }
 
@@ -1080,6 +1021,110 @@ impl eframe::App for ReportApp {
 
                     let mut output = text_edit.show(ui);
 
+                    // Text context menu actions available in both Vim and non-Vim modes.
+                    output.response.context_menu(|ui| {
+                        let copy_text = if self.vim_enabled
+                            && (self.vim_mode == VimMode::Visual || self.vim_mode == VimMode::VisualLine)
+                        {
+                            if let Some(anchor) = self.visual_anchor {
+                                let cur = self
+                                    .buffer
+                                    .caret_char_range
+                                    .as_ref()
+                                    .map(|r| r.start)
+                                    .unwrap_or(anchor)
+                                    .min(self.buffer.char_len());
+                                let (sel_start, sel_end) = if self.vim_mode == VimMode::VisualLine {
+                                    let (a_s, a_e) = self.buffer.line_bounds_at(anchor);
+                                    let (c_s, c_e) = self.buffer.line_bounds_at(cur);
+                                    (a_s.min(c_s), a_e.max(c_e).min(self.buffer.char_len()))
+                                } else {
+                                    let s = anchor.min(cur);
+                                    let e = anchor.max(cur);
+                                    let extend = if e > s { 1 } else { 0 };
+                                    (s, e.min(self.buffer.char_len()).saturating_add(extend).min(self.buffer.char_len()))
+                                };
+                                if sel_end > sel_start {
+                                    Some(
+                                        self.buffer
+                                            .report
+                                            .chars()
+                                            .skip(sel_start)
+                                            .take(sel_end - sel_start)
+                                            .collect::<String>(),
+                                    )
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else if let Some(r) = &self.buffer.caret_char_range {
+                            let s = r.start.min(r.end).min(self.buffer.char_len());
+                            let e = r.start.max(r.end).min(self.buffer.char_len());
+                            if e > s {
+                                Some(
+                                    self.buffer
+                                        .report
+                                        .chars()
+                                        .skip(s)
+                                        .take(e - s)
+                                        .collect::<String>(),
+                                )
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        if ui
+                            .add_enabled(copy_text.is_some(), egui::Button::new("Copy"))
+                            .clicked()
+                        {
+                            if let Some(txt) = copy_text {
+                                ui.ctx().copy_text(txt);
+                            }
+                            ui.close();
+                        }
+
+                        if ui.button("Paste").clicked() {
+                            self.context_paste_requested = true;
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                            ui.close();
+                        }
+
+                        if let Some(c) = self.spell_context.clone() {
+                            ui.separator();
+                            ui.label(format!("Spelling: {}", c.word));
+
+                            if !c.suggestions.is_empty() {
+                                for s in c.suggestions.iter().take(8) {
+                                    if ui.button(s).clicked() {
+                                        self.buffer.replace_bytes(c.start_byte, c.end_byte, s);
+                                        self.spell_context = None;
+                                        ui.close();
+                                    }
+                                }
+                            } else {
+                                ui.label("No suggestions");
+                            }
+
+                            if ui.button("Add to dictionary").clicked() {
+                                self.add_word_to_user_dict(&c.word);
+                                self.spell_context = None;
+                                ui.close();
+                            }
+                            if ui.button("Ignore").clicked() {
+                                self.spell_dict.insert(c.word.clone());
+                                let _ = save_settings(&self.to_settings());
+                                self.spell_context = None;
+                                ui.close();
+                            }
+                        }
+                    });
+
                     // Update stored caret char range from the widget's reported cursor_range
                     // Only trust the widget when the TextEdit is interactive (Insert mode or Vim disabled).
                     if is_interactive {
@@ -1162,6 +1207,20 @@ impl eframe::App for ReportApp {
                         }
                     }
 
+                    // Handle context-menu paste requests in non-interactive mode,
+                    // where TextEdit won't consume Event::Paste itself.
+                    if self.context_paste_requested {
+                        for ev in events.iter() {
+                            if let Event::Paste(paste_text) = ev {
+                                if !is_interactive {
+                                    self.buffer.insert_at_caret(paste_text);
+                                }
+                                self.context_paste_requested = false;
+                                break;
+                            }
+                        }
+                    }
+
                     // Ensure any active undo group is ended on Escape regardless
                     // of whether Vim emulation is enabled. This prevents leaving
                     // grouped edits open when the user presses Escape or when
@@ -1191,6 +1250,7 @@ impl eframe::App for ReportApp {
                             // Spell menu open: right-click any misspelled word glyph area in either mode.
                             if *button == egui::PointerButton::Secondary && *pressed && self.spell_enabled {
                                 if output.response.rect.contains(*pos) {
+                                    self.spell_context = None;
                                     let pointer_pos = *pos;
                                     let re = regex::Regex::new(r"[A-Za-z']{2,}").unwrap();
                                     let text = &self.buffer.report;
@@ -1248,7 +1308,6 @@ impl eframe::App for ReportApp {
                                                 word: word.clone(),
                                                 start_byte,
                                                 end_byte,
-                                                screen_pos: egui::pos2(pointer_pos.x, pointer_pos.y + 8.0),
                                                 suggestions: suggestions.clone(),
                                             });
                                             self.last_right_click_pos = None;
@@ -1726,9 +1785,6 @@ impl eframe::App for ReportApp {
                     });
                 });
             });
-
-            // show spell suggestion window (if any)
-            self.show_spell_window(ctx);
 
             // Templates area: render in the right column when requested
             if self.show_templates_window {
