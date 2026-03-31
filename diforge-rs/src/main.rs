@@ -1018,15 +1018,39 @@ impl eframe::App for ReportApp {
                     }
 
                     // Spellchecking: find words not in dictionary and draw squiggly underlines
-                    // Spellchecking: find words not in dictionary and draw squiggly underlines
-                            if self.spell_enabled {
-                        // simple word regex: letters and apostrophes, length >= 2
-                        let re = regex::Regex::new(r"[A-Za-z']{2,}").unwrap();
+                    // Spellchecking: build a LayoutJob to obtain a galley that matches wrapping
+                    if self.spell_enabled {
                         let text = &self.buffer.report;
+                        let mut job = egui::text::LayoutJob::default();
+                        // set wrapping width to match the text edit rect
+                        job.wrap.max_width = output.response.rect.width();
+
+                        // pick a font consistent with the UI style (monospace for vim)
+                        let font_id = if self.vim_enabled {
+                            ui.style().text_styles.get(&egui::TextStyle::Monospace).map(|f| egui::FontId::monospace(f.size)).unwrap_or(egui::FontId::monospace(14.0))
+                        } else {
+                            ui.style().text_styles.get(&egui::TextStyle::Body).map(|f| egui::FontId::proportional(f.size)).unwrap_or(egui::FontId::proportional(14.0))
+                        };
+
+                        job.append(
+                            &text,
+                            0.0,
+                            egui::text::TextFormat {
+                                font_id: font_id.clone(),
+                                color: ui.visuals().text_color(),
+                                ..Default::default()
+                            },
+                        );
+
+                        // create a galley from the job using the UI's fonts
+                        let galley = ctx.fonts_mut(|f| f.layout_job(job));
+
+                        let re = regex::Regex::new(r"[A-Za-z']{2,}").unwrap();
                         let painter = ui.painter();
                         for m in re.find_iter(text) {
                             let word = m.as_str();
                             if self.check_word_correct(word) { continue; }
+
                             // map byte offsets to char indices
                             let start_byte = m.start();
                             let end_byte = m.end();
@@ -1034,14 +1058,13 @@ impl eframe::App for ReportApp {
                             let word_len_chars = text[start_byte..end_byte].chars().count();
                             let end_char = start_char + word_len_chars;
 
-                            // compute screen coords for start and end using galley
+                            // compute screen coords using our galley
                             let start_cursor = CCursor::new(start_char);
                             let end_cursor = CCursor::new(end_char.saturating_sub(1));
-                            let start_rect = output.galley.pos_from_cursor(start_cursor);
-                            let end_rect = output.galley.pos_from_cursor(end_cursor);
+                            let start_rect = galley.pos_from_cursor(start_cursor);
+                            let end_rect = galley.pos_from_cursor(end_cursor);
                             let start_x = output.response.rect.min.x + start_rect.min.x;
                             let end_x = output.response.rect.min.x + end_rect.max.x;
-                            // baseline y just below glyph area
                             let baseline_y = output.response.rect.min.y + start_rect.max.y + 2.0;
 
                             // draw a simple zig-zag squiggly underline
@@ -1056,7 +1079,6 @@ impl eframe::App for ReportApp {
                                     x += step;
                                     up = !up;
                                 }
-                                // ensure last point at end_x
                                 pts.push(egui::pos2(end_x, baseline_y));
                                 painter.line(pts, egui::Stroke::new(1.5, egui::Color32::from_rgb(220, 40, 40)));
                             }
