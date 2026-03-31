@@ -1134,9 +1134,9 @@ impl eframe::App for ReportApp {
                                     let end_cursor = CCursor::new(end_char);
                                     let start_rect = output.galley.pos_from_cursor(start_cursor);
                                     let end_rect = output.galley.pos_from_cursor(end_cursor);
-                                    let start_x = output.response.rect.min.x + start_rect.min.x;
-                                    let end_x = output.response.rect.min.x + end_rect.min.x;
-                                    let baseline_y = output.response.rect.min.y + start_rect.max.y + 2.0;
+                                    let start_x = output.galley_pos.x + start_rect.min.x;
+                                    let end_x = output.galley_pos.x + end_rect.min.x;
+                                    let baseline_y = output.galley_pos.y + start_rect.max.y + 2.0;
 
                                     // crude hit test: pointer inside horizontal bounds and near baseline
                                     if pointer_pos.x >= start_x && pointer_pos.x <= end_x
@@ -1284,9 +1284,9 @@ impl eframe::App for ReportApp {
                                         let end_cursor = CCursor::new(end_char);
                                         let start_rect = output.galley.pos_from_cursor(start_cursor);
                                         let end_rect = output.galley.pos_from_cursor(end_cursor);
-                                        let start_x = output.response.rect.min.x + start_rect.min.x;
-                                        let end_x = output.response.rect.min.x + end_rect.min.x;
-                                        let baseline_y = output.response.rect.min.y + start_rect.max.y + 2.0;
+                                        let start_x = output.galley_pos.x + start_rect.min.x;
+                                        let end_x = output.galley_pos.x + end_rect.min.x;
+                                        let baseline_y = output.galley_pos.y + start_rect.max.y + 2.0;
 
                                         if pointer_pos.x >= start_x && pointer_pos.x <= end_x
                                             && pointer_pos.y >= baseline_y - 10.0 && pointer_pos.y <= baseline_y + 10.0
@@ -1379,7 +1379,7 @@ impl eframe::App for ReportApp {
                                 for idx in 0..=total {
                                     let cursor = CCursor::new(idx);
                                     let rect = output.galley.pos_from_cursor(cursor);
-                                    let screen = output.response.rect.min + rect.min.to_vec2();
+                                    let screen = output.galley_pos + rect.min.to_vec2();
                                     let dx = screen.x - pos.x;
                                     let dy = screen.y - pos.y;
                                     let dist = dx * dx + dy * dy;
@@ -1439,7 +1439,7 @@ impl eframe::App for ReportApp {
                             for idx in 0..=total {
                                 let cursor = CCursor::new(idx);
                                 let rect = output.galley.pos_from_cursor(cursor);
-                                let screen = output.response.rect.min + rect.min.to_vec2();
+                                let screen = output.galley_pos + rect.min.to_vec2();
                                 let dx = screen.x - pos.x;
                                 let dy = screen.y - pos.y;
                                 let dist = dx * dx + dy * dy;
@@ -1572,9 +1572,8 @@ impl eframe::App for ReportApp {
                             let ccursor = ccr.primary;
                             // Position inside the laid-out galley (pos_from_cursor returns a Rect)
                             let galley_pos = output.galley.pos_from_cursor(ccursor);
-                            // Convert to screen coords: widget rect min + galley_pos offset
-                            // Note: `galley_pos` is already positioned relative to the widget; avoid double-adding `output.galley_pos`.
-                            let screen_pos = output.response.rect.min + galley_pos.min.to_vec2();
+                            // Convert to screen coords from galley-local cursor geometry.
+                            let screen_pos = output.galley_pos + galley_pos.min.to_vec2();
                             // Prepare painter for selection/caret drawing
                             let painter = ui.painter();
 
@@ -1614,13 +1613,13 @@ impl eframe::App for ReportApp {
 
                                         let start_pos = output.galley.pos_from_cursor(CCursor::new(seg_start));
                                         let end_pos = output.galley.pos_from_cursor(CCursor::new(seg_end));
-                                        let mut x0 = output.response.rect.min.x + start_pos.min.x;
-                                        let mut x1 = output.response.rect.min.x + end_pos.min.x;
+                                        let mut x0 = output.galley_pos.x + start_pos.min.x;
+                                        let mut x1 = output.galley_pos.x + end_pos.min.x;
 
                                         if seg_end > seg_start {
                                             let prev_pos =
                                                 output.galley.pos_from_cursor(CCursor::new(seg_end.saturating_sub(1)));
-                                            let prev_x = output.response.rect.min.x + prev_pos.max.x;
+                                            let prev_x = output.galley_pos.x + prev_pos.max.x;
                                             if prev_x > x1 {
                                                 x1 = prev_x;
                                             }
@@ -1634,7 +1633,7 @@ impl eframe::App for ReportApp {
                                             .abs()
                                             .max(14.0)
                                             .min(48.0);
-                                        let y0 = (output.response.rect.min.y + start_pos.min.y)
+                                        let y0 = (output.galley_pos.y + start_pos.min.y)
                                             .clamp(output.response.rect.min.y, output.response.rect.max.y);
                                         let y1 = (y0 + line_h).min(output.response.rect.max.y);
                                         x0 = x0.clamp(output.response.rect.min.x, output.response.rect.max.x);
