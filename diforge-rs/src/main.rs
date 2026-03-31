@@ -1087,6 +1087,16 @@ impl eframe::App for ReportApp {
                             let e = prev.start.max(prev.end);
                             if e > s {
                                 self.context_menu_selection = Some(s..e);
+                                // egui's pointer_interaction() clears the TextEdit cursor on
+                                // any_pressed() — including secondary (right) clicks. Restore
+                                // the selection in TextEditState immediately so the pre-injection
+                                // on the *next* frame picks up the correct state even when the
+                                // secondary press and release span different frames.
+                                output.state.cursor.set_char_range(Some(CCursorRange::two(
+                                    CCursor::new(s),
+                                    CCursor::new(e),
+                                )));
+                                output.state.clone().store(ctx, output.response.id);
                             } else {
                                 // User had no selection when they right-clicked — clear any
                                 // previously captured menu selection so Copy is correctly disabled.
@@ -1207,7 +1217,15 @@ impl eframe::App for ReportApp {
                         }
                     });
 
-                    if !text_context_menu_open && !self.vim_enabled {
+                    // Clear context_menu_selection only when the context menu is
+                    // genuinely closed AND the secondary (right) mouse button is no
+                    // longer held.  Between the initial right-click press and the
+                    // release, text_context_menu_open is false (the popup hasn't opened
+                    // yet) but we must NOT clear — otherwise the captured selection is
+                    // thrown away every intermediate frame before the popup appears.
+                    let secondary_is_held =
+                        ctx.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
+                    if !text_context_menu_open && !self.vim_enabled && !secondary_is_held {
                         self.context_menu_selection = None;
                     }
 
