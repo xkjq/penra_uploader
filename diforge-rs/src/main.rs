@@ -19,7 +19,6 @@ mod hun_wrapper;
 use hun_wrapper::RawHunspell;
 
 use egui::text::{CCursor, CCursorRange};
-use std::ops::Range;
 
 // Simple Levenshtein distance implementation for fallback suggestions
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -980,24 +979,17 @@ impl eframe::App for ReportApp {
                     // intercept Alt+Number events.
                     let alt_pressed = ctx.input(|i| i.modifiers.alt);
                     let is_interactive = (!self.vim_enabled || self.vim_mode == VimMode::Insert) && !alt_pressed;
-                    // choose a FontId to use for overlay text drawing
-                    let font_id = if self.vim_enabled {
-                        ui.style().text_styles.get(&egui::TextStyle::Monospace).map(|f| egui::FontId::monospace(f.size)).unwrap_or(egui::FontId::monospace(14.0))
-                    } else {
-                        ui.style().text_styles.get(&egui::TextStyle::Body).map(|f| egui::FontId::proportional(f.size)).unwrap_or(egui::FontId::proportional(14.0))
-                    };
-
-                    
-
                     // Precompute misspelled ranges and local flags so the layouter
                     // closure does not capture `self` (avoids borrow conflicts).
                     let vim_enabled = self.vim_enabled;
                     let re_split = regex::Regex::new(r"[A-Za-z']{2,}").unwrap();
                     let mut miss_ranges: Vec<std::ops::Range<usize>> = Vec::new();
-                    for m in re_split.find_iter(&self.buffer.report) {
-                        let word = m.as_str();
-                        if !self.check_word_correct(word) {
-                            miss_ranges.push(m.start()..m.end());
+                    if self.spell_enabled {
+                        for m in re_split.find_iter(&self.buffer.report) {
+                            let word = m.as_str();
+                            if !self.check_word_correct(word) {
+                                miss_ranges.push(m.start()..m.end());
+                            }
                         }
                     }
 
@@ -1036,7 +1028,8 @@ impl eframe::App for ReportApp {
                                     0.0,
                                     egui::text::TextFormat {
                                         font_id: font_id.clone(),
-                                        color: miss_color,
+                                        color: ui.visuals().text_color(),
+                                        underline: egui::Stroke::new(1.5, miss_color),
                                         ..Default::default()
                                     },
                                 );
@@ -1105,58 +1098,6 @@ impl eframe::App for ReportApp {
                         } else {
                             eprintln!("[dbg] reverting buffer.report due to non-Insert vim mode (widget tried to edit)");
                             self.buffer.report = prev_report;
-                        }
-                    }
-
-                    // Spellchecking: find words not in dictionary and draw squiggly underlines
-                    if self.spell_enabled {
-                        let text = &self.buffer.report;
-
-                        let re = regex::Regex::new(r"[A-Za-z']{2,}").unwrap();
-                        let painter = ui.painter();
-                        for m in re.find_iter(text) {
-                            let word = m.as_str();
-                            if self.check_word_correct(word) { continue; }
-
-                            // map byte offsets to char indices
-                            let start_byte = m.start();
-                            let end_byte = m.end();
-                            let start_char = text[..start_byte].chars().count();
-                            let word_len_chars = text[start_byte..end_byte].chars().count();
-                            let end_char = start_char + word_len_chars;
-
-                            // compute screen coords using the widget's galley for exact alignment
-                            let start_cursor = CCursor::new(start_char);
-                            let end_cursor = CCursor::new(end_char);
-                            let start_rect = output.galley.pos_from_cursor(start_cursor);
-                            let end_rect = output.galley.pos_from_cursor(end_cursor);
-                            let start_x = output.response.rect.min.x + start_rect.min.x;
-                            let end_x = output.response.rect.min.x + end_rect.min.x;
-                            let baseline_y = output.response.rect.min.y + start_rect.max.y + 2.0;
-
-                            // draw a simple zig-zag squiggly underline
-                            let mut pts: Vec<egui::Pos2> = Vec::new();
-                            let step = 6.0_f32;
-                            if end_x > start_x + 2.0 {
-                                let mut x = start_x;
-                                let mut up = false;
-                                while x < end_x {
-                                    let y = if up { baseline_y - 2.0 } else { baseline_y + 2.0 };
-                                    pts.push(egui::pos2(x, y));
-                                    x += step;
-                                    up = !up;
-                                }
-                                pts.push(egui::pos2(end_x, baseline_y));
-                                painter.line(pts, egui::Stroke::new(1.5, egui::Color32::from_rgb(40, 120, 220)));
-                                // Draw the misspelled word in the same blue on top of the widget text
-                                painter.text(
-                                    egui::pos2(start_x, output.response.rect.min.y + start_rect.min.y),
-                                    egui::Align2::LEFT_TOP,
-                                    word,
-                                    font_id.clone(),
-                                    egui::Color32::from_rgb(40, 120, 220),
-                                );
-                            }
                         }
                     }
 
@@ -1284,9 +1225,6 @@ impl eframe::App for ReportApp {
                     // when Vim emulation is disabled by handling Ctrl-Z / Ctrl-Y
                     // here unconditionally.
                     let events = ctx.input(|i| i.events.clone());
-                    // remember canonical caret before events so we can clean up any
-                    // accidental character insertions caused by modifier shortcuts
-                    let caret_before_events = self.buffer.caret_char_range.as_ref().map(|r| r.start);
 
                     for ev in events.iter() {
                         if let Event::Key { key, pressed: true, modifiers, .. } = ev {
@@ -1563,7 +1501,6 @@ impl eframe::App for ReportApp {
                                         VimMode::Insert => {
                                             // in Insert mode, normal text events are handled by TextEdit; we only intercept Escape above
                                         }
-                                        _ => {}
                                     }
                                 }
                                 _ => {}
@@ -1621,8 +1558,10 @@ impl eframe::App for ReportApp {
                         }
                     }
 
-                    // Draw an unfocused caret indicator so the user can see the caret when the editor is not focused.
-                    if !output.response.has_focus() {
+                    // Fall back to manual selection/caret overlays when Vim mode keeps TextEdit non-interactive
+                    // or unfocused. In standard interactive editing, rely on built-in TextEdit painting.
+                    let needs_custom_overlay = self.vim_enabled && !is_interactive;
+                    if needs_custom_overlay {
                         // Try to use the widget-reported cursor_range, otherwise fall back to our stored `caret_char_range`.
                         let maybe_ccr = output.cursor_range.or_else(|| {
                             self.buffer.caret_char_range.as_ref().map(|r| CCursorRange::two(CCursor::new(r.start), CCursor::new(r.end)))
@@ -1670,9 +1609,8 @@ impl eframe::App for ReportApp {
                                             }
                                         }
                                         let sel = report.chars().skip(s).take(draw_end.saturating_sub(s)).collect::<String>();
-                                        let mut offset = 0usize;
                                         let mut abs_index = s;
-                                        for (i, line) in sel.split('\n').enumerate() {
+                                        for line in sel.split('\n') {
                                             let line_len = line.chars().count();
                                             let line_start = abs_index;
                                             let line_end = abs_index + line_len;
@@ -1681,7 +1619,7 @@ impl eframe::App for ReportApp {
                                             let start_cursor = CCursor::new(line_start);
                                             let end_cursor = CCursor::new(line_end);
                                             let start_pos = output.galley.pos_from_cursor(start_cursor);
-                                            let mut end_pos = output.galley.pos_from_cursor(end_cursor);
+                                            let end_pos = output.galley.pos_from_cursor(end_cursor);
                                             // Also compute the previous glyph rect and use the maximum
                                             // right edge to ensure the last character is included
                                             let prev_pos_opt = if line_len > 0 {
@@ -1712,23 +1650,20 @@ impl eframe::App for ReportApp {
 
                                             // advance absolute index past this line and the newline (if present)
                                             abs_index = line_end + 1; // skip the newline; safe even if at end because we'll not use abs_index further
-                                            offset += line_len + 1;
                                             if abs_index > draw_end { break; }
                                         }
                                     }
                                 }
                             }
                             // No visible drag handles (selection is shown in-text).
-                            // Draw a visible caret. When Vim emulation is enabled draw a thick block;
-                            // otherwise draw a thin caret marker so it doesn't persist as a wide indicator.
+                            // Draw a visible caret. Use a Vim-style block in non-Insert modes.
                             let caret_height = 18.0_f32;
                             // Use the galley cursor rect width as a best-effort char width; fallback to 8.0
                             let mut char_w = (galley_pos.max.x - galley_pos.min.x).abs();
                             if char_w <= 0.1 {
                                 char_w = 8.0;
                             }
-                            // If vim is disabled use a narrow caret (1.0-2.0 px) instead of block width
-                            let caret_w = if self.vim_enabled { char_w } else { 1.5_f32 };
+                            let caret_w = if self.vim_mode == VimMode::Insert { 1.5_f32 } else { char_w };
                             // Nudge the caret slightly right for visual alignment
                             let nudge = 2.0_f32;
                             let x = (screen_pos.x + self.caret_x_offset + nudge).clamp(output.response.rect.min.x, output.response.rect.max.x - 1.0);
