@@ -1,6 +1,7 @@
 use anyhow::Result;
 use crossbeam_channel::{unbounded, Receiver};
 use eframe::egui;
+use egui::TextBuffer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -979,6 +980,95 @@ impl eframe::App for ReportApp {
                     // intercept Alt+Number events.
                     let alt_pressed = ctx.input(|i| i.modifiers.alt);
                     let is_interactive = (!self.vim_enabled || self.vim_mode == VimMode::Insert) && !alt_pressed;
+                    // choose a FontId to use for overlay text drawing
+                    let font_id = if self.vim_enabled {
+                        ui.style().text_styles.get(&egui::TextStyle::Monospace).map(|f| egui::FontId::monospace(f.size)).unwrap_or(egui::FontId::monospace(14.0))
+                    } else {
+                        ui.style().text_styles.get(&egui::TextStyle::Body).map(|f| egui::FontId::proportional(f.size)).unwrap_or(egui::FontId::proportional(14.0))
+                    };
+
+                    
+
+                    // Precompute misspelled ranges and local flags so the layouter
+                    // closure does not capture `self` (avoids borrow conflicts).
+                    let vim_enabled = self.vim_enabled;
+                    let re_split = regex::Regex::new(r"[A-Za-z']{2,}").unwrap();
+                    let mut miss_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+                    for m in re_split.find_iter(&self.buffer.report) {
+                        let word = m.as_str();
+                        if !self.check_word_correct(word) {
+                            miss_ranges.push(m.start()..m.end());
+                        }
+                    }
+
+                    let mut layouter_closure = move |ui: &egui::Ui, text: &dyn TextBuffer, wrap_width: f32| {
+                        let mut job = egui::text::LayoutJob::default();
+                        job.wrap.max_width = wrap_width;
+                        let string = text.as_str();
+
+                        let font_id = if vim_enabled {
+                            ui.style().text_styles.get(&egui::TextStyle::Monospace).map(|f| egui::FontId::monospace(f.size)).unwrap_or(egui::FontId::monospace(14.0))
+                        } else {
+                            ui.style().text_styles.get(&egui::TextStyle::Body).map(|f| egui::FontId::proportional(f.size)).unwrap_or(egui::FontId::proportional(14.0))
+                        };
+
+                        let mut last_byte = 0usize;
+                        for m in re_split.find_iter(string) {
+                            let start = m.start();
+                            let end = m.end();
+                            if start > last_byte {
+                                job.append(
+                                    &string[last_byte..start],
+                                    0.0,
+                                    egui::text::TextFormat {
+                                        font_id: font_id.clone(),
+                                        color: ui.visuals().text_color(),
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                            let miss_color = egui::Color32::from_rgb(40, 120, 220);
+                            // Check if this match overlaps any precomputed miss_range
+                            let is_miss = miss_ranges.iter().any(|r| r.start == start && r.end == end);
+                            if is_miss {
+                                job.append(
+                                    &string[start..end],
+                                    0.0,
+                                    egui::text::TextFormat {
+                                        font_id: font_id.clone(),
+                                        color: miss_color,
+                                        ..Default::default()
+                                    },
+                                );
+                            } else {
+                                job.append(
+                                    &string[start..end],
+                                    0.0,
+                                    egui::text::TextFormat {
+                                        font_id: font_id.clone(),
+                                        color: ui.visuals().text_color(),
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                            last_byte = end;
+                        }
+                        if last_byte < string.len() {
+                            job.append(
+                                &string[last_byte..],
+                                0.0,
+                                egui::text::TextFormat {
+                                    font_id: font_id.clone(),
+                                    color: ui.visuals().text_color(),
+                                    ..Default::default()
+                                },
+                            );
+                        }
+
+                        ui.ctx().fonts_mut(|f| f.layout_job(job))
+                    };
+
+                    // Attach the layouter to the TextEdit builder
                     let mut text_edit = egui::TextEdit::multiline(&mut self.buffer.report)
                         .desired_rows(20)
                         .desired_width(left_w)
@@ -986,7 +1076,8 @@ impl eframe::App for ReportApp {
                         .lock_focus(self.vim_enabled && self.vim_mode == VimMode::Insert)
                         // make the widget non-interactive when Vim is active but not in Insert,
                         // so clicks don't hand keyboard focus to the TextEdit unexpectedly.
-                        .interactive(is_interactive);
+                        .interactive(is_interactive)
+                        .layouter(&mut layouter_closure);
 
                     // Use monospace font when Vim emulation is active for consistent fixed-width behavior
                     if self.vim_enabled {
@@ -1018,32 +1109,8 @@ impl eframe::App for ReportApp {
                     }
 
                     // Spellchecking: find words not in dictionary and draw squiggly underlines
-                    // Spellchecking: build a LayoutJob to obtain a galley that matches wrapping
                     if self.spell_enabled {
                         let text = &self.buffer.report;
-                        let mut job = egui::text::LayoutJob::default();
-                        // set wrapping width to match the text edit rect
-                        job.wrap.max_width = output.response.rect.width();
-
-                        // pick a font consistent with the UI style (monospace for vim)
-                        let font_id = if self.vim_enabled {
-                            ui.style().text_styles.get(&egui::TextStyle::Monospace).map(|f| egui::FontId::monospace(f.size)).unwrap_or(egui::FontId::monospace(14.0))
-                        } else {
-                            ui.style().text_styles.get(&egui::TextStyle::Body).map(|f| egui::FontId::proportional(f.size)).unwrap_or(egui::FontId::proportional(14.0))
-                        };
-
-                        job.append(
-                            &text,
-                            0.0,
-                            egui::text::TextFormat {
-                                font_id: font_id.clone(),
-                                color: ui.visuals().text_color(),
-                                ..Default::default()
-                            },
-                        );
-
-                        // create a galley from the job using the UI's fonts
-                        let galley = ctx.fonts_mut(|f| f.layout_job(job));
 
                         let re = regex::Regex::new(r"[A-Za-z']{2,}").unwrap();
                         let painter = ui.painter();
@@ -1058,13 +1125,13 @@ impl eframe::App for ReportApp {
                             let word_len_chars = text[start_byte..end_byte].chars().count();
                             let end_char = start_char + word_len_chars;
 
-                            // compute screen coords using our galley
+                            // compute screen coords using the widget's galley for exact alignment
                             let start_cursor = CCursor::new(start_char);
-                            let end_cursor = CCursor::new(end_char.saturating_sub(1));
-                            let start_rect = galley.pos_from_cursor(start_cursor);
-                            let end_rect = galley.pos_from_cursor(end_cursor);
+                            let end_cursor = CCursor::new(end_char);
+                            let start_rect = output.galley.pos_from_cursor(start_cursor);
+                            let end_rect = output.galley.pos_from_cursor(end_cursor);
                             let start_x = output.response.rect.min.x + start_rect.min.x;
-                            let end_x = output.response.rect.min.x + end_rect.max.x;
+                            let end_x = output.response.rect.min.x + end_rect.min.x;
                             let baseline_y = output.response.rect.min.y + start_rect.max.y + 2.0;
 
                             // draw a simple zig-zag squiggly underline
@@ -1080,7 +1147,15 @@ impl eframe::App for ReportApp {
                                     up = !up;
                                 }
                                 pts.push(egui::pos2(end_x, baseline_y));
-                                painter.line(pts, egui::Stroke::new(1.5, egui::Color32::from_rgb(220, 40, 40)));
+                                painter.line(pts, egui::Stroke::new(1.5, egui::Color32::from_rgb(40, 120, 220)));
+                                // Draw the misspelled word in the same blue on top of the widget text
+                                painter.text(
+                                    egui::pos2(start_x, output.response.rect.min.y + start_rect.min.y),
+                                    egui::Align2::LEFT_TOP,
+                                    word,
+                                    font_id.clone(),
+                                    egui::Color32::from_rgb(40, 120, 220),
+                                );
                             }
                         }
                     }
@@ -1115,11 +1190,11 @@ impl eframe::App for ReportApp {
                                     let end_char = start_char + word_len_chars;
 
                                     let start_cursor = CCursor::new(start_char);
-                                    let end_cursor = CCursor::new(end_char.saturating_sub(1));
+                                    let end_cursor = CCursor::new(end_char);
                                     let start_rect = output.galley.pos_from_cursor(start_cursor);
                                     let end_rect = output.galley.pos_from_cursor(end_cursor);
                                     let start_x = output.response.rect.min.x + start_rect.min.x;
-                                    let end_x = output.response.rect.min.x + end_rect.max.x;
+                                    let end_x = output.response.rect.min.x + end_rect.min.x;
                                     let baseline_y = output.response.rect.min.y + start_rect.max.y + 2.0;
 
                                     // crude hit test: pointer inside horizontal bounds and near baseline
@@ -1268,11 +1343,11 @@ impl eframe::App for ReportApp {
                                         let end_char = start_char + word_len_chars;
 
                                         let start_cursor = CCursor::new(start_char);
-                                        let end_cursor = CCursor::new(end_char.saturating_sub(1));
+                                        let end_cursor = CCursor::new(end_char);
                                         let start_rect = output.galley.pos_from_cursor(start_cursor);
                                         let end_rect = output.galley.pos_from_cursor(end_cursor);
                                         let start_x = output.response.rect.min.x + start_rect.min.x;
-                                        let end_x = output.response.rect.min.x + end_rect.max.x;
+                                        let end_x = output.response.rect.min.x + end_rect.min.x;
                                         let baseline_y = output.response.rect.min.y + start_rect.max.y + 2.0;
 
                                         if pointer_pos.x >= start_x && pointer_pos.x <= end_x
