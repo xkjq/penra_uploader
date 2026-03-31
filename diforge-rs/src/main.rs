@@ -1273,7 +1273,7 @@ impl eframe::App for ReportApp {
                                     self.buffer.caret_char_range = Some(sorted.clone());
                                     self.last_vim_key = None;
 
-                                    if *pressed {
+                                    if *pressed && self.vim_enabled {
                                         // start drag using the reported cursor position
                                         self.mouse_dragging = true;
                                         self.mouse_drag_anchor = Some(sorted.start);
@@ -1356,6 +1356,9 @@ impl eframe::App for ReportApp {
                     for ev in events.iter() {
                         if let Event::PointerMoved(pos) = ev {
                             if !self.mouse_dragging { continue; }
+                            // In non-Vim interactive mode, let TextEdit own drag selection.
+                            // Custom drag mapping is only needed for non-interactive/Vim flows.
+                            if is_interactive && !self.vim_enabled { continue; }
                             // compute nearest char index to mouse pos
                             let pos = *pos;
                             let mut best = 0usize;
