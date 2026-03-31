@@ -604,7 +604,30 @@ impl eframe::App for AppState {
             });
             ui.separator();
             egui::ScrollArea::vertical().show(ui, |ui| {
-                egui::CollapsingHeader::new("Login").default_open(self.login_open).show(ui, |ui| {
+                let dot_color = if self.logged_in_user.is_some() {
+                    egui::Color32::from_rgb(46, 160, 67)
+                } else {
+                    egui::Color32::from_rgb(220, 38, 38)
+                };
+                let mut login_header = egui::text::LayoutJob::default();
+                login_header.append(
+                    "Login ",
+                    0.0,
+                    egui::TextFormat {
+                        color: ui.visuals().strong_text_color(),
+                        ..Default::default()
+                    },
+                );
+                // Use ASCII 'o' as a status dot to avoid missing-glyph boxes.
+                login_header.append(
+                    "o",
+                    0.0,
+                    egui::TextFormat {
+                        color: dot_color,
+                        ..Default::default()
+                    },
+                );
+                egui::CollapsingHeader::new(login_header).default_open(self.login_open).show(ui, |ui| {
                     let logged_in = self.logged_in_user.clone();
                     if let Some(name) = logged_in {
                         ui.horizontal(|ui| {
