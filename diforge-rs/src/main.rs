@@ -1558,10 +1558,10 @@ impl eframe::App for ReportApp {
                         }
                     }
 
-                    // Fall back to manual selection/caret overlays when Vim mode keeps TextEdit non-interactive
-                    // or unfocused. In standard interactive editing, rely on built-in TextEdit painting.
-                    let needs_custom_overlay = self.vim_enabled && !is_interactive;
-                    if needs_custom_overlay {
+                    // Keep rendering in built-in TextEdit as much as possible.
+                    // Only custom-paint the Vim block caret style, which TextEdit doesn't expose.
+                    let needs_custom_caret = self.vim_enabled && self.vim_mode != VimMode::Insert;
+                    if needs_custom_caret {
                         // Try to use the widget-reported cursor_range, otherwise fall back to our stored `caret_char_range`.
                         let maybe_ccr = output.cursor_range.or_else(|| {
                             self.buffer.caret_char_range.as_ref().map(|r| CCursorRange::two(CCursor::new(r.start), CCursor::new(r.end)))
@@ -1578,84 +1578,88 @@ impl eframe::App for ReportApp {
                             // Prepare painter for selection/caret drawing
                             let painter = ui.painter();
 
-                            // If Visual mode is active and we have an anchor, draw a selection background
-                            if self.vim_mode == VimMode::Visual || self.vim_mode == VimMode::VisualLine {
-                                if let Some(anchor) = self.visual_anchor {
-                                    let cur = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
-                                    let (s, e_display) = if self.vim_mode == VimMode::VisualLine {
-                                        let (a_s, a_e) = self.buffer.line_bounds_at(anchor);
-                                        let (c_s, c_e) = self.buffer.line_bounds_at(cur);
-                                        let s = a_s.min(c_s);
-                                        let e = a_e.max(c_e).min(self.buffer.char_len());
-                                        (s, e)
-                                    } else {
-                                        let s = anchor.min(cur);
-                                        let e = anchor.max(cur);
-                                        let e_display = if e > s { e.saturating_add(1) } else { e };
-                                        (s, e_display)
-                                    };
-                                    if s < e_display {
-                                        // Determine exact per-line glyph bounds by splitting the selected
-                                        // substring on newline boundaries and mapping each segment back
-                                        // to absolute char indices to query `pos_from_cursor`.
-                                        let report = &self.buffer.report;
-                                        // Avoid drawing a trailing empty segment when the selection
-                                        // ends exactly at a newline in VisualLine mode; that
-                                        // would produce a caret-width highlight on the next line.
-                                        let mut draw_end = e_display;
-                                        if self.vim_mode == VimMode::VisualLine && e_display > s {
-                                            if report.chars().nth(e_display.saturating_sub(1)) == Some('\n') {
-                                                draw_end = e_display.saturating_sub(1);
+                            // In Vim visual modes, TextEdit may not paint selection when non-interactive.
+                            // Paint selection using galley cursor geometry so it lines up with glyphs.
+                            if (self.vim_mode == VimMode::Visual || self.vim_mode == VimMode::VisualLine)
+                                && self.visual_anchor.is_some()
+                            {
+                                let anchor = self.visual_anchor.unwrap_or(0);
+                                let cur = self
+                                    .buffer
+                                    .caret_char_range
+                                    .as_ref()
+                                    .map(|r| r.start)
+                                    .unwrap_or(0);
+
+                                let (sel_start, mut sel_end) = if self.vim_mode == VimMode::VisualLine {
+                                    let (a_s, a_e) = self.buffer.line_bounds_at(anchor);
+                                    let (c_s, c_e) = self.buffer.line_bounds_at(cur);
+                                    (a_s.min(c_s), a_e.max(c_e).min(self.buffer.char_len()))
+                                } else {
+                                    let s = anchor.min(cur);
+                                    let e = anchor.max(cur);
+                                    (s, if e > s { e.saturating_add(1) } else { e })
+                                };
+
+                                sel_end = sel_end.min(self.buffer.char_len());
+                                if sel_start < sel_end {
+                                    let mut line_cursor = sel_start;
+                                    while line_cursor < sel_end {
+                                        let (_, line_end) = self.buffer.line_bounds_at(line_cursor);
+                                        let seg_start = line_cursor;
+                                        let seg_end = line_end.min(sel_end);
+                                        if seg_end <= seg_start {
+                                            break;
+                                        }
+
+                                        let start_pos = output.galley.pos_from_cursor(CCursor::new(seg_start));
+                                        let end_pos = output.galley.pos_from_cursor(CCursor::new(seg_end));
+                                        let mut x0 = output.response.rect.min.x + start_pos.min.x;
+                                        let mut x1 = output.response.rect.min.x + end_pos.min.x;
+
+                                        if seg_end > seg_start {
+                                            let prev_pos =
+                                                output.galley.pos_from_cursor(CCursor::new(seg_end.saturating_sub(1)));
+                                            let prev_x = output.response.rect.min.x + prev_pos.max.x;
+                                            if prev_x > x1 {
+                                                x1 = prev_x;
                                             }
                                         }
-                                        let sel = report.chars().skip(s).take(draw_end.saturating_sub(s)).collect::<String>();
-                                        let mut abs_index = s;
-                                        for line in sel.split('\n') {
-                                            let line_len = line.chars().count();
-                                            let line_start = abs_index;
-                                            let line_end = abs_index + line_len;
 
-                                            // compute screen coords for line_start and line_end (end is exclusive)
-                                            let start_cursor = CCursor::new(line_start);
-                                            let end_cursor = CCursor::new(line_end);
-                                            let start_pos = output.galley.pos_from_cursor(start_cursor);
-                                            let end_pos = output.galley.pos_from_cursor(end_cursor);
-                                            // Also compute the previous glyph rect and use the maximum
-                                            // right edge to ensure the last character is included
-                                            let prev_pos_opt = if line_len > 0 {
-                                                let prev_idx = line_end.saturating_sub(1);
-                                                Some(output.galley.pos_from_cursor(CCursor::new(prev_idx)))
-                                            } else { None };
-
-                                            let start_screen = output.response.rect.min + start_pos.min.to_vec2();
-                                            let mut end_screen_x = output.response.rect.min.x + end_pos.max.x;
-                                            if let Some(prev_pos) = prev_pos_opt {
-                                                let prev_x = output.response.rect.min.x + prev_pos.max.x;
-                                                if prev_x > end_screen_x {
-                                                    end_screen_x = prev_x;
-                                                }
-                                            }
-                                            let end_screen = egui::pos2(end_screen_x, output.response.rect.min.y);
-
-                                            // derive a per-line height from the glyph extents
-                                            let line_h = (start_pos.max.y - start_pos.min.y).abs().max(14.0_f32).min(48.0_f32);
-
-                                            // For empty lines (line_len == 0), draw a caret-width selection
-                                            let x0 = if line_len == 0 { start_screen.x } else { start_screen.x };
-                                            let x1 = if line_len == 0 { start_screen.x + 8.0 } else { end_screen.x };
-                                            let y0 = start_screen.y.clamp(output.response.rect.min.y, output.response.rect.max.y);
-                                            let y1 = (y0 + line_h).min(output.response.rect.max.y);
-                                            let sel_rect = egui::Rect::from_min_max(egui::pos2(x0.clamp(output.response.rect.min.x, output.response.rect.max.x), y0), egui::pos2(x1.clamp(output.response.rect.min.x, output.response.rect.max.x), y1));
-                                            painter.rect_filled(sel_rect, 0.0, egui::Color32::from_rgba_unmultiplied(120, 160, 255, 140));
-
-                                            // advance absolute index past this line and the newline (if present)
-                                            abs_index = line_end + 1; // skip the newline; safe even if at end because we'll not use abs_index further
-                                            if abs_index > draw_end { break; }
+                                        if x1 <= x0 {
+                                            x1 = x0 + 8.0;
                                         }
+
+                                        let line_h = (start_pos.max.y - start_pos.min.y)
+                                            .abs()
+                                            .max(14.0)
+                                            .min(48.0);
+                                        let y0 = (output.response.rect.min.y + start_pos.min.y)
+                                            .clamp(output.response.rect.min.y, output.response.rect.max.y);
+                                        let y1 = (y0 + line_h).min(output.response.rect.max.y);
+                                        x0 = x0.clamp(output.response.rect.min.x, output.response.rect.max.x);
+                                        x1 = x1.clamp(output.response.rect.min.x, output.response.rect.max.x);
+
+                                        if x1 > x0 && y1 > y0 {
+                                            let sel_rect = egui::Rect::from_min_max(
+                                                egui::pos2(x0, y0),
+                                                egui::pos2(x1, y1),
+                                            );
+                                            painter.rect_filled(
+                                                sel_rect,
+                                                0.0,
+                                                egui::Color32::from_rgba_unmultiplied(120, 160, 255, 140),
+                                            );
+                                        }
+
+                                        if line_end <= line_cursor {
+                                            break;
+                                        }
+                                        line_cursor = line_end;
                                     }
                                 }
                             }
-                            // No visible drag handles (selection is shown in-text).
+
                             // Draw a visible caret. Use a Vim-style block in non-Insert modes.
                             let caret_height = 18.0_f32;
                             // Use the galley cursor rect width as a best-effort char width; fallback to 8.0
