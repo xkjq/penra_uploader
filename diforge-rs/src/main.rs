@@ -1436,8 +1436,14 @@ impl eframe::App for ReportApp {
                         }
                     }
 
-                    // If we already have a desired caret position (e.g. from an insert earlier this frame), push it into widget state
-                    if self.vim_mode == VimMode::Visual || self.vim_mode == VimMode::VisualLine {
+                    // If we already have a desired caret position (e.g. from an insert earlier this frame),
+                    // push it into widget state for Vim/non-interactive flows only.
+                    // In non-Vim interactive mode, let TextEdit own cursor/selection state entirely
+                    // so drag direction (including reverse selection) works natively.
+                    let should_force_widget_cursor = self.vim_enabled || !is_interactive;
+                    if should_force_widget_cursor
+                        && (self.vim_mode == VimMode::Visual || self.vim_mode == VimMode::VisualLine)
+                    {
                         // When in Visual mode, prefer showing a selection between the visual anchor
                         // and the current caret. This drives the TextEdit's selection rendering.
                         if let Some(anchor) = self.visual_anchor {
@@ -1477,7 +1483,7 @@ impl eframe::App for ReportApp {
                             output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
                             output.state.store(ui.ctx(), output.response.id);
                         }
-                    } else {
+                    } else if should_force_widget_cursor {
                         if let Some(range) = &self.buffer.caret_char_range {
                             let start = CCursor::new(range.start);
                             let end = CCursor::new(range.end);
