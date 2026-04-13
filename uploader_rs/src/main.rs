@@ -411,13 +411,13 @@ impl AppState {
         let seed_clone = self.seed.clone();
 
         thread::spawn(move || {
-                        // ensure export and anon directories exist (create if missing)
-                        if let Err(e) = fs::create_dir_all(&export) {
-                            let _ = tx.send(format!("Failed to create export dir {}: {}", export.display(), e));
-                        }
-                        if let Err(e) = fs::create_dir_all(&anon_dir) {
-                            let _ = tx.send(format!("Failed to create anon dir {}: {}", anon_dir.display(), e));
-                        }
+            // ensure export and anon directories exist (create if missing)
+            if let Err(e) = fs::create_dir_all(&export) {
+                let _ = tx.send(format!("Failed to create export dir {}: {}", export.display(), e));
+            }
+            if let Err(e) = fs::create_dir_all(&anon_dir) {
+                let _ = tx.send(format!("Failed to create anon dir {}: {}", anon_dir.display(), e));
+            }
 
                         // Move the current export contents into a timestamped processing directory
                         // to avoid the exporter clearing the files before we can act on them.
