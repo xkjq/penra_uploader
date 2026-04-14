@@ -869,43 +869,18 @@ pub fn request_scan(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>
                 let _ = s.send("PROC:STEP:Scanning files".to_string());
                 let _ = s.send(format!("PROC:PROG:{}", 0.0));
             }
-
-            // First, perform a quick scan that enumerates files and groups them
-            // without doing expensive DICOM parsing or server prechecks. This
-            // gives the UI a fast, usable result so it doesn't hang waiting
-            // for the full scan to finish.
-            match scan_for_upload_quick(&anon_dir, tx.clone()) {
-                Ok(quick_series) => {
-                    store_last_scan(quick_series.clone());
-                    if let Ok(json) = serde_json::to_string(&quick_series) {
-                        let _ = std::fs::write(".last_scan.json", json);
-                    }
-                    if let Some(ref s) = tx {
-                        let _ = s.send("scan_written".to_string());
-                    }
-                }
-                Err(e) => {
-                    if let Some(ref s) = tx {
-                        let _ = s.send(format!("Quick scan failed: {}", e));
-                    }
-                }
-            }
-
-            // Now perform the full scan (including DICOM parsing, hashing and
-            // server duplicate precheck). When this completes, update the
-            // cached scan and notify the UI again.
             match scan_for_upload(&anon_dir, tx.clone()) {
-                Ok(full_series) => {
+                Ok(series) => {
                     // store parsed series in-memory for quick UI pickup
-                    store_last_scan(full_series.clone());
-                    if let Ok(json) = serde_json::to_string(&full_series) {
+                    store_last_scan(series.clone());
+                    if let Ok(json) = serde_json::to_string(&series) {
                         let _ = std::fs::write(".last_scan.json", json);
+                        if let Some(ref s) = tx {
+                            let _ = s.send("scan_written".to_string());
+                            let _ = s.send("done".to_string());
+                        }
                     } else if let Some(ref s) = tx {
                         let _ = s.send("scan_serialize_failed".to_string());
-                    }
-                    if let Some(ref s) = tx {
-                        let _ = s.send("scan_written".to_string());
-                        let _ = s.send("done".to_string());
                     }
                 }
                 Err(e) => {
@@ -915,7 +890,6 @@ pub fn request_scan(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>
                     }
                 }
             }
-
             SCAN_RUNNING.store(false, Ordering::SeqCst);
         });
         Ok(())
