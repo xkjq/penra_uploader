@@ -148,6 +148,19 @@ impl Default for VimMode {
     }
 }
 
+#[derive(PartialEq, Eq, Serialize, Deserialize, Clone, Copy, Debug)]
+enum StudySourceMode {
+    Manual,
+    Integration,
+    Merged,
+}
+
+impl Default for StudySourceMode {
+    fn default() -> Self {
+        StudySourceMode::Merged
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Default)]
 struct Settings {
     vim_enabled: bool,
@@ -166,6 +179,10 @@ struct Settings {
     spell_enabled: bool,
     // optional path to a custom wordlist used as fallback dictionary
     spell_dict_path: Option<String>,
+    // study context used to adapt template visibility/behavior
+    study_mode: StudySourceMode,
+    manual_studies: Vec<String>,
+    study_filter_templates: bool,
 }
 
 fn settings_path() -> PathBuf {
@@ -218,6 +235,11 @@ struct ReportApp {
     show_templates_window: bool,
     template_search: String,
     template_nicip: String,
+    study_mode: StudySourceMode,
+    manual_studies: Vec<String>,
+    integrated_studies: Vec<String>,
+    new_study_input: String,
+    study_filter_templates: bool,
     selected_template: Option<usize>,
     // template editor state
     show_template_editor: bool,
@@ -308,6 +330,11 @@ impl Default for ReportApp {
             show_templates_window: true,
             template_search: String::new(),
             template_nicip: String::new(),
+            study_mode: StudySourceMode::Merged,
+            manual_studies: Vec::new(),
+            integrated_studies: Vec::new(),
+            new_study_input: String::new(),
+            study_filter_templates: true,
             selected_template: None,
             show_template_editor: false,
             editing_template: None,
@@ -499,6 +526,154 @@ impl Default for ReportApp {
 }
 
 impl ReportApp {
+    fn normalize_study_label(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ").trim().to_string()
+    }
+
+    fn active_studies(&self) -> Vec<String> {
+        match self.study_mode {
+            StudySourceMode::Manual => self.manual_studies.clone(),
+            StudySourceMode::Integration => self.integrated_studies.clone(),
+            StudySourceMode::Merged => {
+                let mut out = self.manual_studies.clone();
+                for s in &self.integrated_studies {
+                    if !out.iter().any(|x| x.eq_ignore_ascii_case(s)) {
+                        out.push(s.clone());
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    fn template_matches_study_context(&self, t: &templates::Template) -> bool {
+        if !self.study_filter_templates {
+            return true;
+        }
+        let studies = self.active_studies();
+        if studies.is_empty() {
+            return true;
+        }
+
+        let title = t.display_title().to_lowercase();
+        let id = t.id.clone().unwrap_or_default().to_lowercase();
+        let codes: Vec<String> = t.applicable_codes.iter().map(|s| s.to_lowercase()).collect();
+        let modalities: Vec<String> = t.modalities.iter().map(|s| s.to_lowercase()).collect();
+
+        studies.iter().any(|study| {
+            let q = study.to_lowercase();
+            if q.is_empty() {
+                return false;
+            }
+            title.contains(&q)
+                || id.contains(&q)
+                || codes.iter().any(|c| c.contains(&q) || q.contains(c))
+                || modalities.iter().any(|m| m.contains(&q) || q.contains(m))
+        })
+    }
+
+    fn template_matches_filters(&self, t: &templates::Template) -> bool {
+        let nicips: Vec<String> = self
+            .template_nicip
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if !nicips.is_empty() && !t.applicable_codes.is_empty() {
+            let matched = nicips.iter().any(|sc| {
+                t.applicable_codes
+                    .iter()
+                    .any(|ac| ac.eq_ignore_ascii_case(sc))
+            });
+            if !matched {
+                return false;
+            }
+        }
+
+        let title = t.display_title();
+        if !self.template_search.is_empty()
+            && !title
+                .to_lowercase()
+                .contains(&self.template_search.to_lowercase())
+            && !t
+                .body
+                .to_lowercase()
+                .contains(&self.template_search.to_lowercase())
+        {
+            return false;
+        }
+
+        self.template_matches_study_context(t)
+    }
+
+    fn visible_template_indices(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        for (i, t) in self.templates.iter().enumerate() {
+            if self.template_matches_filters(t) {
+                out.push(i);
+            }
+        }
+        out
+    }
+
+    fn handle_ipc_message(&mut self, msg: &str) -> bool {
+        let trimmed = msg.trim();
+        if !trimmed.starts_with('{') {
+            return false;
+        }
+
+        let parsed: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+
+        let cmd = parsed
+            .get("cmd")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        match cmd {
+            "set_studies" => {
+                let mut new_list: Vec<String> = Vec::new();
+                if let Some(arr) = parsed.get("studies").and_then(|v| v.as_array()) {
+                    for s in arr.iter().filter_map(|x| x.as_str()) {
+                        let n = Self::normalize_study_label(s);
+                        if !n.is_empty() && !new_list.iter().any(|x| x.eq_ignore_ascii_case(&n)) {
+                            new_list.push(n);
+                        }
+                    }
+                }
+                self.integrated_studies = new_list;
+
+                if let Some(mode_s) = parsed.get("study_mode").and_then(|v| v.as_str()) {
+                    self.study_mode = match mode_s.to_ascii_lowercase().as_str() {
+                        "manual" => StudySourceMode::Manual,
+                        "integration" => StudySourceMode::Integration,
+                        _ => StudySourceMode::Merged,
+                    };
+                }
+                true
+            }
+            "add_studies" => {
+                if let Some(arr) = parsed.get("studies").and_then(|v| v.as_array()) {
+                    for s in arr.iter().filter_map(|x| x.as_str()) {
+                        let n = Self::normalize_study_label(s);
+                        if !n.is_empty() && !self.integrated_studies.iter().any(|x| x.eq_ignore_ascii_case(&n)) {
+                            self.integrated_studies.push(n);
+                        }
+                    }
+                }
+                true
+            }
+            "clear_studies" => {
+                self.integrated_studies.clear();
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn collect_template_var_names(&self) -> Vec<String> {
         use std::collections::HashSet;
         let mut seen: HashSet<String> = HashSet::new();
@@ -578,6 +753,9 @@ impl ReportApp {
             global_vars: self.global_vars.clone(),
             spell_enabled: self.spell_enabled,
             spell_dict_path: self.spell_dict_path.clone(),
+            study_mode: self.study_mode,
+            manual_studies: self.manual_studies.clone(),
+            study_filter_templates: self.study_filter_templates,
         }
     }
 
@@ -686,6 +864,9 @@ impl ReportApp {
         // apply persisted spell settings
         self.spell_enabled = s.spell_enabled;
         self.spell_dict_path = s.spell_dict_path.clone();
+        self.study_mode = s.study_mode;
+        self.manual_studies = s.manual_studies;
+        self.study_filter_templates = s.study_filter_templates;
         // if a custom wordlist path is provided, try to load it as the spell_dict
         if let Some(p) = &self.spell_dict_path {
             if let Ok(txt) = std::fs::read_to_string(p) {
@@ -740,45 +921,7 @@ impl ReportApp {
     // behaviour.
     pub fn alt_number_quick_insert(&mut self, key: egui::Key) {
         // Build visible template index list using current filters
-        let nicips: Vec<String> = self
-            .template_nicip
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        let mut visible_indices: Vec<usize> = Vec::new();
-        for (i, t) in self.templates.iter().enumerate() {
-            if !nicips.is_empty() {
-                if !t.applicable_codes.is_empty() {
-                    let mut matched = false;
-                    for sc in &nicips {
-                        if t.applicable_codes
-                            .iter()
-                            .any(|ac| ac.eq_ignore_ascii_case(sc))
-                        {
-                            matched = true;
-                            break;
-                        }
-                    }
-                    if !matched {
-                        continue;
-                    }
-                }
-            }
-            let title = t.display_title();
-            if !self.template_search.is_empty()
-                && !title
-                    .to_lowercase()
-                    .contains(&self.template_search.to_lowercase())
-                && !t
-                    .body
-                    .to_lowercase()
-                    .contains(&self.template_search.to_lowercase())
-            {
-                continue;
-            }
-            visible_indices.push(i);
-        }
+        let visible_indices = self.visible_template_indices();
 
         let target_opt = match key {
             egui::Key::Num1 => Some(0usize),
@@ -806,8 +949,11 @@ impl ReportApp {
 impl eframe::App for ReportApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // drain any IPC messages (e.g., from Dragon helper) and insert into report buffer
-        if let Some(rx) = &self.rx {
+        if let Some(rx) = self.rx.clone() {
             while let Ok(msg) = rx.try_recv() {
+                if self.handle_ipc_message(&msg) {
+                    continue;
+                }
                 if !self.buffer.report.is_empty() && !self.buffer.report.ends_with('\n') {
                     self.buffer.report.push('\n');
                 }
@@ -1925,43 +2071,97 @@ impl eframe::App for ReportApp {
                             }
                         });
 
-                        // Template creation/edit/delete buttons removed — view-only in main UI.
+                        ui.separator();
+                        ui.label("Study context");
+                        let mut study_settings_changed = false;
+                        ui.horizontal(|ui| {
+                            ui.label("Source:");
+                            egui::ComboBox::from_id_salt("study_source_mode")
+                                .selected_text(match self.study_mode {
+                                    StudySourceMode::Manual => "Manual",
+                                    StudySourceMode::Integration => "Integration",
+                                    StudySourceMode::Merged => "Merged",
+                                })
+                                .show_ui(ui, |ui| {
+                                    study_settings_changed |= ui
+                                        .selectable_value(
+                                            &mut self.study_mode,
+                                            StudySourceMode::Manual,
+                                            "Manual",
+                                        )
+                                        .changed();
+                                    study_settings_changed |= ui
+                                        .selectable_value(
+                                            &mut self.study_mode,
+                                            StudySourceMode::Integration,
+                                            "Integration",
+                                        )
+                                        .changed();
+                                    study_settings_changed |= ui
+                                        .selectable_value(
+                                            &mut self.study_mode,
+                                            StudySourceMode::Merged,
+                                            "Merged",
+                                        )
+                                        .changed();
+                                });
+                        });
 
-                        let nicips: Vec<String> = self
-                            .template_nicip
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect();
+                        study_settings_changed |= ui
+                            .checkbox(&mut self.study_filter_templates, "Filter templates by active studies")
+                            .changed();
+
+                        ui.horizontal(|ui| {
+                            ui.label("Add manual study:");
+                            ui.text_edit_singleline(&mut self.new_study_input);
+                            if ui.button("Add").clicked() {
+                                for token in self.new_study_input.split(',') {
+                                    let s = Self::normalize_study_label(token);
+                                    if !s.is_empty()
+                                        && !self
+                                            .manual_studies
+                                            .iter()
+                                            .any(|x| x.eq_ignore_ascii_case(&s))
+                                    {
+                                        self.manual_studies.push(s);
+                                        study_settings_changed = true;
+                                    }
+                                }
+                                self.new_study_input.clear();
+                            }
+                            if ui.small_button("Clear manual").clicked() {
+                                self.manual_studies.clear();
+                                study_settings_changed = true;
+                            }
+                        });
+
+                        if !self.manual_studies.is_empty() {
+                            ui.label(format!("Manual: {}", self.manual_studies.join(", ")));
+                        }
+                        if !self.integrated_studies.is_empty() {
+                            ui.label(format!(
+                                "Integration: {}",
+                                self.integrated_studies.join(", ")
+                            ));
+                        }
+                        let active_studies = self.active_studies();
+                        if !active_studies.is_empty() {
+                            ui.label(format!("Active studies: {}", active_studies.join(", ")));
+                            if ui.small_button("Use active studies as NICIP filter").clicked() {
+                                self.template_nicip = active_studies.join(", ");
+                            }
+                        }
+
+                        if study_settings_changed {
+                            let _ = save_settings(&self.to_settings());
+                        }
+
+                        // Template creation/edit/delete buttons removed — view-only in main UI.
 
                         // Build a list of visible template indices after applying filters so
                         // we can both render numeric shortcuts and react to Alt+<n> keys.
                         let templates_list = self.templates.clone();
-                        let mut visible_indices: Vec<usize> = Vec::new();
-                        for (i, t) in templates_list.iter().enumerate() {
-                            if !nicips.is_empty() {
-                                if !t.applicable_codes.is_empty() {
-                                    let mut matched = false;
-                                    for sc in &nicips {
-                                        if t.applicable_codes.iter().any(|ac| ac.eq_ignore_ascii_case(sc)) {
-                                            matched = true;
-                                            break;
-                                        }
-                                    }
-                                    if !matched {
-                                        continue;
-                                    }
-                                }
-                            }
-                            let title = t.display_title();
-                            if !self.template_search.is_empty()
-                                && !title.to_lowercase().contains(&self.template_search.to_lowercase())
-                                && !t.body.to_lowercase().contains(&self.template_search.to_lowercase())
-                            {
-                                continue;
-                            }
-                            visible_indices.push(i);
-                        }
+                        let visible_indices = self.visible_template_indices();
 
                         // Render visible templates with numeric prefixes (1-based) and an Insert button.
                         egui::ScrollArea::vertical().show(ui, |ui| {
