@@ -748,18 +748,6 @@ impl eframe::App for AppState {
                         self.trigger_process_export();
                     }
                     ui.add_space(8.0);
-                    if ui.button("Refresh ready-to-upload").clicked() {
-                        let _anon_dir = self.export_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from(".")).join("anon");
-                            let anon_dir = self.anon_dir();
-                        let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
-                        thread::spawn(move || {
-                            if let Err(e) = request_scan(&anon_dir, Some(tx.clone())) {
-                                let _ = tx.send(format!("Scan failed: {}", e));
-                            }
-                            let _ = tx.send("done".to_string());
-                        });
-                    }
-                    ui.add_space(8.0);
                     if ui.button("Import from folder").clicked() {
                         self.import_dialog_open = true;
                     }
@@ -942,6 +930,137 @@ impl eframe::App for AppState {
 
             ui.separator();
             ui.collapsing("Ready to Upload", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if !self.metadata_select_mode {
+                        if ui.add(egui::Button::new("Upload anonymized files").fill(egui::Color32::from_rgb(0,150,60))).clicked() {
+                            let anon_dir = self.anon_dir();
+                            let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
+                            let _ = tx.send("PROC:STEP:Uploading anonymized files".to_string());
+                            let _ = tx.send(format!("PROC:PROG:{}", 0.0));
+                            thread::spawn(move || {
+                                match upload_anon_dir(&anon_dir, None, Some(tx.clone())) {
+                                    Ok(res) => {
+                                        let _ = tx.send(format!("Uploaded: {}", res.uploaded.len()));
+                                        let _ = tx.send(format!("Duplicates: {}", res.duplicates.len()));
+                                        let _ = tx.send(format!("Failed: {}", res.failed.len()));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(format!("Upload failed: {}", e));
+                                    }
+                                }
+                                let _ = tx.send("done".to_string());
+                            });
+                        }
+                        ui.add_space(8.0);
+                        if ui.button("Refresh ready-to-upload").clicked() {
+                            let anon_dir = self.anon_dir();
+                            let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
+                            thread::spawn(move || {
+                                if let Err(e) = request_scan(&anon_dir, Some(tx.clone())) {
+                                    let _ = tx.send(format!("Scan failed: {}", e));
+                                }
+                                let _ = tx.send("done".to_string());
+                            });
+                        }
+                        ui.add_space(8.0);
+                        if ui.button("Compare selected metadata").clicked() {
+                            self.metadata_select_mode = true;
+                            self.selected_files_for_meta.clear();
+                            self.last_msg = "Select files for metadata compare".to_string();
+                        }
+                        ui.add_space(8.0);
+                        if ui.small_button("Clear duplicates").clicked() {
+                            let anon_dir = self.anon_dir();
+                            let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
+                            thread::spawn(move || {
+                                match upload::refresh_duplicates_for_ready(&anon_dir, Some(tx.clone())) {
+                                    Ok(series) => {
+                                        let mut deleted = 0usize;
+                                        let total_dup: usize = series.iter().map(|s| s.files.iter().filter(|f| f.is_duplicate).count()).sum();
+                                        if total_dup > 0 {
+                                            let _ = tx.send("PROC:STEP:Removing duplicates".to_string());
+                                            let _ = tx.send(format!("PROC:PROG:{}", 0.0));
+                                        }
+                                        let mut processed_dup = 0usize;
+                                        let dup_report_interval = std::cmp::max(1, total_dup / 50);
+                                        for s in &series {
+                                            for f in &s.files {
+                                                if f.is_duplicate {
+                                                    if std::fs::remove_file(&f.path).is_ok() {
+                                                        upload::remove_ready_file(&f.path);
+                                                        upload::log_rpc_debug(&format!("Deleted duplicate file: {}", f.path.display()));
+                                                        deleted += 1;
+                                                    } else {
+                                                        upload::log_rpc_warn(&format!("Failed to delete duplicate file: {}", f.path.display()));
+                                                    }
+                                                    processed_dup = processed_dup.saturating_add(1);
+                                                    if total_dup > 0 {
+                                                        if (processed_dup % dup_report_interval == 0) || (processed_dup == total_dup) {
+                                                            let prog = (processed_dup as f32 / total_dup as f32).clamp(0.0, 1.0);
+                                                            let _ = tx.send(format!("PROC:PROG:{}", prog));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let new_series = upload::snapshot_ready_series(&anon_dir);
+                                        if let Ok(json2) = serde_json::to_string(&new_series) {
+                                            upload::store_last_scan(new_series.clone());
+                                            let _ = std::fs::write(".last_scan.json", &json2);
+                                            let b64 = base64::encode(json2.as_bytes());
+                                            let _ = tx.send(format!("SCAN:SET:{}", b64));
+                                            let _ = tx.send("scan_written".to_string());
+                                        }
+                                        let _ = tx.send(format!("duplicates_cleared:{}", deleted));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(format!("Clear duplicates failed: {}", e));
+                                    }
+                                }
+                                let _ = tx.send("done".to_string());
+                            });
+                        }
+                        ui.add_space(6.0);
+                        if ui.small_button("Remove all").clicked() {
+                            self.confirm_remove_all = true;
+                            self.last_msg = "Confirm remove all files...".to_string();
+                        }
+                    } else {
+                        if ui.button("Launch metadata viewer").clicked() {
+                            let mut paths: Vec<String> = Vec::new();
+                            for series in &self.ready_series {
+                                for f in &series.files {
+                                    let pstr = f.path.to_string_lossy().to_string();
+                                    if self.selected_files_for_meta.contains(&pstr) {
+                                        paths.push(pstr);
+                                    }
+                                }
+                            }
+                            if paths.is_empty() {
+                                self.last_msg = "No files selected for metadata compare".to_string();
+                            } else {
+                                match std::env::current_exe() {
+                                    Ok(exe) => {
+                                        let mut cmd = Command::new(exe);
+                                        cmd.arg("--meta-view");
+                                        for p in paths { cmd.arg(p); }
+                                        match cmd.spawn() {
+                                            Ok(_) => { self.last_msg = "Launched metadata viewer".to_string(); self.metadata_select_mode = false; }
+                                            Err(e) => { self.last_msg = format!("Failed to launch metadata viewer: {}", e); }
+                                        }
+                                    }
+                                    Err(e) => { self.last_msg = format!("Failed to find executable: {}", e); }
+                                }
+                            }
+                        }
+                        if ui.button("Cancel compare").clicked() {
+                            self.metadata_select_mode = false;
+                            self.selected_files_for_meta.clear();
+                            self.last_msg = "Metadata compare cancelled".to_string();
+                        }
+                    }
+                });
+                ui.separator();
                 let ready_total_files: usize = self.ready_series.iter().map(|s| s.files.len()).sum();
                 let ready_total_bytes: u64 = self.ready_series.iter().map(|s| s.total_bytes).sum();
                 ui.label(format!(
@@ -951,129 +1070,8 @@ impl eframe::App for AppState {
                 ));
                 ui.separator();
                 egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        // Styled Upload button moved here to Ready-to-Upload (prominent)
-                        if !self.metadata_select_mode {
-                                if ui.add(egui::Button::new("Upload anonymized files").fill(egui::Color32::from_rgb(0,150,60))).clicked() {
-                                let anon_dir = self.anon_dir();
-                                let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
-                                // show immediate progress indicator before scanning
-                                let _ = tx.send("PROC:STEP:Uploading anonymized files".to_string());
-                                let _ = tx.send(format!("PROC:PROG:{}", 0.0));
-                                thread::spawn(move || {
-                                    match upload_anon_dir(&anon_dir, None, Some(tx.clone())) {
-                                        Ok(res) => {
-                                            let _ = tx.send(format!("Uploaded: {}", res.uploaded.len()));
-                                            let _ = tx.send(format!("Duplicates: {}", res.duplicates.len()));
-                                            let _ = tx.send(format!("Failed: {}", res.failed.len()));
-                                        }
-                                        Err(e) => {
-                                            let _ = tx.send(format!("Upload failed: {}", e));
-                                        }
-                                    }
-                                    let _ = tx.send("done".to_string());
-                                });
-                            }
-                            ui.add_space(8.0);
-                            if ui.button("Compare selected metadata").clicked() {
-                                self.metadata_select_mode = true;
-                                self.selected_files_for_meta.clear();
-                                self.last_msg = "Select files for metadata compare".to_string();
-                            }
-                            ui.add_space(8.0);
-                            if ui.small_button("Clear duplicates").clicked() {
-                                let anon_dir = self.anon_dir();
-                                let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
-                                thread::spawn(move || {
-                                    match upload::refresh_duplicates_for_ready(&anon_dir, Some(tx.clone())) {
-                                        Ok(series) => {
-                                            let mut deleted = 0usize;
-                                            let total_dup: usize = series.iter().map(|s| s.files.iter().filter(|f| f.is_duplicate).count()).sum();
-                                            if total_dup > 0 {
-                                                let _ = tx.send("PROC:STEP:Removing duplicates".to_string());
-                                                let _ = tx.send(format!("PROC:PROG:{}", 0.0));
-                                            }
-                                            let mut processed_dup = 0usize;
-                                            let dup_report_interval = std::cmp::max(1, total_dup / 50);
-                                            for s in &series {
-                                                for f in &s.files {
-                                                    if f.is_duplicate {
-                                                        if std::fs::remove_file(&f.path).is_ok() {
-                                                            upload::remove_ready_file(&f.path);
-                                                            upload::log_rpc_debug(&format!("Deleted duplicate file: {}", f.path.display()));
-                                                            deleted += 1;
-                                                        } else {
-                                                            upload::log_rpc_warn(&format!("Failed to delete duplicate file: {}", f.path.display()));
-                                                        }
-                                                        processed_dup = processed_dup.saturating_add(1);
-                                                        if total_dup > 0 {
-                                                            if (processed_dup % dup_report_interval == 0) || (processed_dup == total_dup) {
-                                                                let prog = (processed_dup as f32 / total_dup as f32).clamp(0.0, 1.0);
-                                                                let _ = tx.send(format!("PROC:PROG:{}", prog));
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            let new_series = upload::snapshot_ready_series(&anon_dir);
-                                            if let Ok(json2) = serde_json::to_string(&new_series) {
-                                                upload::store_last_scan(new_series.clone());
-                                                let _ = std::fs::write(".last_scan.json", &json2);
-                                                let b64 = base64::encode(json2.as_bytes());
-                                                let _ = tx.send(format!("SCAN:SET:{}", b64));
-                                                let _ = tx.send("scan_written".to_string());
-                                            }
-                                            let _ = tx.send(format!("duplicates_cleared:{}", deleted));
-                                        }
-                                        Err(e) => {
-                                            let _ = tx.send(format!("Clear duplicates failed: {}", e));
-                                        }
-                                    }
-                                    let _ = tx.send("done".to_string());
-                                });
-                            }
-                            ui.add_space(6.0);
-                            if ui.small_button("Remove all").clicked() {
-                                // ask for confirmation before deleting everything
-                                self.confirm_remove_all = true;
-                                self.last_msg = "Confirm remove all files...".to_string();
-                            }
-                        } else {
-                            if ui.button("Launch metadata viewer").clicked() {
-                                let mut paths: Vec<String> = Vec::new();
-                                for series in &self.ready_series {
-                                    for f in &series.files {
-                                        let pstr = f.path.to_string_lossy().to_string();
-                                        if self.selected_files_for_meta.contains(&pstr) {
-                                            paths.push(pstr);
-                                        }
-                                    }
-                                }
-                                if paths.is_empty() {
-                                    self.last_msg = "No files selected for metadata compare".to_string();
-                                } else {
-                                    match std::env::current_exe() {
-                                        Ok(exe) => {
-                                            let mut cmd = Command::new(exe);
-                                            cmd.arg("--meta-view");
-                                            for p in paths { cmd.arg(p); }
-                                            match cmd.spawn() {
-                                                Ok(_) => { self.last_msg = "Launched metadata viewer".to_string(); self.metadata_select_mode = false; }
-                                                Err(e) => { self.last_msg = format!("Failed to launch metadata viewer: {}", e); }
-                                            }
-                                        }
-                                        Err(e) => { self.last_msg = format!("Failed to find executable: {}", e); }
-                                    }
-                                }
-                            }
-                            if ui.button("Cancel compare").clicked() {
-                                self.metadata_select_mode = false;
-                                self.selected_files_for_meta.clear();
-                                self.last_msg = "Metadata compare cancelled".to_string();
-                            }
-                        }
-                    });
-                    for (si, series) in self.ready_series.iter().enumerate() {
+                    for si in 0..self.ready_series.len() {
+                        let series = self.ready_series[si].clone();
                         let mut checked = *self.selected_series.get(si).unwrap_or(&true);
                         ui.horizontal(|ui| {
                             let header = format!(
@@ -1165,89 +1163,116 @@ impl eframe::App for AppState {
                                     });
                                 }
                             });
-                        // Add a "View series" button to launch diviz-rs with the series files
-                        if ui.small_button("View series").clicked() {
-                            // collect file paths for this series
-                            let mut paths: Vec<String> = Vec::new();
-                            for f in &series.files {
-                                paths.push(f.path.to_string_lossy().to_string());
-                            }
-                            if paths.is_empty() {
-                                self.last_msg = "No files in series to view".to_string();
-                            } else {
-                                // Try to launch `diviz-rs` (in PATH) with all file args; fall back to workspace target path
-                                let try_spawn = |cmd: &str, args: &[String]| -> Result<std::process::Child, std::io::Error> {
-                                    Command::new(cmd).args(args).spawn()
-                                };
+                        // Add series-level actions.
+                        ui.horizontal(|ui| {
+                            if ui.small_button("View series").clicked() {
+                                // collect file paths for this series
+                                let mut paths: Vec<String> = Vec::new();
+                                for f in &series.files {
+                                    paths.push(f.path.to_string_lossy().to_string());
+                                }
+                                if paths.is_empty() {
+                                    self.last_msg = "No files in series to view".to_string();
+                                } else {
+                                    // Try to launch `diviz-rs` (in PATH) with all file args; fall back to workspace target path
+                                    let try_spawn = |cmd: &str, args: &[String]| -> Result<std::process::Child, std::io::Error> {
+                                        Command::new(cmd).args(args).spawn()
+                                    };
 
-                                // first try by name (in PATH)
-                                match try_spawn("diviz-rs", &paths) {
-                                    Ok(_) => { self.last_msg = "Launched diviz-rs".to_string(); }
-                                    Err(_) => {
-                                        // Attempt to locate a workspace-built binary by walking up ancestor directories
-                                        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-                                        // helper to push debug/release targets for a root path
-                                        let mut push_targets = |root: &std::path::Path| {
-                                            candidates.push(root.join("diviz-rs/target/debug/diviz-rs"));
-                                            candidates.push(root.join("diviz-rs/target/release/diviz-rs"));
-                                        };
+                                    // first try by name (in PATH)
+                                    match try_spawn("diviz-rs", &paths) {
+                                        Ok(_) => { self.last_msg = "Launched diviz-rs".to_string(); }
+                                        Err(_) => {
+                                            // Attempt to locate a workspace-built binary by walking up ancestor directories
+                                            let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+                                            // helper to push debug/release targets for a root path
+                                            let mut push_targets = |root: &std::path::Path| {
+                                                candidates.push(root.join("diviz-rs/target/debug/diviz-rs"));
+                                                candidates.push(root.join("diviz-rs/target/release/diviz-rs"));
+                                            };
 
-                                        if let Ok(cwd) = std::env::current_dir() {
-                                            let mut cur = Some(cwd.as_path());
-                                            for _ in 0..6 {
-                                                if let Some(p) = cur {
-                                                    push_targets(p);
-                                                    cur = p.parent();
-                                                } else { break; }
-                                            }
-                                        }
-
-                                        if let Ok(exe) = std::env::current_exe() {
-                                            let mut cur = exe.parent();
-                                            for _ in 0..8 {
-                                                if let Some(p) = cur {
-                                                    push_targets(p);
-                                                    cur = p.parent();
-                                                } else { break; }
-                                            }
-                                        }
-
-                                        // Also try the parent of the uploader_rs directory (workspace root sibling)
-                                        if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-                                            let mut cur = std::path::Path::new(&manifest_dir).parent();
-                                            for _ in 0..6 {
-                                                if let Some(p) = cur {
-                                                    push_targets(p);
-                                                    cur = p.parent();
-                                                } else { break; }
-                                            }
-                                        }
-
-                                        // remove duplicates and try each candidate
-                                        let mut launched = false;
-                                        use std::collections::HashSet;
-                                        let mut seen = HashSet::new();
-                                        for cand in candidates.into_iter() {
-                                            let key = cand.to_string_lossy().to_string();
-                                            if seen.contains(&key) { continue; }
-                                            seen.insert(key.clone());
-                                            if cand.exists() {
-                                                if try_spawn(cand.to_string_lossy().as_ref(), &paths).is_ok() {
-                                                    launched = true;
-                                                    break;
+                                            if let Ok(cwd) = std::env::current_dir() {
+                                                let mut cur = Some(cwd.as_path());
+                                                for _ in 0..6 {
+                                                    if let Some(p) = cur {
+                                                        push_targets(p);
+                                                        cur = p.parent();
+                                                    } else { break; }
                                                 }
                                             }
-                                        }
 
-                                        if launched {
-                                            self.last_msg = "Launched diviz-rs (fallback)".to_string();
-                                        } else {
-                                            self.last_msg = "Failed to launch diviz-rs; ensure it is built or in PATH".to_string();
+                                            if let Ok(exe) = std::env::current_exe() {
+                                                let mut cur = exe.parent();
+                                                for _ in 0..8 {
+                                                    if let Some(p) = cur {
+                                                        push_targets(p);
+                                                        cur = p.parent();
+                                                    } else { break; }
+                                                }
+                                            }
+
+                                            // Also try the parent of the uploader_rs directory (workspace root sibling)
+                                            if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+                                                let mut cur = std::path::Path::new(&manifest_dir).parent();
+                                                for _ in 0..6 {
+                                                    if let Some(p) = cur {
+                                                        push_targets(p);
+                                                        cur = p.parent();
+                                                    } else { break; }
+                                                }
+                                            }
+
+                                            // remove duplicates and try each candidate
+                                            let mut launched = false;
+                                            use std::collections::HashSet;
+                                            let mut seen = HashSet::new();
+                                            for cand in candidates.into_iter() {
+                                                let key = cand.to_string_lossy().to_string();
+                                                if seen.contains(&key) { continue; }
+                                                seen.insert(key.clone());
+                                                if cand.exists() {
+                                                    if try_spawn(cand.to_string_lossy().as_ref(), &paths).is_ok() {
+                                                        launched = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+
+                                            if launched {
+                                                self.last_msg = "Launched diviz-rs (fallback)".to_string();
+                                            } else {
+                                                self.last_msg = "Failed to launch diviz-rs; ensure it is built or in PATH".to_string();
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
+
+                            if ui.add(egui::Button::new("Delete series").fill(egui::Color32::from_rgb(170, 35, 35))).clicked() {
+                                let to_delete: Vec<std::path::PathBuf> = series.files.iter().map(|f| f.path.clone()).collect();
+                                let anon_dir = self.anon_dir();
+                                let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
+                                thread::spawn(move || {
+                                    let mut deleted = 0usize;
+                                    for p in &to_delete {
+                                        if std::fs::remove_file(p).is_ok() {
+                                            upload::remove_ready_file(p);
+                                            deleted = deleted.saturating_add(1);
+                                        }
+                                    }
+                                    let new_series = upload::snapshot_ready_series(&anon_dir);
+                                    if let Ok(json2) = serde_json::to_string(&new_series) {
+                                        upload::store_last_scan(new_series.clone());
+                                        let _ = std::fs::write(".last_scan.json", &json2);
+                                        let b64 = base64::encode(json2.as_bytes());
+                                        let _ = tx.send(format!("SCAN:SET:{}", b64));
+                                        let _ = tx.send("scan_written".to_string());
+                                    }
+                                    let _ = tx.send(format!("Deleted series files: {}", deleted));
+                                    let _ = tx.send("done".to_string());
+                                });
+                            }
+                        });
                         ui.separator();
                     }
                 });
