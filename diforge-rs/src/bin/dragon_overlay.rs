@@ -73,7 +73,10 @@ fn main() {
                                 let y = v.get("y").and_then(|n| n.as_i64()).unwrap_or(0);
                                 let w = v.get("w").and_then(|n| n.as_i64()).unwrap_or(0);
                                 let h = v.get("h").and_then(|n| n.as_i64()).unwrap_or(0);
-                                println!("Received overlay position: x={}, y={}, w={}, h={}", x, y, w, h);
+                                println!(
+                                    "Received overlay position: x={}, y={}, w={}, h={}",
+                                    x, y, w, h
+                                );
                                 // No real overlay on terminal; just acknowledge
                                 let ack = format!("overlay_position_ack {} {} {} {}\n", x, y, w, h);
                                 let _ = stream.write_all(ack.as_bytes());

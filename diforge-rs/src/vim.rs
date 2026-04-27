@@ -5,8 +5,8 @@ use std::ops::Range;
 pub enum VimMode {
     Normal,
     Insert,
-        Visual,
-        VisualLine,
+    Visual,
+    VisualLine,
 }
 
 impl Default for VimMode {
@@ -18,6 +18,10 @@ impl Default for VimMode {
 pub struct ReportBuffer {
     pub report: String,
     pub caret_char_range: Option<Range<usize>>,
+    // Internal Vim yank register (unnamed register).
+    yank_buffer: String,
+    yank_linewise: bool,
+    yank_changed: bool,
     // undo/redo stacks store previous buffer states
     history: Vec<(String, Option<Range<usize>>)>,
     redo: Vec<(String, Option<Range<usize>>)>,
@@ -30,6 +34,9 @@ impl ReportBuffer {
         Self {
             report: String::new(),
             caret_char_range: None,
+            yank_buffer: String::new(),
+            yank_linewise: false,
+            yank_changed: false,
             history: Vec::new(),
             redo: Vec::new(),
             in_undo_group: false,
@@ -65,6 +72,16 @@ impl ReportBuffer {
             self.history.push(self.snapshot());
             self.redo.clear();
         }
+    }
+
+    /// Replace the byte range `start_byte..end_byte` in `report` with `replacement`,
+    /// recording an undo snapshot first. Updates `caret_char_range` to the start
+    /// of the replaced region.
+    pub fn replace_bytes(&mut self, start_byte: usize, end_byte: usize, replacement: &str) {
+        self.push_undo_snapshot();
+        self.report.replace_range(start_byte..end_byte, replacement);
+        let pos = self.report[..start_byte].chars().count();
+        self.caret_char_range = Some(pos..pos);
     }
 
     pub fn undo(&mut self) {
@@ -133,7 +150,9 @@ impl ReportBuffer {
     }
 
     fn delete_range(&mut self, start_char: usize, end_char: usize) {
-        if start_char >= end_char { return; }
+        if start_char >= end_char {
+            return;
+        }
         self.push_undo_snapshot();
         let start_byte = self.char_to_byte_index(start_char);
         let end_byte = self.char_to_byte_index(end_char);
@@ -143,23 +162,101 @@ impl ReportBuffer {
         }
     }
 
+    fn text_for_char_range(&self, start_char: usize, end_char: usize) -> String {
+        if start_char >= end_char {
+            return String::new();
+        }
+        self.report
+            .chars()
+            .skip(start_char)
+            .take(end_char - start_char)
+            .collect::<String>()
+    }
+
+    pub fn yank_range(&mut self, start_char: usize, end_char: usize, linewise: bool) {
+        if start_char >= end_char {
+            self.yank_buffer.clear();
+            self.yank_linewise = linewise;
+            self.yank_changed = true;
+            return;
+        }
+        self.yank_buffer = self.text_for_char_range(start_char, end_char);
+        self.yank_linewise = linewise;
+        self.yank_changed = true;
+    }
+
+    pub fn take_yank_for_clipboard(&mut self) -> Option<String> {
+        if self.yank_changed {
+            self.yank_changed = false;
+            Some(self.yank_buffer.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn yank_current_line(&mut self) {
+        let cur = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+        let (s, e) = self.line_bounds_at(cur);
+        self.yank_range(s, e, true);
+    }
+
+    pub fn paste_after(&mut self) {
+        if self.yank_buffer.is_empty() {
+            return;
+        }
+        let cur = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+        let insert_pos = if self.yank_linewise {
+            let (_s, e) = self.line_bounds_at(cur);
+            e
+        } else {
+            (cur + 1).min(self.char_len())
+        };
+        self.set_caret_pos(insert_pos);
+        self.insert_at_caret(&self.yank_buffer.clone());
+    }
+
+    pub fn paste_before(&mut self) {
+        if self.yank_buffer.is_empty() {
+            return;
+        }
+        let cur = self.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+        let insert_pos = if self.yank_linewise {
+            let (s, _e) = self.line_bounds_at(cur);
+            s
+        } else {
+            cur.min(self.char_len())
+        };
+        self.set_caret_pos(insert_pos);
+        self.insert_at_caret(&self.yank_buffer.clone());
+    }
+
     fn next_word_start_from(&self, pos: usize) -> usize {
         let chars: Vec<char> = self.report.chars().collect();
         let mut p = pos;
         let n = chars.len();
         if p < n && chars[p].is_alphanumeric() {
-            while p < n && chars[p].is_alphanumeric() { p += 1; }
+            while p < n && chars[p].is_alphanumeric() {
+                p += 1;
+            }
         }
-        while p < n && !chars[p].is_alphanumeric() { p += 1; }
+        while p < n && !chars[p].is_alphanumeric() {
+            p += 1;
+        }
         p
     }
 
     fn prev_word_start_from(&self, pos: usize) -> usize {
         let chars: Vec<char> = self.report.chars().collect();
-        if pos == 0 { return 0; }
+        if pos == 0 {
+            return 0;
+        }
         let mut i = pos;
-        while i > 0 && !chars[i - 1].is_alphanumeric() { i -= 1; }
-        while i > 0 && chars[i - 1].is_alphanumeric() { i -= 1; }
+        while i > 0 && !chars[i - 1].is_alphanumeric() {
+            i -= 1;
+        }
+        while i > 0 && chars[i - 1].is_alphanumeric() {
+            i -= 1;
+        }
         i
     }
 
@@ -168,10 +265,18 @@ impl ReportBuffer {
         let mut p = pos;
         let n = chars.len();
         // advance to start of next word
-        while p < n && !chars[p].is_alphanumeric() { p += 1; }
+        while p < n && !chars[p].is_alphanumeric() {
+            p += 1;
+        }
         // advance to end of that word
-        while p < n && chars[p].is_alphanumeric() { p += 1; }
-        if p > 0 { p - 1 } else { 0 }
+        while p < n && chars[p].is_alphanumeric() {
+            p += 1;
+        }
+        if p > 0 {
+            p - 1
+        } else {
+            0
+        }
     }
 
     /// Determine the start (inclusive) and end (exclusive) char indices of
@@ -180,7 +285,9 @@ impl ReportBuffer {
     fn current_word_bounds(&self, pos: usize) -> Option<(usize, usize)> {
         let chars: Vec<char> = self.report.chars().collect();
         let n = chars.len();
-        if n == 0 { return None; }
+        if n == 0 {
+            return None;
+        }
         let mut p = pos;
         if p >= n {
             p = n.saturating_sub(1);
@@ -192,14 +299,20 @@ impl ReportBuffer {
         // If still not on a word, try to find next word
         if !chars[p].is_alphanumeric() {
             let s = self.next_word_start_from(p);
-            if s >= n { return None; }
+            if s >= n {
+                return None;
+            }
             p = s;
         }
         // p is inside a word
         let mut start = p;
-        while start > 0 && chars[start - 1].is_alphanumeric() { start -= 1; }
+        while start > 0 && chars[start - 1].is_alphanumeric() {
+            start -= 1;
+        }
         let mut end = p;
-        while end < n && chars[end].is_alphanumeric() { end += 1; }
+        while end < n && chars[end].is_alphanumeric() {
+            end += 1;
+        }
         Some((start, end))
     }
 
@@ -263,7 +376,9 @@ impl ReportBuffer {
         } else {
             false
         };
-        let after_word = pos > 0 && (pos == n || !chars[pos].is_alphanumeric()) && chars[pos - 1].is_alphanumeric();
+        let after_word = pos > 0
+            && (pos == n || !chars[pos].is_alphanumeric())
+            && chars[pos - 1].is_alphanumeric();
         if at_end_of_word || after_word {
             pos = pos.saturating_add(1);
         }
@@ -274,7 +389,9 @@ impl ReportBuffer {
         while pos < n && chars[pos].is_alphanumeric() {
             pos += 1;
         }
-        if pos > 0 { pos -= 1; }
+        if pos > 0 {
+            pos -= 1;
+        }
         self.set_caret_pos(pos);
     }
 
@@ -305,7 +422,9 @@ impl ReportBuffer {
     pub fn line_bounds_at(&self, pos: usize) -> (usize, usize) {
         let chars: Vec<char> = self.report.chars().collect();
         let n = chars.len();
-        if n == 0 { return (0, 0); }
+        if n == 0 {
+            return (0, 0);
+        }
         let p = pos.min(n);
         let mut start = 0usize;
         for i in (0..p).rev() {
@@ -337,14 +456,23 @@ impl ReportBuffer {
         }
         let mut line_idx = 0usize;
         for (i, &s) in line_starts.iter().enumerate() {
-            if s <= pos { line_idx = i; } else { break; }
+            if s <= pos {
+                line_idx = i;
+            } else {
+                break;
+            }
         }
-        if line_idx == 0 { return; }
+        if line_idx == 0 {
+            return;
+        }
         let (_, cur_end, col) = self.move_to_line_bounds();
         let prev_start = line_starts[line_idx - 1];
         let mut prev_end = n;
         for i in prev_start..n {
-            if chars[i] == '\n' { prev_end = i + 1; break; }
+            if chars[i] == '\n' {
+                prev_end = i + 1;
+                break;
+            }
         }
         let target = (prev_start + col).min(prev_end.saturating_sub(1));
         self.set_caret_pos(target);
@@ -363,14 +491,23 @@ impl ReportBuffer {
         }
         let mut line_idx = 0usize;
         for (i, &s) in line_starts.iter().enumerate() {
-            if s <= pos { line_idx = i; } else { break; }
+            if s <= pos {
+                line_idx = i;
+            } else {
+                break;
+            }
         }
-        if line_idx + 1 >= line_starts.len() { return; }
+        if line_idx + 1 >= line_starts.len() {
+            return;
+        }
         let (cur_start, cur_end, col) = self.move_to_line_bounds();
         let next_start = line_starts[line_idx + 1];
         let mut next_end = n;
         for i in next_start..n {
-            if chars[i] == '\n' { next_end = i + 1; break; }
+            if chars[i] == '\n' {
+                next_end = i + 1;
+                break;
+            }
         }
         let target = (next_start + col).min(next_end.saturating_sub(1));
         self.set_caret_pos(target);
@@ -380,10 +517,14 @@ impl ReportBuffer {
     /// start of the previous line when moving upward. Used by operator ranges.
     fn prev_line_start_from(&self, pos: usize) -> usize {
         let chars: Vec<char> = self.report.chars().collect();
-        if pos == 0 { return 0; }
+        if pos == 0 {
+            return 0;
+        }
         let mut i = pos.saturating_sub(1);
         while i > 0 {
-            if chars[i] == '\n' { return i + 1; }
+            if chars[i] == '\n' {
+                return i + 1;
+            }
             i = i.saturating_sub(1);
         }
         0
@@ -392,7 +533,9 @@ impl ReportBuffer {
     /// Delete `count` lines starting at `start_char` (char indices). If the
     /// requested range extends past EOF, clamp to EOF.
     fn delete_lines_from(&mut self, start_char: usize, count: usize) {
-        if count == 0 { return; }
+        if count == 0 {
+            return;
+        }
         let chars: Vec<char> = self.report.chars().collect();
         let n = chars.len();
         if start_char >= n {
@@ -442,7 +585,9 @@ impl ReportBuffer {
             pos += 1;
         }
         // If we reached end, clamp to end-of-file start
-        if pos > n { pos = n; }
+        if pos > n {
+            pos = n;
+        }
         self.set_caret_pos(pos);
     }
 
@@ -504,7 +649,8 @@ impl ReportBuffer {
             }
             if line_start_byte < line_end_byte {
                 self.push_undo_snapshot();
-                self.report.replace_range(line_start_byte..line_end_byte, "");
+                self.report
+                    .replace_range(line_start_byte..line_end_byte, "");
                 self.caret_char_range = Some(line_start_byte..line_start_byte);
             }
         }
@@ -516,8 +662,14 @@ impl ReportBuffer {
         let (_s, e, _c) = self.move_to_line_bounds();
         let insert_pos = if e > 0 {
             let prev = self.report.chars().nth(e - 1);
-            if prev == Some('\n') { e.saturating_sub(1) } else { e }
-        } else { e };
+            if prev == Some('\n') {
+                e.saturating_sub(1)
+            } else {
+                e
+            }
+        } else {
+            e
+        };
         self.set_caret_pos(insert_pos);
         self.push_undo_snapshot();
         self.insert_at_caret("\n");
@@ -545,8 +697,14 @@ impl ReportBuffer {
         let (_s, e, _c) = self.move_to_line_bounds();
         let target = if e > 0 {
             let prev = self.report.chars().nth(e - 1);
-            if prev == Some('\n') { e.saturating_sub(1) } else { e }
-        } else { e };
+            if prev == Some('\n') {
+                e.saturating_sub(1)
+            } else {
+                e
+            }
+        } else {
+            e
+        };
         self.set_caret_pos(target);
     }
 
@@ -631,7 +789,11 @@ impl ReportBuffer {
                 // other end of the selection (reverse selection endpoints).
                 if *vim_mode == crate::VimMode::Visual || *vim_mode == crate::VimMode::VisualLine {
                     if let Some(anchor_pos) = *visual_anchor {
-                        let cur = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                        let cur = buffer
+                            .caret_char_range
+                            .as_ref()
+                            .map(|r| r.start)
+                            .unwrap_or(0);
                         *visual_anchor = Some(cur);
                         buffer.set_caret_pos(anchor_pos);
                     }
@@ -657,14 +819,23 @@ impl ReportBuffer {
                 *last_vim_count = None;
                 true
             }
-            'u' => { buffer.undo(); *last_vim_key = None; *last_vim_count = None; false }
+            'u' => {
+                buffer.undo();
+                *last_vim_key = None;
+                *last_vim_count = None;
+                false
+            }
             'v' => {
                 // toggle Visual mode and set/clear anchor
                 if *vim_mode == crate::VimMode::Visual {
                     *vim_mode = crate::VimMode::Normal;
                     *visual_anchor = None;
                 } else {
-                    let pos = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    let pos = buffer
+                        .caret_char_range
+                        .as_ref()
+                        .map(|r| r.start)
+                        .unwrap_or(0);
                     *visual_anchor = Some(pos);
                     // initialize the caret range so UI shows selection immediately
                     buffer.caret_char_range = Some(pos..pos);
@@ -680,7 +851,11 @@ impl ReportBuffer {
                     *vim_mode = crate::VimMode::Normal;
                     *visual_anchor = None;
                 } else {
-                    let pos = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    let pos = buffer
+                        .caret_char_range
+                        .as_ref()
+                        .map(|r| r.start)
+                        .unwrap_or(0);
                     let (s, _e, _c) = buffer.move_to_line_bounds();
                     *visual_anchor = Some(s);
                     buffer.caret_char_range = Some(s..s);
@@ -690,7 +865,7 @@ impl ReportBuffer {
                 *last_vim_count = None;
                 false
             }
-            
+
             'j' => {
                 // operator-pending: d/j or c/j ranges
                 if *last_vim_key == Some('d') {
@@ -708,10 +883,31 @@ impl ReportBuffer {
                     *last_vim_key = None;
                     *vim_mode = crate::VimMode::Insert;
                     true
+                } else if *last_vim_key == Some('y') {
+                    let start = buffer.move_to_line_bounds().0;
+                    let op_count = last_vim_count.take().unwrap_or(1);
+                    let mut end = start;
+                    let chars: Vec<char> = buffer.report.chars().collect();
+                    let n = chars.len();
+                    let mut lines_yanked = 0usize;
+                    while end < n && lines_yanked < op_count {
+                        if let Some(pos) = chars[end..].iter().position(|&c| c == '\n') {
+                            end = end + pos + 1;
+                        } else {
+                            end = n;
+                        }
+                        lines_yanked += 1;
+                    }
+                    buffer.yank_range(start, end, true);
+                    *last_vim_key = None;
+                    false
                 } else {
                     let repeats = last_vim_count.take().unwrap_or(1);
-                    for _ in 0..repeats { buffer.move_line_down(); }
-                    *last_vim_key = None; false
+                    for _ in 0..repeats {
+                        buffer.move_line_down();
+                    }
+                    *last_vim_key = None;
+                    false
                 }
             }
             'k' => {
@@ -737,10 +933,23 @@ impl ReportBuffer {
                     *last_vim_key = None;
                     *vim_mode = crate::VimMode::Insert;
                     true
+                } else if *last_vim_key == Some('y') {
+                    let end = buffer.move_to_line_bounds().0;
+                    let op_count = last_vim_count.take().unwrap_or(1);
+                    let mut start = end;
+                    for _ in 0..op_count {
+                        start = buffer.prev_line_start_from(start);
+                    }
+                    buffer.yank_range(start, end, true);
+                    *last_vim_key = None;
+                    false
                 } else {
                     let repeats = last_vim_count.take().unwrap_or(1);
-                    for _ in 0..repeats { buffer.move_line_up(); }
-                    *last_vim_key = None; false
+                    for _ in 0..repeats {
+                        buffer.move_line_up();
+                    }
+                    *last_vim_key = None;
+                    false
                 }
             }
             'w' => {
@@ -748,14 +957,22 @@ impl ReportBuffer {
                 if last_vim_object.is_some() {
                     if let Some(obj) = last_vim_object.take() {
                         if obj == 'i' || obj == 'a' {
-                            let cur = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                            let cur = buffer
+                                .caret_char_range
+                                .as_ref()
+                                .map(|r| r.start)
+                                .unwrap_or(0);
                             if let Some((start_char, end_char)) = buffer.current_word_bounds(cur) {
                                 let mut s = start_char;
                                 let mut e = end_char;
                                 if obj == 'a' {
                                     let chars: Vec<char> = buffer.report.chars().collect();
-                                    if s > 0 && chars[s - 1].is_whitespace() { s -= 1; }
-                                    if e < chars.len() && chars[e].is_whitespace() { e += 1; }
+                                    if s > 0 && chars[s - 1].is_whitespace() {
+                                        s -= 1;
+                                    }
+                                    if e < chars.len() && chars[e].is_whitespace() {
+                                        e += 1;
+                                    }
                                 }
                                 if *last_vim_key == Some('d') {
                                     buffer.delete_range(s, e);
@@ -776,7 +993,11 @@ impl ReportBuffer {
 
                 // operator 'd' (delete words)
                 if *last_vim_key == Some('d') {
-                    let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    let start = buffer
+                        .caret_char_range
+                        .as_ref()
+                        .map(|r| r.start)
+                        .unwrap_or(0);
                     let mut end = start;
                     let op_count = last_vim_count.take().unwrap_or(1);
                     for _ in 0..op_count {
@@ -789,7 +1010,11 @@ impl ReportBuffer {
 
                 // operator 'c' (change words)
                 if *last_vim_key == Some('c') {
-                    let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    let start = buffer
+                        .caret_char_range
+                        .as_ref()
+                        .map(|r| r.start)
+                        .unwrap_or(0);
                     let mut end = start;
                     let op_count = last_vim_count.take().unwrap_or(1);
                     for _ in 0..op_count {
@@ -802,65 +1027,147 @@ impl ReportBuffer {
                     return true;
                 }
 
+                // operator 'y' (yank words)
+                if *last_vim_key == Some('y') {
+                    let start = buffer
+                        .caret_char_range
+                        .as_ref()
+                        .map(|r| r.start)
+                        .unwrap_or(0);
+                    let mut end = start;
+                    let op_count = last_vim_count.take().unwrap_or(1);
+                    for _ in 0..op_count {
+                        end = buffer.next_word_start_from(end);
+                    }
+                    buffer.yank_range(start, end, false);
+                    *last_vim_key = None;
+                    return false;
+                }
+
                 // default: move by words
                 let repeats = last_vim_count.take().unwrap_or(1);
-                for _ in 0..repeats { buffer.move_word_forward(); }
-                *last_vim_key = None; false
+                for _ in 0..repeats {
+                    buffer.move_word_forward();
+                }
+                *last_vim_key = None;
+                false
             }
             'b' => {
                 if *last_vim_key == Some('d') {
-                    let end = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    let end = buffer
+                        .caret_char_range
+                        .as_ref()
+                        .map(|r| r.start)
+                        .unwrap_or(0);
                     let mut start = end;
                     let op_count = last_vim_count.take().unwrap_or(1);
-                    for _ in 0..op_count { start = buffer.prev_word_start_from(start); }
+                    for _ in 0..op_count {
+                        start = buffer.prev_word_start_from(start);
+                    }
                     buffer.delete_range(start, end);
                     *last_vim_key = None;
                     false
                 } else if *last_vim_key == Some('c') {
-                    let end = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    let end = buffer
+                        .caret_char_range
+                        .as_ref()
+                        .map(|r| r.start)
+                        .unwrap_or(0);
                     let mut start = end;
                     let op_count = last_vim_count.take().unwrap_or(1);
-                    for _ in 0..op_count { start = buffer.prev_word_start_from(start); }
+                    for _ in 0..op_count {
+                        start = buffer.prev_word_start_from(start);
+                    }
                     buffer.start_undo_group();
                     buffer.delete_range(start, end);
                     *last_vim_key = None;
                     *vim_mode = crate::VimMode::Insert;
                     true
+                } else if *last_vim_key == Some('y') {
+                    let end = buffer
+                        .caret_char_range
+                        .as_ref()
+                        .map(|r| r.start)
+                        .unwrap_or(0);
+                    let mut start = end;
+                    let op_count = last_vim_count.take().unwrap_or(1);
+                    for _ in 0..op_count {
+                        start = buffer.prev_word_start_from(start);
+                    }
+                    buffer.yank_range(start, end, false);
+                    *last_vim_key = None;
+                    false
                 } else {
                     let repeats = last_vim_count.take().unwrap_or(1);
-                    for _ in 0..repeats { buffer.move_word_backward(); }
-                    *last_vim_key = None; false
+                    for _ in 0..repeats {
+                        buffer.move_word_backward();
+                    }
+                    *last_vim_key = None;
+                    false
                 }
             }
             'e' => {
                 if *last_vim_key == Some('d') {
-                    let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    let start = buffer
+                        .caret_char_range
+                        .as_ref()
+                        .map(|r| r.start)
+                        .unwrap_or(0);
                     let mut end_char = start;
                     let op_count = last_vim_count.take().unwrap_or(1);
-                    for _ in 0..op_count { end_char = buffer.word_end_from(end_char).saturating_add(1); }
+                    for _ in 0..op_count {
+                        end_char = buffer.word_end_from(end_char).saturating_add(1);
+                    }
                     buffer.delete_range(start, end_char);
                     *last_vim_key = None;
                     false
                 } else if *last_vim_key == Some('c') {
-                    let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    let start = buffer
+                        .caret_char_range
+                        .as_ref()
+                        .map(|r| r.start)
+                        .unwrap_or(0);
                     let mut end_char = start;
                     let op_count = last_vim_count.take().unwrap_or(1);
-                    for _ in 0..op_count { end_char = buffer.word_end_from(end_char).saturating_add(1); }
+                    for _ in 0..op_count {
+                        end_char = buffer.word_end_from(end_char).saturating_add(1);
+                    }
                     buffer.start_undo_group();
                     buffer.delete_range(start, end_char);
                     *last_vim_key = None;
                     *vim_mode = crate::VimMode::Insert;
                     true
+                } else if *last_vim_key == Some('y') {
+                    let start = buffer
+                        .caret_char_range
+                        .as_ref()
+                        .map(|r| r.start)
+                        .unwrap_or(0);
+                    let mut end_char = start;
+                    let op_count = last_vim_count.take().unwrap_or(1);
+                    for _ in 0..op_count {
+                        end_char = buffer.word_end_from(end_char).saturating_add(1);
+                    }
+                    buffer.yank_range(start, end_char, false);
+                    *last_vim_key = None;
+                    false
                 } else {
                     let repeats = last_vim_count.take().unwrap_or(1);
-                    for _ in 0..repeats { buffer.move_word_end(); }
-                    *last_vim_key = None; false
+                    for _ in 0..repeats {
+                        buffer.move_word_end();
+                    }
+                    *last_vim_key = None;
+                    false
                 }
             }
             // motions that can be used with operators (d, c)
             'h' | 'l' => {
                 if *last_vim_key == Some('d') {
-                    let cur = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    let cur = buffer
+                        .caret_char_range
+                        .as_ref()
+                        .map(|r| r.start)
+                        .unwrap_or(0);
                     let op_count = last_vim_count.take().unwrap_or(1);
                     let (start, end) = if ch == 'h' {
                         (cur.saturating_sub(op_count), cur)
@@ -872,7 +1179,11 @@ impl ReportBuffer {
                     false
                 } else if *last_vim_key == Some('c') {
                     buffer.start_undo_group();
-                    let cur = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    let cur = buffer
+                        .caret_char_range
+                        .as_ref()
+                        .map(|r| r.start)
+                        .unwrap_or(0);
                     let op_count = last_vim_count.take().unwrap_or(1);
                     let (start, end) = if ch == 'h' {
                         (cur.saturating_sub(op_count), cur)
@@ -883,9 +1194,30 @@ impl ReportBuffer {
                     *last_vim_key = None;
                     *vim_mode = crate::VimMode::Insert;
                     true
+                } else if *last_vim_key == Some('y') {
+                    let cur = buffer
+                        .caret_char_range
+                        .as_ref()
+                        .map(|r| r.start)
+                        .unwrap_or(0);
+                    let op_count = last_vim_count.take().unwrap_or(1);
+                    let (start, end) = if ch == 'h' {
+                        (cur.saturating_sub(op_count), cur)
+                    } else {
+                        (cur, (cur + op_count).min(buffer.char_len()))
+                    };
+                    buffer.yank_range(start, end, false);
+                    *last_vim_key = None;
+                    false
                 } else {
                     let repeats = last_vim_count.take().unwrap_or(1);
-                    for _ in 0..repeats { if ch == 'h' { buffer.move_caret_by(-1); } else { buffer.move_caret_by(1); } }
+                    for _ in 0..repeats {
+                        if ch == 'h' {
+                            buffer.move_caret_by(-1);
+                        } else {
+                            buffer.move_caret_by(1);
+                        }
+                    }
                     *last_vim_key = None;
                     false
                 }
@@ -906,13 +1238,21 @@ impl ReportBuffer {
             'G' => {
                 // operator-pending: dG/cG delete/change to specified line or EOF
                 if *last_vim_key == Some('d') {
-                    let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    let start = buffer
+                        .caret_char_range
+                        .as_ref()
+                        .map(|r| r.start)
+                        .unwrap_or(0);
                     if let Some(n) = last_vim_count.take() {
                         // delete to start of line n
                         let mut target = 0usize;
                         // goto_line_start uses 1-based lines
                         buffer.goto_line_start(n);
-                        target = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                        target = buffer
+                            .caret_char_range
+                            .as_ref()
+                            .map(|r| r.start)
+                            .unwrap_or(0);
                         buffer.delete_range(start, target);
                     } else {
                         // delete to EOF
@@ -922,10 +1262,18 @@ impl ReportBuffer {
                     *last_vim_key = None;
                     false
                 } else if *last_vim_key == Some('c') {
-                    let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                    let start = buffer
+                        .caret_char_range
+                        .as_ref()
+                        .map(|r| r.start)
+                        .unwrap_or(0);
                     if let Some(n) = last_vim_count.take() {
                         buffer.goto_line_start(n);
-                        let target = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                        let target = buffer
+                            .caret_char_range
+                            .as_ref()
+                            .map(|r| r.start)
+                            .unwrap_or(0);
                         buffer.start_undo_group();
                         buffer.delete_range(start, target);
                     } else {
@@ -950,12 +1298,22 @@ impl ReportBuffer {
             }
             '$' => {
                 // end-of-line motion; can be used with d/c
-                let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                let start = buffer
+                    .caret_char_range
+                    .as_ref()
+                    .map(|r| r.start)
+                    .unwrap_or(0);
                 let (_s, e, _c) = buffer.move_to_line_bounds();
                 // compute end-of-line char index (exclude newline)
                 let end_char = if e > 0 {
-                    if buffer.report.chars().nth(e - 1) == Some('\n') { e.saturating_sub(1) } else { e }
-                } else { e };
+                    if buffer.report.chars().nth(e - 1) == Some('\n') {
+                        e.saturating_sub(1)
+                    } else {
+                        e
+                    }
+                } else {
+                    e
+                };
                 if *last_vim_key == Some('d') {
                     buffer.delete_range(start, end_char);
                     *last_vim_key = None;
@@ -966,6 +1324,10 @@ impl ReportBuffer {
                     *last_vim_key = None;
                     *vim_mode = crate::VimMode::Insert;
                     true
+                } else if *last_vim_key == Some('y') {
+                    buffer.yank_range(start, end_char, false);
+                    *last_vim_key = None;
+                    false
                 } else {
                     buffer.set_caret_pos(end_char);
                     *last_vim_key = None;
@@ -974,7 +1336,11 @@ impl ReportBuffer {
             }
             '0' => {
                 // move to start of line; if operator pending, delete/change to start
-                let cur = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                let cur = buffer
+                    .caret_char_range
+                    .as_ref()
+                    .map(|r| r.start)
+                    .unwrap_or(0);
                 let (line_start, _e, _c) = buffer.move_to_line_bounds();
                 if *last_vim_key == Some('d') {
                     buffer.delete_range(line_start, cur);
@@ -986,6 +1352,10 @@ impl ReportBuffer {
                     *last_vim_key = None;
                     *vim_mode = crate::VimMode::Insert;
                     true
+                } else if *last_vim_key == Some('y') {
+                    buffer.yank_range(line_start, cur, false);
+                    *last_vim_key = None;
+                    false
                 } else {
                     buffer.set_caret_pos(line_start);
                     *last_vim_key = None;
@@ -994,18 +1364,42 @@ impl ReportBuffer {
             }
             'D' => {
                 // delete to end of line
-                let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                let start = buffer
+                    .caret_char_range
+                    .as_ref()
+                    .map(|r| r.start)
+                    .unwrap_or(0);
                 let (_s, e, _c) = buffer.move_to_line_bounds();
-                let end_char = if e > 0 { if buffer.report.chars().nth(e - 1) == Some('\n') { e.saturating_sub(1) } else { e } } else { e };
+                let end_char = if e > 0 {
+                    if buffer.report.chars().nth(e - 1) == Some('\n') {
+                        e.saturating_sub(1)
+                    } else {
+                        e
+                    }
+                } else {
+                    e
+                };
                 buffer.delete_range(start, end_char);
                 *last_vim_key = None;
                 false
             }
             'C' => {
                 // change to end of line (enter Insert)
-                let start = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                let start = buffer
+                    .caret_char_range
+                    .as_ref()
+                    .map(|r| r.start)
+                    .unwrap_or(0);
                 let (_s, e, _c) = buffer.move_to_line_bounds();
-                let end_char = if e > 0 { if buffer.report.chars().nth(e - 1) == Some('\n') { e.saturating_sub(1) } else { e } } else { e };
+                let end_char = if e > 0 {
+                    if buffer.report.chars().nth(e - 1) == Some('\n') {
+                        e.saturating_sub(1)
+                    } else {
+                        e
+                    }
+                } else {
+                    e
+                };
                 buffer.start_undo_group();
                 buffer.delete_range(start, end_char);
                 *last_vim_key = None;
@@ -1016,7 +1410,11 @@ impl ReportBuffer {
                 // If in Visual mode (char or line), delete the selected range instead of a single char
                 if *vim_mode == crate::VimMode::Visual || *vim_mode == crate::VimMode::VisualLine {
                     if let Some(anchor) = visual_anchor.take() {
-                        let cur = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                        let cur = buffer
+                            .caret_char_range
+                            .as_ref()
+                            .map(|r| r.start)
+                            .unwrap_or(0);
                         if *vim_mode == crate::VimMode::VisualLine {
                             let (as_, ae) = buffer.line_bounds_at(anchor);
                             let (cs, ce) = buffer.line_bounds_at(cur);
@@ -1037,11 +1435,25 @@ impl ReportBuffer {
                 *last_vim_key = None;
                 false
             }
+            'p' => {
+                buffer.paste_after();
+                *last_vim_key = None;
+                false
+            }
+            'P' => {
+                buffer.paste_before();
+                *last_vim_key = None;
+                false
+            }
             'd' => {
                 // If we're in Visual mode (char or line), "d" should delete the visual selection.
                 if *vim_mode == crate::VimMode::Visual || *vim_mode == crate::VimMode::VisualLine {
                     if let Some(anchor) = visual_anchor.take() {
-                        let cur = buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                        let cur = buffer
+                            .caret_char_range
+                            .as_ref()
+                            .map(|r| r.start)
+                            .unwrap_or(0);
                         if *vim_mode == crate::VimMode::VisualLine {
                             let (as_, ae) = buffer.line_bounds_at(anchor);
                             let (cs, ce) = buffer.line_bounds_at(cur);
@@ -1071,12 +1483,71 @@ impl ReportBuffer {
                 }
                 false
             }
+            'y' => {
+                // Visual yanks selection and returns to Normal mode.
+                if *vim_mode == crate::VimMode::Visual || *vim_mode == crate::VimMode::VisualLine {
+                    if let Some(anchor) = visual_anchor.take() {
+                        let cur = buffer
+                            .caret_char_range
+                            .as_ref()
+                            .map(|r| r.start)
+                            .unwrap_or(0);
+                        if *vim_mode == crate::VimMode::VisualLine {
+                            let (as_, ae) = buffer.line_bounds_at(anchor);
+                            let (cs, ce) = buffer.line_bounds_at(cur);
+                            let s = as_.min(cs);
+                            let e = ae.max(ce).min(buffer.char_len());
+                            buffer.yank_range(s, e, true);
+                        } else {
+                            let s = anchor.min(cur);
+                            // Visual char mode is inclusive in Vim, so convert
+                            // to an end-exclusive range by adding one.
+                            let e = anchor
+                                .max(cur)
+                                .min(buffer.char_len())
+                                .saturating_add(1)
+                                .min(buffer.char_len());
+                            buffer.yank_range(s, e, false);
+                        }
+                        *last_vim_key = None;
+                        *vim_mode = crate::VimMode::Normal;
+                        buffer.set_caret_pos(cur.min(buffer.char_len()));
+                        return false;
+                    }
+                }
+
+                if *last_vim_key == Some('y') {
+                    // yy / Nyy: yank whole lines
+                    let count = last_vim_count.take().unwrap_or(1);
+                    let start = buffer.move_to_line_bounds().0;
+                    let chars: Vec<char> = buffer.report.chars().collect();
+                    let n = chars.len();
+                    let mut end = start;
+                    let mut lines_yanked = 0usize;
+                    while end < n && lines_yanked < count {
+                        if let Some(pos) = chars[end..].iter().position(|&c| c == '\n') {
+                            end = end + pos + 1;
+                        } else {
+                            end = n;
+                        }
+                        lines_yanked += 1;
+                    }
+                    buffer.yank_range(start, end, true);
+                    *last_vim_key = None;
+                } else {
+                    *last_vim_key = Some('y');
+                }
+                false
+            }
             'c' => {
                 // operator-pending: wait for next motion (handled in motion arms)
                 *last_vim_key = Some('c');
                 false
             }
-            _ => { *last_vim_key = None; false }
+            _ => {
+                *last_vim_key = None;
+                false
+            }
         }
     }
     pub fn get_caret_line_number(&self) -> usize {
@@ -1187,7 +1658,15 @@ mod tests {
         let mut count = None;
         let mut obj: Option<char> = None;
         let mut anchor: Option<usize> = None;
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'a');
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'a',
+        );
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, 1);
     }
 
@@ -1201,8 +1680,14 @@ mod tests {
         let (_s, e, _c) = b.move_to_line_bounds();
         let expected = if e > 0 {
             let prev = b.report.chars().nth(e - 1);
-            if prev == Some('\n') { e.saturating_sub(1) } else { e }
-        } else { e };
+            if prev == Some('\n') {
+                e.saturating_sub(1)
+            } else {
+                e
+            }
+        } else {
+            e
+        };
         b.append_at_end_of_line();
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, expected);
     }
@@ -1221,7 +1706,15 @@ mod tests {
         let mut count = None;
         let mut obj: Option<char> = None;
         let mut anchor: Option<usize> = None;
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'I');
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'I',
+        );
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, s);
     }
 
@@ -1235,15 +1728,29 @@ mod tests {
         let (_, e, _) = b.move_to_line_bounds();
         let insert_pos = if e > 0 {
             let prev = b.report.chars().nth(e - 1);
-            if prev == Some('\n') { e.saturating_sub(1) } else { e }
-        } else { e };
+            if prev == Some('\n') {
+                e.saturating_sub(1)
+            } else {
+                e
+            }
+        } else {
+            e
+        };
         // Use the shared Normal-mode handler so tests match runtime behavior
         let mut mode = crate::VimMode::Normal;
         let mut last = None;
         let mut count = None;
         let mut obj: Option<char> = None;
         let mut anchor: Option<usize> = None;
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'o');
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'o',
+        );
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, insert_pos + 1);
     }
 
@@ -1259,7 +1766,7 @@ mod tests {
         b.open_line_above();
         let new_line = b.get_caret_line_number();
         assert_eq!(new_line, start_line); // still on the same line number because we inserted above
-        // caret should be at the start of the newly inserted blank line
+                                          // caret should be at the start of the newly inserted blank line
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, s);
     }
 
@@ -1277,7 +1784,15 @@ mod tests {
         let mut obj: Option<char> = None;
         let mut anchor: Option<usize> = None;
         let prev = b.report.clone();
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'o');
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'o',
+        );
 
         // simulate typing in Insert mode (TextEdit would normally do this)
         b.insert_at_caret("hello");
@@ -1309,8 +1824,24 @@ mod tests {
         let mut obj: Option<char> = None;
         let mut anchor: Option<usize> = None;
         let prev = b.report.clone();
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'w');
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'd',
+        );
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'w',
+        );
 
         assert_eq!(b.report, "one three");
 
@@ -1334,8 +1865,24 @@ mod tests {
         let mut anchor: Option<usize> = None;
         let prev = b.report.clone();
 
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'c');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'w');
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'c',
+        );
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'w',
+        );
 
         // now in Insert mode; simulate typing
         b.insert_at_caret("X");
@@ -1364,8 +1911,24 @@ mod tests {
         let mut anchor: Option<usize> = None;
         let prev = b.report.clone();
 
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'd',
+        );
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'd',
+        );
 
         assert_eq!(b.report, "a\nc");
 
@@ -1388,8 +1951,24 @@ mod tests {
         let mut obj: Option<char> = None;
         let mut anchor: Option<usize> = None;
         // '3h' should move left 3 chars
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, '3');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'h');
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            '3',
+        );
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'h',
+        );
         assert_eq!(b.caret_char_range.as_ref().unwrap().start, 2);
     }
 
@@ -1404,9 +1983,33 @@ mod tests {
         let mut count = None;
         let mut obj: Option<char> = None;
         let mut anchor: Option<usize> = None;
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, '3');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'w');
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            '3',
+        );
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'd',
+        );
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'w',
+        );
 
         assert_eq!(b.report, "one five");
     }
@@ -1424,9 +2027,33 @@ mod tests {
         let mut anchor: Option<usize> = None;
         let prev = b.report.clone();
 
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, '2');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'c');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'w');
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            '2',
+        );
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'c',
+        );
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'w',
+        );
 
         // in Insert mode now; simulate typing
         b.insert_at_caret("X");
@@ -1453,9 +2080,33 @@ mod tests {
         let mut obj: Option<char> = None;
 
         let mut anchor: Option<usize> = None;
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, '3');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            '3',
+        );
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'd',
+        );
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'd',
+        );
 
         // expect lines b,c,d removed -> remaining a\ne\nf
         assert_eq!(b.report, "a\ne\nf");
@@ -1476,15 +2127,39 @@ mod tests {
         // d$ should delete to EOL
         let mut obj: Option<char> = None;
         let mut anchor: Option<usize> = None;
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, '$');
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'd',
+        );
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            '$',
+        );
         assert_eq!(b.report, "hello \nnext line");
 
         b.undo();
         assert_eq!(b.report, prev);
 
         // now test C (change to end of line) grouped
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'C');
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'C',
+        );
         // simulate typing
         b.insert_at_caret("X");
         b.end_undo_group();
@@ -1509,9 +2184,33 @@ mod tests {
         let mut anchor: Option<usize> = None;
 
         // perform 'd' 'i' 'w'
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'i');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'w');
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'd',
+        );
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'i',
+        );
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'w',
+        );
 
         // expect only the word 'two' removed, surrounding spaces preserved
         assert_eq!(b.report, "one    three");
@@ -1531,9 +2230,33 @@ mod tests {
         let mut anchor: Option<usize> = None;
 
         // perform 'd' 'a' 'w'
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'a');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'w');
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'd',
+        );
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'a',
+        );
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'w',
+        );
 
         // expect the word and adjacent whitespace to be removed (current behavior preserves one space on each side)
         assert_eq!(b.report, "one  three");
@@ -1553,15 +2276,47 @@ mod tests {
         let mut anchor: Option<usize> = None;
 
         // enter visual mode
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'v');
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'v',
+        );
         assert_eq!(mode, crate::VimMode::Visual);
 
         // move right twice (two 'l' motions)
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'l');
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'l');
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'l',
+        );
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'l',
+        );
 
         // now delete selection with 'd' (should remove indices 1..3 -> 'b','c')
-        ReportBuffer::handle_normal_key(&mut b, &mut mode, &mut last, &mut obj, &mut count, &mut anchor, 'd');
+        ReportBuffer::handle_normal_key(
+            &mut b,
+            &mut mode,
+            &mut last,
+            &mut obj,
+            &mut count,
+            &mut anchor,
+            'd',
+        );
 
         assert_eq!(b.report, "adef");
         assert_eq!(mode, crate::VimMode::Normal);

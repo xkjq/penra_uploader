@@ -8,7 +8,10 @@ use std::thread;
 pub type SharedWriters = Arc<Mutex<Vec<Arc<Mutex<TcpStream>>>>>;
 
 fn handle_stream(stream: TcpStream, tx: Sender<String>, writers: SharedWriters) {
-    let writer = Arc::new(Mutex::new(stream.try_clone().unwrap_or_else(|_| stream.try_clone().unwrap_or_else(|_| panic!()))));
+    let writer =
+        Arc::new(Mutex::new(stream.try_clone().unwrap_or_else(|_| {
+            stream.try_clone().unwrap_or_else(|_| panic!())
+        })));
     // store writer
     {
         let mut w = writers.lock().unwrap();

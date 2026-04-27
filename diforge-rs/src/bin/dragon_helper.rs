@@ -1,7 +1,7 @@
 use std::env;
+use std::io::Write;
 use std::io::{self, Read};
 use std::net::TcpStream;
-use std::io::Write;
 
 fn main() {
     // Usage: dragon_helper [text]

@@ -1,5 +1,5 @@
-use crossbeam_channel::Sender;
 use anyhow::Result;
+use crossbeam_channel::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -18,12 +18,16 @@ pub struct DummyEngine {
 
 impl DummyEngine {
     pub fn new() -> Self {
-        Self { running: Arc::new(Mutex::new(false)) }
+        Self {
+            running: Arc::new(Mutex::new(false)),
+        }
     }
 }
 
 impl SpeechEngine for DummyEngine {
-    fn name(&self) -> &str { "dummy" }
+    fn name(&self) -> &str {
+        "dummy"
+    }
 
     fn start(&mut self, tx: Sender<String>) -> Result<()> {
         let running = self.running.clone();
@@ -49,15 +53,15 @@ impl SpeechEngine for DummyEngine {
 #[cfg(feature = "vosk")]
 mod vosk_impl {
     use super::SpeechEngine;
+    use anyhow::{anyhow, Result};
     use crossbeam_channel::Sender;
-    use anyhow::{Result, anyhow};
     use std::sync::{Arc, Mutex};
     use std::thread;
 
-    use cpal::traits::{HostTrait, DeviceTrait, StreamTrait};
-    use cpal::{SampleFormat, StreamConfig, BufferSize};
-    use vosk::{Model, Recognizer, DecodingState};
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::{BufferSize, SampleFormat, StreamConfig};
     use serde_json;
+    use vosk::{DecodingState, Model, Recognizer};
 
     pub struct VoskEngine {
         running: Arc<Mutex<bool>>,
@@ -73,12 +77,17 @@ mod vosk_impl {
             }
             // Defer actual model loading to the start() method so creating the engine
             // doesn't fail on missing audio device at construction time.
-            Ok(Self { running: Arc::new(Mutex::new(false)), model_path: model_path.to_string() })
+            Ok(Self {
+                running: Arc::new(Mutex::new(false)),
+                model_path: model_path.to_string(),
+            })
         }
     }
 
     impl SpeechEngine for VoskEngine {
-        fn name(&self) -> &str { "vosk" }
+        fn name(&self) -> &str {
+            "vosk"
+        }
 
         fn start(&mut self, tx: Sender<String>) -> Result<()> {
             let model_path = self.model_path.clone();
@@ -91,7 +100,10 @@ mod vosk_impl {
                 let model = match Model::new(&model_path) {
                     Some(m) => m,
                     None => {
-                        let _ = tx.send(format!("vosk model load error: failed to open model at {}", model_path));
+                        let _ = tx.send(format!(
+                            "vosk model load error: failed to open model at {}",
+                            model_path
+                        ));
                         return;
                     }
                 };
@@ -100,9 +112,13 @@ mod vosk_impl {
                 let mut host_ids: Vec<cpal::HostId> = cpal::available_hosts().into_iter().collect();
                 host_ids.sort_by_key(|h| {
                     let s = format!("{:?}", h);
-                    if s.contains("Pulse") || s.contains("PipeWire") { 0 }
-                    else if s.contains("Alsa") { 1 }
-                    else { 2 }
+                    if s.contains("Pulse") || s.contains("PipeWire") {
+                        0
+                    } else if s.contains("Alsa") {
+                        1
+                    } else {
+                        2
+                    }
                 });
 
                 let mut stream_opt: Option<cpal::Stream> = None;
@@ -124,7 +140,11 @@ mod vosk_impl {
                         // Move devices with names like "plughw:" or starting with "hw:" to the front
                         candidates.sort_by_key(|d| {
                             let n = d.name().unwrap_or_default().to_lowercase();
-                            if n.contains("plughw") || n.contains("hw:") { 0 } else { 1 }
+                            if n.contains("plughw") || n.contains("hw:") {
+                                0
+                            } else {
+                                1
+                            }
                         });
 
                         for dev in candidates.into_iter() {
@@ -135,29 +155,59 @@ mod vosk_impl {
                             match dev.supported_input_configs() {
                                 Ok(mut it) => {
                                     while let Some(sup) = it.next() {
-                                        let ranges = format!("min_rate={} max_rate={} channels={} fmt={:?}",
-                                            sup.min_sample_rate().0, sup.max_sample_rate().0, sup.channels(), sup.sample_format());
-                                        let _ = tx.send(format!("[dbg] supported: {} on {}", ranges, dev_name));
+                                        let ranges = format!(
+                                            "min_rate={} max_rate={} channels={} fmt={:?}",
+                                            sup.min_sample_rate().0,
+                                            sup.max_sample_rate().0,
+                                            sup.channels(),
+                                            sup.sample_format()
+                                        );
+                                        let _ = tx.send(format!(
+                                            "[dbg] supported: {} on {}",
+                                            ranges, dev_name
+                                        ));
                                     }
                                 }
-                                Err(e) => { let _ = tx.send(format!("[dbg] supported_input_configs() error for {}: {}", dev_name, e)); }
+                                Err(e) => {
+                                    let _ = tx.send(format!(
+                                        "[dbg] supported_input_configs() error for {}: {}",
+                                        dev_name, e
+                                    ));
+                                }
                             }
 
                             let cfg = match dev.default_input_config() {
                                 Ok(c) => c,
-                                Err(e) => { let _ = tx.send(format!("[dbg] device {} config error: {}", dev_name, e)); continue; }
+                                Err(e) => {
+                                    let _ = tx.send(format!(
+                                        "[dbg] device {} config error: {}",
+                                        dev_name, e
+                                    ));
+                                    continue;
+                                }
                             };
 
                             let sample_rate = cfg.sample_rate().0 as f32;
 
                             let recognizer = match Recognizer::new(&model, sample_rate) {
                                 Some(r) => r,
-                                None => { let _ = tx.send(format!("[dbg] recognizer create failed for {}", dev_name)); continue; }
+                                None => {
+                                    let _ = tx.send(format!(
+                                        "[dbg] recognizer create failed for {}",
+                                        dev_name
+                                    ));
+                                    continue;
+                                }
                             };
                             let recognizer = Arc::new(Mutex::new(recognizer));
 
                             // Try a few buffer sizes in case defaults hit ALSA POLLERR
-                            let buffer_options = vec![BufferSize::Default, BufferSize::Fixed(512), BufferSize::Fixed(1024), BufferSize::Fixed(2048)];
+                            let buffer_options = vec![
+                                BufferSize::Default,
+                                BufferSize::Fixed(512),
+                                BufferSize::Fixed(1024),
+                                BufferSize::Fixed(2048),
+                            ];
                             let mut succeeded = false;
                             for buf in buffer_options.into_iter() {
                                 let stream_config = StreamConfig {
@@ -175,25 +225,46 @@ mod vosk_impl {
                                             &stream_config,
                                             move |data: &[f32], _| {
                                                 let mut rec = r2.lock().unwrap();
-                                                let buf: Vec<i16> = data.iter().map(|&s| (s * i16::MAX as f32) as i16).collect();
+                                                let buf: Vec<i16> = data
+                                                    .iter()
+                                                    .map(|&s| (s * i16::MAX as f32) as i16)
+                                                    .collect();
                                                 match rec.accept_waveform(&buf) {
                                                     Ok(state) => match state {
                                                         DecodingState::Finalized => {
                                                             let finalr = rec.final_result();
-                                                            let s = serde_json::to_string(&finalr).unwrap_or_default();
-                                                            if !s.is_empty() { let _ = data_tx.send(s); }
+                                                            let s = serde_json::to_string(&finalr)
+                                                                .unwrap_or_default();
+                                                            if !s.is_empty() {
+                                                                let _ = data_tx.send(s);
+                                                            }
                                                         }
                                                         DecodingState::Running => {
                                                             let partial = rec.partial_result();
-                                                            let s = serde_json::to_string(&partial).unwrap_or_default();
-                                                            if !s.is_empty() { let _ = data_tx.send(s); }
+                                                            let s = serde_json::to_string(&partial)
+                                                                .unwrap_or_default();
+                                                            if !s.is_empty() {
+                                                                let _ = data_tx.send(s);
+                                                            }
                                                         }
-                                                        DecodingState::Failed => { let _ = data_tx.send("decoding failed".to_string()); }
+                                                        DecodingState::Failed => {
+                                                            let _ = data_tx.send(
+                                                                "decoding failed".to_string(),
+                                                            );
+                                                        }
                                                     },
-                                                    Err(e) => { let _ = data_tx.send(format!("accept_waveform error: {}", e)); }
+                                                    Err(e) => {
+                                                        let _ = data_tx.send(format!(
+                                                            "accept_waveform error: {}",
+                                                            e
+                                                        ));
+                                                    }
                                                 }
                                             },
-                                            move |err| { let _ = err_tx.send(format!("audio input error: {:?}", err)); },
+                                            move |err| {
+                                                let _ = err_tx
+                                                    .send(format!("audio input error: {:?}", err));
+                                            },
                                             None,
                                         )
                                     }
@@ -209,20 +280,38 @@ mod vosk_impl {
                                                     Ok(state) => match state {
                                                         DecodingState::Finalized => {
                                                             let finalr = rec.final_result();
-                                                            let s = serde_json::to_string(&finalr).unwrap_or_default();
-                                                            if !s.is_empty() { let _ = data_tx.send(s); }
+                                                            let s = serde_json::to_string(&finalr)
+                                                                .unwrap_or_default();
+                                                            if !s.is_empty() {
+                                                                let _ = data_tx.send(s);
+                                                            }
                                                         }
                                                         DecodingState::Running => {
                                                             let partial = rec.partial_result();
-                                                            let s = serde_json::to_string(&partial).unwrap_or_default();
-                                                            if !s.is_empty() { let _ = data_tx.send(s); }
+                                                            let s = serde_json::to_string(&partial)
+                                                                .unwrap_or_default();
+                                                            if !s.is_empty() {
+                                                                let _ = data_tx.send(s);
+                                                            }
                                                         }
-                                                        DecodingState::Failed => { let _ = data_tx.send("decoding failed".to_string()); }
+                                                        DecodingState::Failed => {
+                                                            let _ = data_tx.send(
+                                                                "decoding failed".to_string(),
+                                                            );
+                                                        }
                                                     },
-                                                    Err(e) => { let _ = data_tx.send(format!("accept_waveform error: {}", e)); }
+                                                    Err(e) => {
+                                                        let _ = data_tx.send(format!(
+                                                            "accept_waveform error: {}",
+                                                            e
+                                                        ));
+                                                    }
                                                 }
                                             },
-                                            move |err| { let _ = err_tx.send(format!("audio input error: {:?}", err)); },
+                                            move |err| {
+                                                let _ = err_tx
+                                                    .send(format!("audio input error: {:?}", err));
+                                            },
                                             None,
                                         )
                                     }
@@ -233,53 +322,96 @@ mod vosk_impl {
                                         dev.build_input_stream(
                                             &stream_config,
                                             move |data: &[u16], _| {
-                                                let buf: Vec<i16> = data.iter().map(|&s| (s as i32 - 32768) as i16).collect();
+                                                let buf: Vec<i16> = data
+                                                    .iter()
+                                                    .map(|&s| (s as i32 - 32768) as i16)
+                                                    .collect();
                                                 let mut rec = r2.lock().unwrap();
                                                 match rec.accept_waveform(&buf) {
                                                     Ok(state) => match state {
                                                         DecodingState::Finalized => {
                                                             let finalr = rec.final_result();
-                                                            let s = serde_json::to_string(&finalr).unwrap_or_default();
-                                                            if !s.is_empty() { let _ = data_tx.send(s); }
+                                                            let s = serde_json::to_string(&finalr)
+                                                                .unwrap_or_default();
+                                                            if !s.is_empty() {
+                                                                let _ = data_tx.send(s);
+                                                            }
                                                         }
                                                         DecodingState::Running => {
                                                             let partial = rec.partial_result();
-                                                            let s = serde_json::to_string(&partial).unwrap_or_default();
-                                                            if !s.is_empty() { let _ = data_tx.send(s); }
+                                                            let s = serde_json::to_string(&partial)
+                                                                .unwrap_or_default();
+                                                            if !s.is_empty() {
+                                                                let _ = data_tx.send(s);
+                                                            }
                                                         }
-                                                        DecodingState::Failed => { let _ = data_tx.send("decoding failed".to_string()); }
+                                                        DecodingState::Failed => {
+                                                            let _ = data_tx.send(
+                                                                "decoding failed".to_string(),
+                                                            );
+                                                        }
                                                     },
-                                                    Err(e) => { let _ = data_tx.send(format!("accept_waveform error: {}", e)); }
+                                                    Err(e) => {
+                                                        let _ = data_tx.send(format!(
+                                                            "accept_waveform error: {}",
+                                                            e
+                                                        ));
+                                                    }
                                                 }
                                             },
-                                            move |err| { let _ = err_tx.send(format!("audio input error: {:?}", err)); },
+                                            move |err| {
+                                                let _ = err_tx
+                                                    .send(format!("audio input error: {:?}", err));
+                                            },
                                             None,
                                         )
                                     }
-                                    _ => { let _ = tx.send("unsupported sample format".to_string()); continue; }
+                                    _ => {
+                                        let _ = tx.send("unsupported sample format".to_string());
+                                        continue;
+                                    }
                                 };
 
                                 match attempt {
-                                    Ok(s) => {
-                                        match s.play() {
-                                            Ok(()) => { stream_opt = Some(s); succeeded = true; break; }
-                                            Err(e) => { let _ = tx.send(format!("[dbg] play failed on {} buf={:?}: {}", dev_name, buf, e)); }
+                                    Ok(s) => match s.play() {
+                                        Ok(()) => {
+                                            stream_opt = Some(s);
+                                            succeeded = true;
+                                            break;
                                         }
+                                        Err(e) => {
+                                            let _ = tx.send(format!(
+                                                "[dbg] play failed on {} buf={:?}: {}",
+                                                dev_name, buf, e
+                                            ));
+                                        }
+                                    },
+                                    Err(e) => {
+                                        let _ = tx.send(format!(
+                                            "[dbg] build_input_stream failed on {} buf={:?}: {:?}",
+                                            dev_name, buf, e
+                                        ));
                                     }
-                                    Err(e) => { let _ = tx.send(format!("[dbg] build_input_stream failed on {} buf={:?}: {:?}", dev_name, buf, e)); }
                                 }
                             }
 
-                            if succeeded { break; }
+                            if succeeded {
+                                break;
+                            }
                         }
 
-                        if stream_opt.is_some() { break; }
+                        if stream_opt.is_some() {
+                            break;
+                        }
                     }
                 }
 
                 let stream = match stream_opt {
                     Some(s) => s,
-                    None => { let _ = tx.send("failed to open any input stream".to_string()); return; }
+                    None => {
+                        let _ = tx.send("failed to open any input stream".to_string());
+                        return;
+                    }
                 };
 
                 while *running.lock().unwrap() {
@@ -306,7 +438,7 @@ mod vosk_impl {
 
 #[cfg(not(feature = "vosk"))]
 mod vosk_impl {
-    use super::{SpeechEngine, DummyEngine};
+    use super::{DummyEngine, SpeechEngine};
     use anyhow::Result;
 
     pub fn create_vosk_engine(_model_path: &str) -> Result<Box<dyn SpeechEngine>> {
@@ -317,4 +449,3 @@ mod vosk_impl {
 }
 
 pub use vosk_impl::create_vosk_engine;
- 

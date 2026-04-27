@@ -9,12 +9,17 @@ mod windows_impl {
     use std::thread;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-    use windows::Win32::UI::Controls::{CreateWindowExW, EDIT_CLASSW, ES_MULTILINE, ES_AUTOVSCROLL, ES_WANTRETURN};
+    use windows::Win32::UI::Controls::{
+        CreateWindowExW, EDIT_CLASSW, ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN,
+    };
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     fn to_wstring(s: &str) -> Vec<u16> {
         use std::os::windows::ffi::OsStrExt;
-        std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
 
     pub fn run() {
@@ -91,10 +96,15 @@ mod windows_impl {
                                         if let Some(cmd) = v.get("cmd").and_then(|c| c.as_str()) {
                                             match cmd {
                                                 "show_overlay" | "set_text" => {
-                                                    if let Some(t) = v.get("text").and_then(|tt| tt.as_str()) {
+                                                    if let Some(t) =
+                                                        v.get("text").and_then(|tt| tt.as_str())
+                                                    {
                                                         let w = to_wstring(t);
                                                         unsafe {
-                                                            SetWindowTextW(hwnd_edit, PCWSTR(w.as_ptr()));
+                                                            SetWindowTextW(
+                                                                hwnd_edit,
+                                                                PCWSTR(w.as_ptr()),
+                                                            );
                                                         }
                                                     }
                                                 }
@@ -102,12 +112,36 @@ mod windows_impl {
                                                     ShowWindow(hwnd, SW_HIDE);
                                                 },
                                                 "set_overlay_position" => {
-                                                    let x = v.get("x").and_then(|n| n.as_i64()).unwrap_or(0) as i32;
-                                                    let y = v.get("y").and_then(|n| n.as_i64()).unwrap_or(0) as i32;
-                                                    let w = v.get("w").and_then(|n| n.as_i64()).unwrap_or(600) as i32;
-                                                    let h = v.get("h").and_then(|n| n.as_i64()).unwrap_or(200) as i32;
+                                                    let x = v
+                                                        .get("x")
+                                                        .and_then(|n| n.as_i64())
+                                                        .unwrap_or(0)
+                                                        as i32;
+                                                    let y = v
+                                                        .get("y")
+                                                        .and_then(|n| n.as_i64())
+                                                        .unwrap_or(0)
+                                                        as i32;
+                                                    let w = v
+                                                        .get("w")
+                                                        .and_then(|n| n.as_i64())
+                                                        .unwrap_or(600)
+                                                        as i32;
+                                                    let h = v
+                                                        .get("h")
+                                                        .and_then(|n| n.as_i64())
+                                                        .unwrap_or(200)
+                                                        as i32;
                                                     unsafe {
-                                                        SetWindowPos(hwnd, HWND(0), x, y, w, h, SWP_NOZORDER);
+                                                        SetWindowPos(
+                                                            hwnd,
+                                                            HWND(0),
+                                                            x,
+                                                            y,
+                                                            w,
+                                                            h,
+                                                            SWP_NOZORDER,
+                                                        );
                                                     }
                                                 }
                                                 _ => {}

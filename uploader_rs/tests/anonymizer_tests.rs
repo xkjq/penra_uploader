@@ -6,8 +6,31 @@ use std::process::Command;
 fn find_first_dcm() -> Option<PathBuf> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let base = manifest.join("../test_dicoms");
+    // Ensure a test_dicoms directory exists; if missing, create a minimal DICOM
+    // fixture so tests can run in fresh checkouts.
     if !base.exists() {
-        return None;
+        if let Err(e) = std::fs::create_dir_all(&base) {
+            eprintln!("Failed to create test_dicoms dir: {}", e);
+            return None;
+        }
+        // create a minimal DICOM file
+        use dicom_object::{InMemDicomObject, FileMetaTableBuilder, Tag};
+        use dicom_core::header::VR;
+        const EXPLICIT_VR_LE_UID: &str = "1.2.840.10008.1.2.1";
+        let fixture_path = base.join("p01_s01_s01_i01.dcm");
+        let mut obj = InMemDicomObject::new_empty();
+        let _ = obj.put_str(Tag(0x0008, 0x0016), VR::UI, "1.2.840.10008.5.1.4.1.1.1");
+        let _ = obj.put_str(Tag(0x0008, 0x0018), VR::UI, "2.25.1000000");
+        let _ = obj.put_str(Tag(0x0010, 0x0010), VR::PN, "Test^Patient");
+        let file_obj = obj.with_meta(
+            FileMetaTableBuilder::new()
+                .transfer_syntax(EXPLICIT_VR_LE_UID)
+                .media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.1")
+                .media_storage_sop_instance_uid("2.25.1000000"),
+        );
+        if let Ok(fm) = file_obj {
+            let _ = fm.write_to_file(&fixture_path);
+        }
     }
     let mut stack = vec![base];
     while let Some(p) = stack.pop() {

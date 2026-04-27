@@ -29,6 +29,10 @@ use tracing_subscriber::prelude::*;
 
 static FILTER_RELOADER: OnceCell<Box<dyn Fn(EnvFilter) -> Result<(), String> + Send + Sync>> = OnceCell::new();
 
+const MAX_UI_MESSAGES_PER_FRAME: usize = 256;
+const MAX_PROCESSED_MESSAGES: usize = 5_000;
+const LOG_CACHE_REFRESH_INTERVAL: Duration = Duration::from_millis(800);
+
 use once_cell::sync::Lazy;
 use std::sync::mpsc as std_mpsc;
 
@@ -73,16 +77,15 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                     .and_then(|p| p.parent().map(|pp| pp.join("anon")))
                     .unwrap_or_else(|| PathBuf::from("anon"));
 
-                // collect .dcm files recursively from the processing dir
-                let mut dcm_files: Vec<std::path::PathBuf> = Vec::new();
-                let all = upload::collect_files_recursive(&processing_dir);
-                for p in all.into_iter() {
-                    if p.extension().map(|e| e == "dcm").unwrap_or(false) {
-                        dcm_files.push(p);
-                    }
-                }
+                // collect all files recursively from the processing dir and attempt
+                // to anonymize them regardless of extension — the anonymizer will
+                // return an error for non-DICOM files which are logged at debug level.
+                let dcm_files: Vec<std::path::PathBuf> = upload::collect_files_recursive(&processing_dir)
+                    .into_iter()
+                    .filter(|p| p.is_file())
+                    .collect();
                 if dcm_files.is_empty() {
-                    let _ = tx.send("No export dir or no .dcm files found".to_string());
+                    let _ = tx.send("No files found in export dir".to_string());
                 }
 
                 let total = dcm_files.len();
@@ -103,7 +106,8 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                                 }
                             }
                             Err(e) => {
-                                let _ = tx.send(format!("Anon failed {}: {}", p.display(), e));
+                                // Log non-DICOM / unrecognised files quietly; don't flood the UI.
+                                upload::log_rpc_debug(&format!("Anon skipped {}: {}", p.display(), e));
                             }
                         }
                         let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -226,6 +230,9 @@ struct AppState {
     selected_files_for_meta: HashSet<String>,
     metadata_select_mode: bool,
     log_window_open: bool,
+    about_open: bool,
+    // cached logo texture for About window
+    logo_tex: Option<egui::TextureHandle>,
     // import dialog state
     import_dialog_open: bool,
     import_src: Option<PathBuf>,
@@ -237,6 +244,9 @@ struct AppState {
     exit_at: Option<Instant>,
     // in-app toast messages (message, expire_at)
     toasts: Vec<(String, Instant)>,
+    // expanded request/response logs cached for UI windows
+    log_cache: String,
+    log_cache_last_refresh: Option<Instant>,
 }
 
 impl Default for AppState {
@@ -301,6 +311,7 @@ impl Default for AppState {
             selected_files_for_meta: HashSet::new(),
             metadata_select_mode: false,
             log_window_open: false,
+            about_open: false,
             import_dialog_open: false,
             import_src: None,
             login_open: upload::token_username().is_none(),
@@ -308,7 +319,10 @@ impl Default for AppState {
             exit_requested: None,
             exit_at: None,
             toasts: Vec::new(),
+            log_cache: String::new(),
+            log_cache_last_refresh: None,
             log_level: std::env::var("RUST_LOG").ok().or_else(|| upload::load_log_level()).unwrap_or_else(|| "info".to_string()),
+            logo_tex: None,
         }
     }
 }
@@ -317,6 +331,50 @@ impl AppState {
     fn add_toast(&mut self, msg: String, duration_ms: u64) {
         let expire = Instant::now() + Duration::from_millis(duration_ms);
         self.toasts.push((msg, expire));
+    }
+
+    fn trim_processed_messages(&mut self) {
+        if self.processed.len() > MAX_PROCESSED_MESSAGES {
+            let overflow = self.processed.len() - MAX_PROCESSED_MESSAGES;
+            self.processed.drain(0..overflow);
+        }
+    }
+
+    fn refresh_log_cache(&mut self, force: bool) {
+        let now = Instant::now();
+        if !force {
+            if let Some(last) = self.log_cache_last_refresh {
+                if now.saturating_duration_since(last) < LOG_CACHE_REFRESH_INTERVAL {
+                    return;
+                }
+            }
+        }
+
+        let p = upload::log_file_path();
+        let contents = std::fs::read_to_string(&p).unwrap_or_else(|_| "(no logs)".to_string());
+        let mut display = String::new();
+        for line in contents.lines() {
+            display.push_str(line);
+            display.push('\n');
+            if let Some(idx) = line.find("BODY_FILE:") {
+                let path = line[idx + "BODY_FILE:".len()..].trim();
+                if !path.is_empty() {
+                    if let Ok(body) = std::fs::read_to_string(path) {
+                        display.push_str("---- BODY START ----\n");
+                        display.push_str(&body);
+                        if !body.ends_with('\n') {
+                            display.push('\n');
+                        }
+                        display.push_str("---- BODY END ----\n");
+                    } else {
+                        display.push_str("(failed to read body file)\n");
+                    }
+                }
+            }
+        }
+
+        self.log_cache = display;
+        self.log_cache_last_refresh = Some(now);
     }
 
     fn spawn_login(&mut self, user: String, pass: String) {
@@ -561,6 +619,7 @@ impl AppState {
             }
         } else {
             self.processed.push(m.to_string());
+            self.trim_processed_messages();
             self.last_msg = m.to_string();
         }
     }
@@ -568,6 +627,10 @@ impl AppState {
 
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.log_window_open || self.about_open {
+            self.refresh_log_cache(false);
+        }
+
         // apply visuals based on saved theme
         if self.theme_dark {
             ctx.set_visuals(egui::Visuals::dark());
@@ -580,6 +643,16 @@ impl eframe::App for AppState {
             ui.horizontal(|ui| {
                 ui.heading("Uploader (Rust)");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("About").clicked() {
+                        self.about_open = !self.about_open;
+                        if self.about_open {
+                            self.last_msg = "About opened".to_string();
+                            upload::log_rpc("About opened");
+                        } else {
+                            self.last_msg = "About closed".to_string();
+                            upload::log_rpc("About closed");
+                        }
+                    }
                     if let Some(step) = &self.processing_step {
                         let pct = (self.processing_progress * 100.0).clamp(0.0, 100.0);
                         let label = format!("{} — {:.0}%", step, pct);
@@ -589,7 +662,30 @@ impl eframe::App for AppState {
             });
             ui.separator();
             egui::ScrollArea::vertical().show(ui, |ui| {
-                egui::CollapsingHeader::new("Login").default_open(self.login_open).show(ui, |ui| {
+                let dot_color = if self.logged_in_user.is_some() {
+                    egui::Color32::from_rgb(46, 160, 67)
+                } else {
+                    egui::Color32::from_rgb(220, 38, 38)
+                };
+                let mut login_header = egui::text::LayoutJob::default();
+                login_header.append(
+                    "Login ",
+                    0.0,
+                    egui::TextFormat {
+                        color: ui.visuals().strong_text_color(),
+                        ..Default::default()
+                    },
+                );
+                // Use ASCII 'o' as a status dot to avoid missing-glyph boxes.
+                login_header.append(
+                    "o",
+                    0.0,
+                    egui::TextFormat {
+                        color: dot_color,
+                        ..Default::default()
+                    },
+                );
+                egui::CollapsingHeader::new(login_header).default_open(self.login_open).show(ui, |ui| {
                     let logged_in = self.logged_in_user.clone();
                     if let Some(name) = logged_in {
                         ui.horizontal(|ui| {
@@ -681,7 +777,7 @@ impl eframe::App for AppState {
                         });
 
                         ui.horizontal(|ui| {
-                            ui.label("Extension filter (empty = try all files):");
+                            ui.label("Extension filter (empty = attempt all files as DICOM):");
                             ui.text_edit_singleline(&mut self.ext_filter);
                         });
 
@@ -802,12 +898,22 @@ impl eframe::App for AppState {
                 }
 
             });
-            
             // Temporarily take ownership of the receiver so `handle_message` can
             // mutably borrow `self` while we drain pending messages.
             if let Some(rx) = self.rx.take() {
-                while let Ok(m) = rx.try_recv() {
-                    self.handle_message(&m);
+                let mut drained = 0usize;
+                while drained < MAX_UI_MESSAGES_PER_FRAME {
+                    match rx.try_recv() {
+                        Ok(m) => {
+                            self.handle_message(&m);
+                            drained += 1;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if drained == MAX_UI_MESSAGES_PER_FRAME {
+                    // Keep pumping quickly if there is a backlog without stalling a frame.
+                    ctx.request_repaint();
                 }
                 self.rx = Some(rx);
             }
@@ -1361,57 +1467,46 @@ impl eframe::App for AppState {
 
             // Logs window
             if self.log_window_open {
-                egui::Window::new("Request/Response Logs").open(&mut self.log_window_open).show(ctx, |ui| {
-                    let p = upload::log_file_path();
-                    let contents = std::fs::read_to_string(&p).unwrap_or_else(|_| "(no logs)".to_string());
-                    // expand BODY_FILE entries to inline the saved body contents for easier copy
-                    let mut display = String::new();
-                    for line in contents.lines() {
-                        display.push_str(line);
-                        display.push('\n');
-                        if let Some(idx) = line.find("BODY_FILE:") {
-                            let path = line[idx+"BODY_FILE:".len()..].trim();
-                            if !path.is_empty() {
-                                if let Ok(body) = std::fs::read_to_string(path) {
-                                    display.push_str("---- BODY START ----\n");
-                                    display.push_str(&body);
-                                    if !body.ends_with('\n') { display.push('\n'); }
-                                    display.push_str("---- BODY END ----\n");
-                                } else {
-                                    display.push_str("(failed to read body file)\n");
-                                }
-                            }
-                        }
-                    }
-                    let mut txt = display;
+                let mut log_open = self.log_window_open;
+                let mut do_refresh_logs = false;
+                let mut do_clear_logs = false;
+                egui::Window::new("Request/Response Logs").open(&mut log_open).show(ctx, |ui| {
+                    let mut txt = self.log_cache.clone();
                     egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
                         ui.add(egui::TextEdit::multiline(&mut txt).desired_rows(20).desired_width(ui.available_width()));
                     });
                     ui.horizontal(|ui| {
                         if ui.button("Refresh").clicked() {
-                            // force UI to re-open (content read each frame, so nothing else required)
-                            self.last_msg = "Logs refreshed".to_string();
+                            do_refresh_logs = true;
                         }
                         if ui.button("Clear").clicked() {
-                            let _ = std::fs::write(p.clone(), "");
-                            self.last_msg = "Logs cleared".to_string();
+                            do_clear_logs = true;
                         }
                     });
                 });
+                self.log_window_open = log_open;
+                if do_clear_logs {
+                    let _ = std::fs::write(upload::log_file_path(), "");
+                    self.refresh_log_cache(true);
+                    self.last_msg = "Logs cleared".to_string();
+                } else if do_refresh_logs {
+                    self.refresh_log_cache(true);
+                    self.last_msg = "Logs refreshed".to_string();
+                }
             }
 
             // Metadata compare window (side-by-side)
             if self.metadata_compare_open {
-                let comps = self.metadata_compare.clone();
-                egui::Window::new("Compare metadata").open(&mut self.metadata_compare_open).show(ctx, |ui| {
-                    if comps.is_empty() {
+                let mut compare_open = self.metadata_compare_open;
+                egui::Window::new("Compare metadata").open(&mut compare_open).show(ctx, |ui| {
+                    if self.metadata_compare.is_empty() {
                         ui.label("No files to compare");
                         return;
                     }
                     // build union of keys
                     let mut keys: Vec<String> = Vec::new();
                     let mut keyset: HashSet<String> = HashSet::new();
-                    for (_name, map) in &comps {
+                    for (_name, map) in &self.metadata_compare {
                         for k in map.keys() {
                             if !keyset.contains(k) { keyset.insert(k.clone()); keys.push(k.clone()); }
                         }
@@ -1419,7 +1514,7 @@ impl eframe::App for AppState {
                     // header row
                     ui.horizontal(|ui| {
                         ui.label("");
-                        for (name, _map) in &comps {
+                        for (name, _map) in &self.metadata_compare {
                             ui.label(name);
                         }
                     });
@@ -1430,7 +1525,7 @@ impl eframe::App for AppState {
                                 ui.label(k);
                                 // collect values for this key
                                 let mut vals: Vec<Option<String>> = Vec::new();
-                                for (_name, map) in &comps {
+                                for (_name, map) in &self.metadata_compare {
                                     vals.push(map.get(k).cloned());
                                 }
                                 // detect differences
@@ -1455,9 +1550,80 @@ impl eframe::App for AppState {
                         }
                     });
                 });
+                self.metadata_compare_open = compare_open;
             }
             });
         });
+
+        // About window rendered after central panel to ensure it's not hidden by layout
+        if self.about_open {
+            // load logo texture once when needed
+            if self.logo_tex.is_none() {
+                if let Ok(img) = image::load_from_memory(include_bytes!("../assets/generated/uploade-rs_logo_128.png")) {
+                    let img = img.to_rgba8();
+                    let size = [img.width() as usize, img.height() as usize];
+                    let pixels: Vec<egui::Color32> = img
+                        .chunks(4)
+                        .map(|px| egui::Color32::from_rgba_unmultiplied(px[0], px[1], px[2], px[3]))
+                        .collect();
+                    let mut raw: Vec<u8> = Vec::with_capacity(pixels.len() * 4);
+                    for c in &pixels {
+                        raw.push(c.r()); raw.push(c.g()); raw.push(c.b()); raw.push(c.a());
+                    }
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &raw);
+                    let handle = ctx.load_texture("about_logo", color_image, egui::TextureOptions::default());
+                    self.logo_tex = Some(handle);
+                } else {
+                    tracing::warn!("Failed to load about logo image");
+                }
+            }
+
+            let mut about_open = self.about_open;
+            let mut do_refresh_logs = false;
+            let mut do_clear_logs = false;
+            egui::Window::new("About Uploader")
+                .open(&mut about_open)
+                .anchor(egui::Align2::RIGHT_TOP, egui::Vec2::new(-10.0, 40.0))
+                .default_size(egui::vec2(600.0, 400.0))
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if let Some(tex) = &self.logo_tex {
+                            let sz = egui::vec2(96.0, 96.0);
+                            ui.image((tex.id(), sz));
+                        }
+                        ui.vertical(|ui| {
+                            ui.heading("Uploader (Rust)");
+                            ui.label(format!("Version: {}", env!("CARGO_PKG_VERSION")));
+                            ui.label(format!("Base URL: {}", upload::base_site_url()));
+                            ui.label(format!("Logged in: {}", self.logged_in_user.as_deref().unwrap_or("(not logged in)")));
+                        });
+                    });
+                    ui.separator();
+                    ui.label("Application logs:");
+                    let mut txt = self.log_cache.clone();
+                    egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                        ui.add(egui::TextEdit::multiline(&mut txt).desired_rows(10).desired_width(ui.available_width()));
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Refresh").clicked() {
+                            do_refresh_logs = true;
+                        }
+                        if ui.button("Clear").clicked() {
+                            do_clear_logs = true;
+                        }
+                    });
+                });
+            self.about_open = about_open;
+            if do_clear_logs {
+                let _ = std::fs::write(upload::log_file_path(), "");
+                self.refresh_log_cache(true);
+                self.last_msg = "Logs cleared".to_string();
+            } else if do_refresh_logs {
+                self.refresh_log_cache(true);
+                self.last_msg = "Logs refreshed".to_string();
+            }
+        }
 
         // Render toasts in a top-right area and drop expired ones.
         let now = Instant::now();
@@ -1483,6 +1649,9 @@ impl eframe::App for AppState {
         }
     }
 }
+
+#[cfg(test)]
+mod processing_workflow_tests;
 
 fn main() {
     // Initialize structured logging (writes to ~/.uploader/request_log.txt).

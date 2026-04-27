@@ -1,19 +1,49 @@
-use eframe::egui;
-use std::fs;
-use crossbeam_channel::{unbounded, Receiver};
 use anyhow::Result;
-use serde_json::Value;
+use crossbeam_channel::{unbounded, Receiver};
+use eframe::egui;
+use egui::TextBuffer;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 
+mod dragon_ipc;
 mod speech;
 mod templates;
-mod dragon_ipc;
 mod vim;
 use speech::{create_vosk_engine, SpeechEngine};
+#[cfg(feature = "hunspell")]
+mod hun_wrapper;
+#[cfg(feature = "hunspell")]
+use hun_wrapper::RawHunspell;
 
-use std::ops::Range;
 use egui::text::{CCursor, CCursorRange};
+
+// Simple Levenshtein distance implementation for fallback suggestions
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let m = a_chars.len();
+    let n = b_chars.len();
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut cur: Vec<usize> = vec![0; n + 1];
+    for i in 0..m {
+        cur[0] = i + 1;
+        for j in 0..n {
+            let cost = if a_chars[i] == b_chars[j] { 0 } else { 1 };
+            cur[j + 1] = std::cmp::min(std::cmp::min(prev[j + 1] + 1, cur[j] + 1), prev[j] + cost);
+        }
+        prev.clone_from(&cur);
+    }
+    cur[n]
+}
 
 #[cfg(test)]
 mod selection_tests;
@@ -25,9 +55,109 @@ enum VimMode {
     VisualLine,
 }
 
+impl ReportApp {
+    fn add_word_to_user_dict(&mut self, word: &str) {
+        // ensure settings dir exists and determine user dict path
+        let p = settings_path();
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let user_dict = if let Some(sp) = self.spell_dict_path.clone() {
+            sp
+        } else {
+            let mut d = p.clone();
+            d.set_file_name("user_dict.txt");
+            let s = d.to_string_lossy().to_string();
+            self.spell_dict_path = Some(s.clone());
+            s
+        };
+
+        // load existing words into set (if file exists)
+        let mut set = std::collections::HashSet::new();
+        if let Ok(txt) = std::fs::read_to_string(&user_dict) {
+            for ln in txt.lines() {
+                set.insert(ln.trim().to_lowercase());
+            }
+        }
+
+        // normalize and check the new word
+        let w = word.trim().to_lowercase();
+        if set.contains(&w) {
+            return; // nothing to do
+        }
+
+        // insert into set and write the full sorted file atomically
+        set.insert(w.clone());
+        let mut lines: Vec<String> = set.iter().cloned().collect();
+        lines.sort();
+        let tmp_path = format!("{}.tmp", &user_dict);
+        match std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&tmp_path) {
+            Ok(mut tf) => {
+                use std::io::Write;
+                for ln in &lines {
+                    if let Err(e) = writeln!(tf, "{}", ln) {
+                        eprintln!("[err] writing temp user_dict '{}': {}", tmp_path, e);
+                        let _ = std::fs::remove_file(&tmp_path);
+                        return;
+                    }
+                }
+                if let Err(e) = tf.flush() {
+                    eprintln!("[err] flushing temp user_dict '{}': {}", tmp_path, e);
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return;
+                }
+                if let Err(e) = std::fs::rename(&tmp_path, &user_dict) {
+                    eprintln!("[err] renaming '{}' -> '{}': {}", tmp_path, user_dict, e);
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return;
+                }
+            }
+            Err(e) => {
+                eprintln!("[err] creating temp user_dict '{}': {}", tmp_path, e);
+                return;
+            }
+        }
+
+        // replace in-memory dict and persist settings
+        self.spell_dict = set;
+        if let Err(e) = save_settings(&self.to_settings()) {
+            eprintln!("[err] saving settings after updating user_dict '{}': {}", user_dict, e);
+        }
+
+        // Log the updated user dictionary contents for debugging/auditing
+        eprintln!("[info] user_dict '{}' updated ({} entries): {:?}", user_dict, lines.len(), lines);
+
+        // If hunspell is active, add the newly-inserted word into its session
+        #[cfg(feature = "hunspell")]
+        {
+            if let Some(hs) = &mut self.hunspell {
+                let w_clone = w.clone();
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hs.add(&w_clone)));
+                match res {
+                    Ok(v) => eprintln!("[dbg] hunspell add('{}') returned {}", w_clone, v),
+                    Err(_) => eprintln!("[err] hunspell add('{}') panicked", w_clone),
+                }
+            }
+        }
+    }
+}
+
 impl Default for VimMode {
     fn default() -> Self {
         VimMode::Normal
+    }
+}
+
+#[derive(PartialEq, Eq, Serialize, Deserialize, Clone, Copy, Debug)]
+enum StudySourceMode {
+    Manual,
+    Integration,
+    Merged,
+}
+
+impl Default for StudySourceMode {
+    fn default() -> Self {
+        StudySourceMode::Merged
     }
 }
 
@@ -41,6 +171,18 @@ struct Settings {
     overlay_y: i32,
     overlay_w: i32,
     overlay_h: i32,
+    // per-user overrides for template variables: template_key -> (var -> value)
+    user_template_vars: HashMap<String, HashMap<String, String>>,
+    // centralized global variables that apply to all templates unless overridden
+    global_vars: HashMap<String, String>,
+    // persist spellcheck preference
+    spell_enabled: bool,
+    // optional path to a custom wordlist used as fallback dictionary
+    spell_dict_path: Option<String>,
+    // study context used to adapt template visibility/behavior
+    study_mode: StudySourceMode,
+    manual_studies: Vec<String>,
+    study_filter_templates: bool,
 }
 
 fn settings_path() -> PathBuf {
@@ -93,11 +235,29 @@ struct ReportApp {
     show_templates_window: bool,
     template_search: String,
     template_nicip: String,
+    study_mode: StudySourceMode,
+    manual_studies: Vec<String>,
+    integrated_studies: Vec<String>,
+    new_study_input: String,
+    study_filter_templates: bool,
     selected_template: Option<usize>,
     // template editor state
     show_template_editor: bool,
     editing_template: Option<templates::Template>,
     editing_index: Option<usize>,
+    // per-user template variable overrides (runtime copy of Settings.user_template_vars)
+    user_template_vars: HashMap<String, HashMap<String, String>>,
+    // showing edit-vars dialog: template_key (text stored in edit_vars_text)
+    show_edit_vars_dialog: Option<String>,
+    edit_vars_text: String,
+    // centralized global vars state
+    global_vars: HashMap<String, String>,
+    show_global_vars_dialog: bool,
+    global_vars_text: String,
+    global_vars_dirty: bool,
+    user_template_vars_dirty: bool,
+    // preview option: whether to show variables replaced in template preview
+    preview_replace_vars: bool,
     attach_requested: bool,
     // overlay position (for helper)
     overlay_x: i32,
@@ -123,8 +283,33 @@ struct ReportApp {
     // mouse drag tracking for click-and-drag selection when TextEdit is non-interactive
     mouse_dragging: bool,
     mouse_drag_anchor: Option<usize>,
+    // remember last right-click position so context menus can remain anchored
+    last_right_click_pos: Option<egui::Pos2>,
     // numeric prefix for vim commands (e.g., `3dw`)
     vim_count: Option<usize>,
+    // Spellchecking
+    spell_enabled: bool,
+    spell_dict: std::collections::HashSet<String>,
+    spell_dict_path: Option<String>,
+    #[cfg(feature = "hunspell")]
+    hunspell: Option<hun_wrapper::RawHunspell>,
+    // transient context for spell suggestion popup
+    spell_context: Option<SpellContext>,
+    // when true, skip reverting widget-applied edits (used when we intentionally
+    // update `buffer.report` from UI actions like choosing a suggestion)
+    skip_revert_on_widget_edit: bool,
+    // set when Paste is chosen from our custom context menu; consumed on Event::Paste
+    context_paste_requested: bool,
+    // preserve non-Vim selection while context menu is open
+    context_menu_selection: Option<std::ops::Range<usize>>,
+}
+
+#[derive(Clone)]
+struct SpellContext {
+    word: String,
+    start_byte: usize,
+    end_byte: usize,
+    suggestions: Vec<String>,
 }
 
 impl Default for ReportApp {
@@ -135,7 +320,8 @@ impl Default for ReportApp {
 
         let mut app = Self {
             templates: templates::load_templates(),
-            engine: create_vosk_engine("models/vosk-small").unwrap_or_else(|_| create_vosk_engine("").unwrap()),
+            engine: create_vosk_engine("models/vosk-small")
+                .unwrap_or_else(|_| create_vosk_engine("").unwrap()),
             dictating: false,
             interim: String::new(),
             rx: Some(rx_local),
@@ -144,6 +330,11 @@ impl Default for ReportApp {
             show_templates_window: true,
             template_search: String::new(),
             template_nicip: String::new(),
+            study_mode: StudySourceMode::Merged,
+            manual_studies: Vec::new(),
+            integrated_studies: Vec::new(),
+            new_study_input: String::new(),
+            study_filter_templates: true,
             selected_template: None,
             show_template_editor: false,
             editing_template: None,
@@ -155,7 +346,7 @@ impl Default for ReportApp {
             overlay_h: 200,
             buffer: vim::ReportBuffer::new(),
             show_caret_debug: false,
-            caret_x_offset: 3.0,
+            caret_x_offset: 0.0,
             vim_enabled: false,
             vim_mode: VimMode::Normal,
             last_vim_key: None,
@@ -163,8 +354,160 @@ impl Default for ReportApp {
             visual_anchor: None,
             mouse_dragging: false,
             mouse_drag_anchor: None,
+            last_right_click_pos: None,
             vim_count: None,
+            spell_enabled: false,
+            spell_dict: {
+                // try loading a system wordlist if available
+                let mut set = std::collections::HashSet::new();
+                let candidates = [
+                    "/usr/share/dict/words",
+                    "/usr/dict/words",
+                    "/usr/share/dict/web2",
+                ];
+                for p in candidates.iter() {
+                    if let Ok(txt) = std::fs::read_to_string(p) {
+                        for ln in txt.lines() {
+                            set.insert(ln.trim().to_lowercase());
+                        }
+                        break;
+                    }
+                }
+                set
+            },
+            spell_dict_path: None,
+            #[cfg(feature = "hunspell")]
+            hunspell: {
+                // Try to initialize Hunspell from env vars, common system locations,
+                // or a project-local vendor directory (e.g. third_party/hunspell/en_GB/)
+                let mut h = None;
+                #[cfg(feature = "hunspell")]
+                {
+                    use std::path::PathBuf;
+                    // Helper to attempt initialization and log failures
+                        let try_init = |aff: &str, dic: &str| -> Option<RawHunspell> {
+                            eprintln!("[dbg] trying hunspell aff='{}' dic='{}'", aff, dic);
+                            match std::panic::catch_unwind(|| RawHunspell::new(aff, dic)) {
+                                Ok(hs) => Some(hs),
+                                Err(_) => {
+                                    eprintln!(
+                                        "[dbg] RawHunspell::new panicked for {} {}",
+                                        aff, dic
+                                    );
+                                    None
+                                }
+                            }
+                        };
+
+                    // 1) Env vars
+                    if let (Ok(aff), Ok(dic)) =
+                        (std::env::var("HUNSPELL_AFF"), std::env::var("HUNSPELL_DIC"))
+                    {
+                        if PathBuf::from(&aff).exists() && PathBuf::from(&dic).exists() {
+                            h = try_init(&aff, &dic);
+                        } else {
+                            eprintln!(
+                                "[dbg] HUNSPELL_AFF/DIC env set but files missing: {} {}",
+                                aff, dic
+                            );
+                        }
+                    }
+
+                    // 2) Common system locations
+                    if h.is_none() {
+                        let system_dir = PathBuf::from("/usr/share/hunspell");
+                        if system_dir.exists() {
+                            // pick en_GB then en_US as fallback
+                            let candidates = ["en_GB", "en_GB-oxford", "en_US", "en_US-large"];
+                            for cand in candidates.iter() {
+                                let aff = system_dir.join(format!("{}.aff", cand));
+                                let dic = system_dir.join(format!("{}.dic", cand));
+                                if aff.exists() && dic.exists() {
+                                    if let Some(hs) =
+                                        try_init(&aff.to_string_lossy(), &dic.to_string_lossy())
+                                    {
+                                        h = Some(hs);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 3) Project-local vendor directory (where you can place en_GB.aff/.dic)
+                    if h.is_none() {
+                        if let Ok(exe) = std::env::current_exe() {
+                            if let Some(root) = exe.parent() {
+                                let vend_dirs = [
+                                    root.join("../third_party/hunspell/en_GB"),
+                                    root.join("../../third_party/hunspell/en_GB"),
+                                    root.join("third_party/hunspell/en_GB"),
+                                ];
+                                for vd in vend_dirs.iter() {
+                                    let aff = vd.join("en_GB.aff");
+                                    let dic = vd.join("en_GB.dic");
+                                    if aff.exists() && dic.exists() {
+                                        if let Some(hs) =
+                                            try_init(&aff.to_string_lossy(), &dic.to_string_lossy())
+                                        {
+                                            h = Some(hs);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if h.is_none() {
+                        eprintln!("[dbg] Hunspell not initialized (no usable aff/dic found or initialization failed)");
+                    } else {
+                        eprintln!("[dbg] Hunspell initialized successfully");
+                    }
+                }
+                h
+            },
+            spell_context: None,
+            skip_revert_on_widget_edit: false,
+            context_paste_requested: false,
+            context_menu_selection: None,
+            user_template_vars: HashMap::new(),
+            show_edit_vars_dialog: None,
+            edit_vars_text: String::new(),
+            user_template_vars_dirty: false,
+            global_vars: HashMap::new(),
+            show_global_vars_dialog: false,
+            global_vars_text: String::new(),
+            global_vars_dirty: false,
+            preview_replace_vars: true,
         };
+
+        // Debug: print hunspell env and initialization status before applying settings
+        let aff_env = std::env::var("HUNSPELL_AFF").ok();
+        let dic_env = std::env::var("HUNSPELL_DIC").ok();
+        eprintln!(
+            "[dbg] HUNSPELL_AFF={:?}",
+            aff_env.as_ref().map(|s| s.as_str())
+        );
+        eprintln!(
+            "[dbg] HUNSPELL_DIC={:?}",
+            dic_env.as_ref().map(|s| s.as_str())
+        );
+        eprintln!(
+            "[dbg] HUNSPELL_AFF exists={}",
+            aff_env
+                .as_ref()
+                .map(|p| std::path::Path::new(p).exists())
+                .unwrap_or(false)
+        );
+        eprintln!(
+            "[dbg] HUNSPELL_DIC exists={}",
+            dic_env
+                .as_ref()
+                .map(|p| std::path::Path::new(p).exists())
+                .unwrap_or(false)
+        );
+        eprintln!("[dbg] hunspell_present={}", app.hunspell.is_some());
 
         // Load persisted settings (if any) and apply
         let settings = load_settings();
@@ -183,6 +526,219 @@ impl Default for ReportApp {
 }
 
 impl ReportApp {
+    fn normalize_study_label(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ").trim().to_string()
+    }
+
+    fn active_studies(&self) -> Vec<String> {
+        match self.study_mode {
+            StudySourceMode::Manual => self.manual_studies.clone(),
+            StudySourceMode::Integration => self.integrated_studies.clone(),
+            StudySourceMode::Merged => {
+                let mut out = self.manual_studies.clone();
+                for s in &self.integrated_studies {
+                    if !out.iter().any(|x| x.eq_ignore_ascii_case(s)) {
+                        out.push(s.clone());
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    fn template_matches_study_context(&self, t: &templates::Template) -> bool {
+        if !self.study_filter_templates {
+            return true;
+        }
+        let studies = self.active_studies();
+        if studies.is_empty() {
+            return true;
+        }
+
+        let title = t.display_title().to_lowercase();
+        let id = t.id.clone().unwrap_or_default().to_lowercase();
+        let codes: Vec<String> = t.applicable_codes.iter().map(|s| s.to_lowercase()).collect();
+        let modalities: Vec<String> = t.modalities.iter().map(|s| s.to_lowercase()).collect();
+
+        studies.iter().any(|study| {
+            let q = study.to_lowercase();
+            if q.is_empty() {
+                return false;
+            }
+            title.contains(&q)
+                || id.contains(&q)
+                || codes.iter().any(|c| c.contains(&q) || q.contains(c))
+                || modalities.iter().any(|m| m.contains(&q) || q.contains(m))
+        })
+    }
+
+    fn template_matches_filters(&self, t: &templates::Template) -> bool {
+        let nicips: Vec<String> = self
+            .template_nicip
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if !nicips.is_empty() && !t.applicable_codes.is_empty() {
+            let matched = nicips.iter().any(|sc| {
+                t.applicable_codes
+                    .iter()
+                    .any(|ac| ac.eq_ignore_ascii_case(sc))
+            });
+            if !matched {
+                return false;
+            }
+        }
+
+        let title = t.display_title();
+        if !self.template_search.is_empty()
+            && !title
+                .to_lowercase()
+                .contains(&self.template_search.to_lowercase())
+            && !t
+                .body
+                .to_lowercase()
+                .contains(&self.template_search.to_lowercase())
+        {
+            return false;
+        }
+
+        self.template_matches_study_context(t)
+    }
+
+    fn visible_template_indices(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        for (i, t) in self.templates.iter().enumerate() {
+            if self.template_matches_filters(t) {
+                out.push(i);
+            }
+        }
+        out
+    }
+
+    fn handle_ipc_message(&mut self, msg: &str) -> bool {
+        let trimmed = msg.trim();
+        if !trimmed.starts_with('{') {
+            return false;
+        }
+
+        let parsed: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+
+        let cmd = parsed
+            .get("cmd")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        match cmd {
+            "set_studies" => {
+                let mut new_list: Vec<String> = Vec::new();
+                if let Some(arr) = parsed.get("studies").and_then(|v| v.as_array()) {
+                    for s in arr.iter().filter_map(|x| x.as_str()) {
+                        let n = Self::normalize_study_label(s);
+                        if !n.is_empty() && !new_list.iter().any(|x| x.eq_ignore_ascii_case(&n)) {
+                            new_list.push(n);
+                        }
+                    }
+                }
+                self.integrated_studies = new_list;
+
+                if let Some(mode_s) = parsed.get("study_mode").and_then(|v| v.as_str()) {
+                    self.study_mode = match mode_s.to_ascii_lowercase().as_str() {
+                        "manual" => StudySourceMode::Manual,
+                        "integration" => StudySourceMode::Integration,
+                        _ => StudySourceMode::Merged,
+                    };
+                }
+                true
+            }
+            "add_studies" => {
+                if let Some(arr) = parsed.get("studies").and_then(|v| v.as_array()) {
+                    for s in arr.iter().filter_map(|x| x.as_str()) {
+                        let n = Self::normalize_study_label(s);
+                        if !n.is_empty() && !self.integrated_studies.iter().any(|x| x.eq_ignore_ascii_case(&n)) {
+                            self.integrated_studies.push(n);
+                        }
+                    }
+                }
+                true
+            }
+            "clear_studies" => {
+                self.integrated_studies.clear();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn collect_template_var_names(&self) -> Vec<String> {
+        use std::collections::HashSet;
+        let mut seen: HashSet<String> = HashSet::new();
+        for t in self.templates.iter() {
+            // include explicit template.vars keys
+            for k in t.vars.keys() {
+                seen.insert(k.clone());
+            }
+            // scan body for occurrences like {{key}} or {{key|default}} or {{> partial}}
+            let s = &t.body;
+            let mut i = 0usize;
+            while let Some(start) = s[i..].find("{{") {
+                i += start + 2;
+                if let Some(end_rel) = s[i..].find("}}") {
+                    let chunk = &s[i..i + end_rel];
+                    let mut name = chunk.trim();
+                    // skip partial includes
+                    if name.starts_with('>') {
+                        // skip
+                    } else {
+                        // take up to '|' if present
+                        if let Some(pipe) = name.find('|') {
+                            name = &name[..pipe];
+                        }
+                        // trim whitespace and quotes
+                        let nm = name.trim().trim_matches('"').trim_matches('\'');
+                        if !nm.is_empty() {
+                            // only accept reasonable var name chars
+                            let filtered = nm
+                                .chars()
+                                .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                                .collect::<String>();
+                            if !filtered.is_empty() {
+                                seen.insert(filtered);
+                            }
+                        }
+                    }
+                    i = i + end_rel + 2;
+                } else {
+                    break;
+                }
+            }
+        }
+        let mut out: Vec<String> = seen.into_iter().collect();
+        out.sort();
+        out
+    }
+    // check a single word for correctness using hunspell if available,
+    // otherwise fallback to in-memory dictionary lookup
+    fn check_word_correct(&self, word: &str) -> bool {
+        let key = word.to_lowercase();
+        #[cfg(feature = "hunspell")]
+        {
+            if let Some(hs) = &self.hunspell {
+                // hunspell::Hunspell API: spell(word) -> bool
+                if hs.check(word) {
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+        }
+        // fallback to simple dictionary
+        self.spell_dict.contains(&key)
+    }
     fn to_settings(&self) -> Settings {
         Settings {
             vim_enabled: self.vim_enabled,
@@ -193,53 +749,105 @@ impl ReportApp {
             overlay_y: self.overlay_y,
             overlay_w: self.overlay_w,
             overlay_h: self.overlay_h,
+            user_template_vars: self.user_template_vars.clone(),
+            global_vars: self.global_vars.clone(),
+            spell_enabled: self.spell_enabled,
+            spell_dict_path: self.spell_dict_path.clone(),
+            study_mode: self.study_mode,
+            manual_studies: self.manual_studies.clone(),
+            study_filter_templates: self.study_filter_templates,
         }
     }
 
-    // Prepare the template body for insertion according to template settings
-    fn prepare_body_for_insertion(&self, t: &templates::Template, mut body: String) -> String {
-        // If the template explicitly allows inline insertion, return as-is
+    // Insert a template at the current caret position, applying inline/block
+    // insertion rules and optional pre/post finishing (sentence completion).
+    fn insert_template_at_caret(&mut self, t: &templates::Template) {
+        // Group the entire insertion (pre-finish, insertion, post-finish or
+        // block insertion) into a single undo step so Undo/Redo treats it
+        // atomically.
+        self.buffer.start_undo_group();
+        // start with per-template defaults
+        let mut vars: std::collections::HashMap<String, String> = t.vars.clone();
+        // overlay user overrides from settings (per-user saved values)
+        let key =
+            t.id.clone()
+                .unwrap_or_else(|| t.title.clone().unwrap_or_else(|| t.display_title()));
+        if let Some(user_map) = self.user_template_vars.get(&key) {
+            for (k, v) in user_map.iter() {
+                vars.insert(k.clone(), v.clone());
+            }
+        }
+        // finally, fill missing keys from centralized global vars so users
+        // only need to set common values once
+        for (k, v) in self.global_vars.iter() {
+            vars.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        // (future) overlay per-insertion overrides here
+        let rendered = templates::render_template(&t.body, &vars, &self.templates);
+
         if t.insert_inline {
-            return body;
-        }
-
-        // Determine caret position
-        let pos = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or_else(|| self.buffer.report.chars().count());
-
-        // Helper to peek character at index
-        let ch_at = |s: &String, idx: usize| -> Option<char> {
-            s.chars().nth(idx)
-        };
-
-        // Ensure there is a newline before if required
-        if t.ensure_surrounding_newlines {
-            let need_prefix = if pos == 0 {
-                false
-            } else {
-                match ch_at(&self.buffer.report, pos.saturating_sub(1)) {
-                    Some('\n') => false,
-                    _ => true,
-                }
-            };
-            if need_prefix {
-                body = format!("\n{}", body);
+            let mut pos = self
+                .buffer
+                .caret_char_range
+                .as_ref()
+                .map(|r| r.start)
+                .unwrap_or_else(|| self.buffer.report.chars().count());
+            // apply pre-finish if requested
+            if t.inline_finish == templates::InlineFinish::Pre
+                || t.inline_finish == templates::InlineFinish::Both
+            {
+                pos = templates::ensure_finish_before(&mut self.buffer.report, pos);
+                self.buffer.set_caret_pos(pos);
             }
 
-            // Ensure there's a newline after insertion
-            let after_char = ch_at(&self.buffer.report, pos);
-            let need_suffix = match after_char {
-                Some('\n') => false,
-                None => false,
-                _ => true,
-            };
-            if need_suffix {
-                if !body.ends_with('\n') {
-                    body.push('\n');
+            // perform insertion
+            self.buffer.insert_at_caret(&rendered);
+
+            // apply post-finish if requested (pos is insertion start)
+            if t.inline_finish == templates::InlineFinish::Post
+                || t.inline_finish == templates::InlineFinish::Both
+            {
+                let insert_len = rendered.chars().count();
+                let start_pos = self
+                    .buffer
+                    .caret_char_range
+                    .as_ref()
+                    .map(|r| r.start)
+                    .unwrap_or_else(|| self.buffer.report.chars().count())
+                    .saturating_sub(insert_len);
+                templates::ensure_finish_after(&mut self.buffer.report, start_pos, insert_len);
+            }
+            // End the grouped undo step for inline insertions as well
+            self.buffer.end_undo_group();
+        } else {
+            // block-mode insertion: ensure surrounding blank lines if requested
+            let mut body = rendered.clone();
+            let pos = self
+                .buffer
+                .caret_char_range
+                .as_ref()
+                .map(|r| r.start)
+                .unwrap_or_else(|| self.buffer.report.chars().count());
+            if t.ensure_surrounding_newlines {
+                // prefix
+                if pos > 0 {
+                    if let Some(ch) = self.buffer.report.chars().nth(pos.saturating_sub(1)) {
+                        if ch != '\n' {
+                            body = format!("\n{}", body);
+                        }
+                    }
+                }
+                // suffix
+                if let Some(ch) = self.buffer.report.chars().nth(pos) {
+                    if ch != '\n' && !body.ends_with('\n') {
+                        body.push('\n');
+                    }
                 }
             }
+            self.buffer.insert_at_caret(&body);
+            // End the grouped undo step
+            self.buffer.end_undo_group();
         }
-
-        body
     }
 
     fn apply_settings(&mut self, s: Settings) {
@@ -251,14 +859,101 @@ impl ReportApp {
         self.overlay_y = s.overlay_y;
         self.overlay_w = s.overlay_w;
         self.overlay_h = s.overlay_h;
+        self.user_template_vars = s.user_template_vars;
+        self.global_vars = s.global_vars;
+        // apply persisted spell settings
+        self.spell_enabled = s.spell_enabled;
+        self.spell_dict_path = s.spell_dict_path.clone();
+        self.study_mode = s.study_mode;
+        self.manual_studies = s.manual_studies;
+        self.study_filter_templates = s.study_filter_templates;
+        // if a custom wordlist path is provided, try to load it as the spell_dict
+        if let Some(p) = &self.spell_dict_path {
+            if let Ok(txt) = std::fs::read_to_string(p) {
+                let mut set = std::collections::HashSet::new();
+                for ln in txt.lines() {
+                    set.insert(ln.trim().to_lowercase());
+                }
+                self.spell_dict = set;
+                // If hunspell is available, add these words into its session so
+                // runtime spell checks and suggestions take user words into account.
+                #[cfg(feature = "hunspell")]
+                {
+                    if let Some(hs) = &mut self.hunspell {
+                                        // Add persisted words into the running hunspell session
+                                        // so runtime checks/suggestions include them.
+                                        for w in self.spell_dict.iter() {
+                                            let w_clone = w.clone();
+                                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                                let r = hs.add(&w_clone);
+                                                eprintln!("[dbg] hunspell add('{}') returned {}", w_clone, r);
+                                            }));
+                                        }
+                                        eprintln!("[info] loaded {} user words into program spell_dict and hunspell session", self.spell_dict.len());
+                    }
+                }
+            }
+        }
+    }
+
+    // Ensure all vim-related runtime state is cleared so emulation is fully disabled.
+    pub fn ensure_vim_disabled_state(&mut self) {
+        self.vim_mode = VimMode::Normal;
+        self.last_vim_key = None;
+        self.last_vim_object = None;
+        self.visual_anchor = None;
+        self.mouse_dragging = false;
+        self.mouse_drag_anchor = None;
+        // collapse any selection into a canonical caret
+        let cur = self
+            .buffer
+            .caret_char_range
+            .as_ref()
+            .map(|r| r.start)
+            .unwrap_or(0);
+        self.buffer.caret_char_range = Some(cur..cur);
+    }
+
+    // Replicate the Alt+Number quick-insert behavior as performed in the
+    // UI event handler. This helper intentionally does NOT attempt to
+    // remove any numeric character that the TextEdit may have inserted; it
+    // reproduces the raw sequence so tests can assert the original buggy
+    // behaviour.
+    pub fn alt_number_quick_insert(&mut self, key: egui::Key) {
+        // Build visible template index list using current filters
+        let visible_indices = self.visible_template_indices();
+
+        let target_opt = match key {
+            egui::Key::Num1 => Some(0usize),
+            egui::Key::Num2 => Some(1usize),
+            egui::Key::Num3 => Some(2usize),
+            egui::Key::Num4 => Some(3usize),
+            egui::Key::Num5 => Some(4usize),
+            egui::Key::Num6 => Some(5usize),
+            egui::Key::Num7 => Some(6usize),
+            egui::Key::Num8 => Some(7usize),
+            egui::Key::Num9 => Some(8usize),
+            egui::Key::Num0 => Some(9usize),
+            _ => None,
+        };
+
+        if let Some(pos) = target_opt {
+            if let Some(&tmpl_i) = visible_indices.get(pos) {
+                let t = self.templates[tmpl_i].clone();
+                self.insert_template_at_caret(&t);
+            }
+        }
     }
 }
 
 impl eframe::App for ReportApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // drain any IPC messages (e.g., from Dragon helper) and insert into report buffer
-        if let Some(rx) = &self.rx {
+        if let Some(rx) = self.rx.clone() {
             while let Ok(msg) = rx.try_recv() {
+                if self.handle_ipc_message(&msg) {
+                    continue;
+                }
                 if !self.buffer.report.is_empty() && !self.buffer.report.ends_with('\n') {
                     self.buffer.report.push('\n');
                 }
@@ -266,6 +961,56 @@ impl eframe::App for ReportApp {
             }
         }
         // (removed SidePanel overlay; templates render inline when requested)
+
+        // Intercept Alt+Number key events before widgets (e.g. TextEdit)
+        // handle them here and remove the event so the TextEdit doesn't
+        // receive and insert the numeric character.
+        // Collect and remove Alt+Number events, recording which keys were seen
+        // so we can handle insertion while ensuring widgets (TextEdit) don't
+        // receive the numeric character.
+        let mut removed_alt_keys: Vec<egui::Key> = Vec::new();
+        ctx.input_mut(|i| {
+            use egui::Event;
+            let mut remove_idxs: Vec<usize> = Vec::new();
+            for (idx, ev) in i.events.iter().enumerate() {
+                if let Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = ev
+                {
+                    if modifiers.alt {
+                        match key {
+                            egui::Key::Num1
+                            | egui::Key::Num2
+                            | egui::Key::Num3
+                            | egui::Key::Num4
+                            | egui::Key::Num5
+                            | egui::Key::Num6
+                            | egui::Key::Num7
+                            | egui::Key::Num8
+                            | egui::Key::Num9
+                            | egui::Key::Num0 => {
+                                // record key for handling after we leave input_mut
+                                removed_alt_keys.push(*key);
+                                remove_idxs.push(idx);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            // Remove matched events in reverse so indices remain valid
+            for &r in remove_idxs.iter().rev() {
+                i.events.remove(r);
+            }
+        });
+
+        // Now perform quick-insert for each removed Alt+number key
+        for key in removed_alt_keys.into_iter() {
+            self.alt_number_quick_insert(key);
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // Build a two-column layout: left = main report area, right = templates (fixed width)
@@ -301,18 +1046,9 @@ impl eframe::App for ReportApp {
                             self.attach_requested = true;
                         }
                         ui.separator();
-                        // Clone templates to avoid borrowing `self` across UI calls so we can mutably borrow later
-                        let templates_top = self.templates.clone();
-                        for (i, t) in templates_top.iter().enumerate() {
-                            if ui.small_button(format!("T{}", i + 1)).clicked() {
-                                    // Insert at caret (or append)
-                                    let mut body = t.body.clone();
-                                    if !self.buffer.report.is_empty() && !self.buffer.report.ends_with('\n') && self.buffer.caret_char_range.is_none() {
-                                        // if no caret known, preserve previous append behavior and add newline
-                                        body = format!("\n{}", body);
-                                    }
-                                    self.buffer.insert_at_caret(&body);
-                                }
+                        let spell_resp = ui.checkbox(&mut self.spell_enabled, "Spellcheck");
+                        if spell_resp.changed() {
+                            let _ = save_settings(&self.to_settings());
                         }
                     });
 
@@ -323,7 +1059,103 @@ impl eframe::App for ReportApp {
                     // If Vim emulation is enabled and we are NOT in Insert mode, prevent the TextEdit
                     // from applying direct edits by restoring any accidental changes.
                     let prev_report = self.buffer.report.clone();
-                    let is_interactive = !self.vim_enabled || self.vim_mode == VimMode::Insert;
+                    // If vim emulation is disabled, ensure no vim runtime state persists.
+                    if !self.vim_enabled {
+                        self.ensure_vim_disabled_state();
+                    }
+                    // If Alt is currently pressed, make the TextEdit non-interactive
+                    // so it doesn't receive/insert the numeric character while we
+                    // intercept Alt+Number events.
+                    let alt_pressed = ctx.input(|i| i.modifiers.alt);
+                    let is_interactive = (!self.vim_enabled || self.vim_mode == VimMode::Insert) && !alt_pressed;
+                    // Precompute misspelled ranges and local flags so the layouter
+                    // closure does not capture `self` (avoids borrow conflicts).
+                    let vim_enabled = self.vim_enabled;
+                    let re_split = regex::Regex::new(r"[A-Za-z']{2,}").unwrap();
+                    let mut miss_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+                    if self.spell_enabled {
+                        for m in re_split.find_iter(&self.buffer.report) {
+                            let word = m.as_str();
+                            if !self.check_word_correct(word) {
+                                miss_ranges.push(m.start()..m.end());
+                            }
+                        }
+                    }
+
+                    let mut miss_ranges_for_paint = miss_ranges.clone();
+                    let mut layouter_closure = move |ui: &egui::Ui, text: &dyn TextBuffer, wrap_width: f32| {
+                        let mut job = egui::text::LayoutJob::default();
+                        job.wrap.max_width = wrap_width;
+                        let string = text.as_str();
+
+                        let font_id = if vim_enabled {
+                            ui.style().text_styles.get(&egui::TextStyle::Monospace).map(|f| egui::FontId::monospace(f.size)).unwrap_or(egui::FontId::monospace(14.0))
+                        } else {
+                            ui.style().text_styles.get(&egui::TextStyle::Body).map(|f| egui::FontId::proportional(f.size)).unwrap_or(egui::FontId::proportional(14.0))
+                        };
+
+                        let mut last_byte = 0usize;
+                        for m in re_split.find_iter(string) {
+                            let start = m.start();
+                            let end = m.end();
+                            if start > last_byte {
+                                job.append(
+                                    &string[last_byte..start],
+                                    0.0,
+                                    egui::text::TextFormat {
+                                        font_id: font_id.clone(),
+                                        color: ui.visuals().text_color(),
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                            let miss_color = egui::Color32::from_rgb(220, 40, 40);
+                            // Check if this match overlaps any precomputed miss_range
+                            let is_miss = miss_ranges.iter().any(|r| r.start == start && r.end == end);
+                            if is_miss {
+                                job.append(
+                                    &string[start..end],
+                                    0.0,
+                                    egui::text::TextFormat {
+                                        font_id: font_id.clone(),
+                                        color: ui.visuals().text_color(),
+                                        // Spell squiggle is custom-painted after TextEdit so it can be wavy.
+                                        underline: egui::Stroke::NONE,
+                                        ..Default::default()
+                                    },
+                                );
+                            } else {
+                                job.append(
+                                    &string[start..end],
+                                    0.0,
+                                    egui::text::TextFormat {
+                                        font_id: font_id.clone(),
+                                        color: ui.visuals().text_color(),
+                                        ..Default::default()
+                                    },
+                                );
+                            }
+                            last_byte = end;
+                        }
+                        if last_byte < string.len() {
+                            job.append(
+                                &string[last_byte..],
+                                0.0,
+                                egui::text::TextFormat {
+                                    font_id: font_id.clone(),
+                                    color: ui.visuals().text_color(),
+                                    ..Default::default()
+                                },
+                            );
+                        }
+
+                        ui.ctx().fonts_mut(|f| f.layout_job(job))
+                    };
+
+                    // Capture char_len before the mutable borrow of self.buffer.report.
+                    let report_char_len = self.buffer.char_len();
+
+                    // Attach the layouter to the TextEdit builder
                     let mut text_edit = egui::TextEdit::multiline(&mut self.buffer.report)
                         .desired_rows(20)
                         .desired_width(left_w)
@@ -331,21 +1163,230 @@ impl eframe::App for ReportApp {
                         .lock_focus(self.vim_enabled && self.vim_mode == VimMode::Insert)
                         // make the widget non-interactive when Vim is active but not in Insert,
                         // so clicks don't hand keyboard focus to the TextEdit unexpectedly.
-                        .interactive(is_interactive);
+                        .interactive(is_interactive)
+                        .layouter(&mut layouter_closure)
+                        // stable ID so we can pre-load and patch its state before show()
+                        .id_source("diforge_report");
 
                     // Use monospace font when Vim emulation is active for consistent fixed-width behavior
                     if self.vim_enabled {
                         text_edit = text_edit.font(egui::TextStyle::Monospace);
                     }
 
+                    use egui::Event;
+
+                    // Capture events now (before show) so undo/redo and secondary-press
+                    // detection are available both before and after the widget runs.
+                    let events = ctx.input(|i| i.events.clone());
+
+                    // Snapshot selection before TextEdit handles pointer events in this frame.
+                    let prev_selection_before_context = self.buffer.caret_char_range.clone();
+
+                    // Pre-inject the preserved non-Vim selection into TextEditState BEFORE
+                    // show() runs.  TextEdit reads its persisted state at the start of render,
+                    // so setting it here means the highlight is visible on THIS frame even
+                    // while the context-menu popup holds keyboard focus.
+                    if !self.vim_enabled {
+                        if let Some(sel) = self.context_menu_selection.clone() {
+                            let textedit_id = ui.make_persistent_id("diforge_report");
+                            let s = sel.start.min(sel.end).min(report_char_len);
+                            let e = sel.start.max(sel.end).min(report_char_len);
+                            if e > s {
+                                if let Some(mut te_state) =
+                                    egui::TextEdit::load_state(ctx, textedit_id)
+                                {
+                                    te_state.cursor.set_char_range(Some(CCursorRange::two(
+                                        CCursor::new(s),
+                                        CCursor::new(e),
+                                    )));
+                                    egui::TextEdit::store_state(ctx, textedit_id, te_state);
+                                }
+                            }
+                        }
+                    }
+
                     let mut output = text_edit.show(ui);
 
-                    // Update stored caret char range from the widget's reported cursor_range
-                    // Only trust the widget when the TextEdit is interactive (Insert mode or Vim disabled).
+                    let secondary_press_in_editor = events.iter().any(|ev| {
+                        if let Event::PointerButton {
+                            pos,
+                            pressed,
+                            button,
+                            ..
+                        } = ev
+                        {
+                            *pressed
+                                && *button == egui::PointerButton::Secondary
+                                && output.response.rect.contains(*pos)
+                        } else {
+                            false
+                        }
+                    });
+
+                    // Capture current non-empty selection before right-click opens the menu,
+                    // then keep reusing it while the menu is visible.
+                    // Use only prev_selection_before_context (pre-show snapshot) — this correctly
+                    // reflects the selection the user had before clicking, with no stale cache.
+                    if !self.vim_enabled && secondary_press_in_editor {
+                        if let Some(prev) = prev_selection_before_context.clone() {
+                            let s = prev.start.min(prev.end);
+                            let e = prev.start.max(prev.end);
+                            if e > s {
+                                self.context_menu_selection = Some(s..e);
+                                // egui's pointer_interaction() clears the TextEdit cursor on
+                                // any_pressed() — including secondary (right) clicks. Restore
+                                // the selection in TextEditState immediately so the pre-injection
+                                // on the *next* frame picks up the correct state even when the
+                                // secondary press and release span different frames.
+                                output.state.cursor.set_char_range(Some(CCursorRange::two(
+                                    CCursor::new(s),
+                                    CCursor::new(e),
+                                )));
+                                output.state.clone().store(ctx, output.response.id);
+                            } else {
+                                // User had no selection when they right-clicked — clear any
+                                // previously captured menu selection so Copy is correctly disabled.
+                                self.context_menu_selection = None;
+                            }
+                        } else {
+                            self.context_menu_selection = None;
+                        }
+                    }
+
+                    // Text context menu actions available in both Vim and non-Vim modes.
+                    let mut text_context_menu_open = false;
+                    output.response.context_menu(|ui| {
+                        text_context_menu_open = true;
+                        let copy_text = if self.vim_enabled
+                            && (self.vim_mode == VimMode::Visual || self.vim_mode == VimMode::VisualLine)
+                        {
+                            if let Some(anchor) = self.visual_anchor {
+                                let cur = self
+                                    .buffer
+                                    .caret_char_range
+                                    .as_ref()
+                                    .map(|r| r.start)
+                                    .unwrap_or(anchor)
+                                    .min(self.buffer.char_len());
+                                let (sel_start, sel_end) = if self.vim_mode == VimMode::VisualLine {
+                                    let (a_s, a_e) = self.buffer.line_bounds_at(anchor);
+                                    let (c_s, c_e) = self.buffer.line_bounds_at(cur);
+                                    (a_s.min(c_s), a_e.max(c_e).min(self.buffer.char_len()))
+                                } else {
+                                    let s = anchor.min(cur);
+                                    let e = anchor.max(cur);
+                                    let extend = if e > s { 1 } else { 0 };
+                                    (s, e.min(self.buffer.char_len()).saturating_add(extend).min(self.buffer.char_len()))
+                                };
+                                if sel_end > sel_start {
+                                    Some(
+                                        self.buffer
+                                            .report
+                                            .chars()
+                                            .skip(sel_start)
+                                            .take(sel_end - sel_start)
+                                            .collect::<String>(),
+                                    )
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else if let Some(r) = self
+                            .context_menu_selection
+                            .as_ref()
+                            .or(self.buffer.caret_char_range.as_ref())
+                        {
+                            let s = r.start.min(r.end).min(self.buffer.char_len());
+                            let e = r.start.max(r.end).min(self.buffer.char_len());
+                            if e > s {
+                                Some(
+                                    self.buffer
+                                        .report
+                                        .chars()
+                                        .skip(s)
+                                        .take(e - s)
+                                        .collect::<String>(),
+                                )
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        if ui
+                            .add_enabled(copy_text.is_some(), egui::Button::new("Copy"))
+                            .clicked()
+                        {
+                            if let Some(txt) = copy_text {
+                                ui.ctx().copy_text(txt);
+                            }
+                            ui.close();
+                        }
+
+                        if ui.button("Paste").clicked() {
+                            self.context_paste_requested = true;
+                            ui.ctx()
+                                .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                            ui.close();
+                        }
+
+                        if let Some(c) = self.spell_context.clone() {
+                            ui.separator();
+                            ui.label(format!("Spelling: {}", c.word));
+
+                            if !c.suggestions.is_empty() {
+                                for s in c.suggestions.iter().take(8) {
+                                    if ui.button(s).clicked() {
+                                        self.buffer.replace_bytes(c.start_byte, c.end_byte, s);
+                                        self.spell_context = None;
+                                        ui.close();
+                                    }
+                                }
+                            } else {
+                                ui.label("No suggestions");
+                            }
+
+                            if ui.button("Add to dictionary").clicked() {
+                                self.add_word_to_user_dict(&c.word);
+                                self.spell_context = None;
+                                ui.close();
+                            }
+                            if ui.button("Ignore").clicked() {
+                                self.spell_dict.insert(c.word.clone());
+                                let _ = save_settings(&self.to_settings());
+                                self.spell_context = None;
+                                ui.close();
+                            }
+                        }
+                    });
+
+                    // Clear context_menu_selection only when the context menu is
+                    // genuinely closed AND the secondary (right) mouse button is no
+                    // longer held.  Between the initial right-click press and the
+                    // release, text_context_menu_open is false (the popup hasn't opened
+                    // yet) but we must NOT clear — otherwise the captured selection is
+                    // thrown away every intermediate frame before the popup appears.
+                    let secondary_is_held =
+                        ctx.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
+                    if !text_context_menu_open && !self.vim_enabled && !secondary_is_held {
+                        self.context_menu_selection = None;
+                    }
+
+                    // Update stored caret char range from the widget's reported cursor_range.
+                    // Only trust the widget when interactive and not preserving a menu selection.
                     if is_interactive {
-                        if let Some(ccr) = output.cursor_range {
+                        if !self.vim_enabled && self.context_menu_selection.is_some() {
+                            // Context menu is open: keep buffer in sync with the preserved
+                            // selection; do NOT overwrite from output.cursor_range which may
+                            // be None because the popup holds focus.
+                            if let Some(sel) = self.context_menu_selection.clone() {
+                                self.buffer.caret_char_range = Some(sel);
+                            }
+                        } else if let Some(ccr) = output.cursor_range {
                             let sorted = ccr.as_sorted_char_range();
-                            eprintln!("[dbg] widget.cursor_range -> {:?}", sorted);
                             self.buffer.caret_char_range = Some(sorted);
                         }
                     }
@@ -354,20 +1395,56 @@ impl eframe::App for ReportApp {
                     // direct text changes the TextEdit may have applied (so Normal mode
                     // keystrokes are handled by our modal logic instead).
                     if self.vim_enabled && self.vim_mode != VimMode::Insert && self.buffer.report != prev_report {
-                        eprintln!("[dbg] reverting buffer.report due to non-Insert vim mode (widget tried to edit)");
-                        self.buffer.report = prev_report;
+                        if self.skip_revert_on_widget_edit {
+                            eprintln!("[dbg] accepting intentional widget edit (skip revert)");
+                            self.skip_revert_on_widget_edit = false;
+                        } else {
+                            eprintln!("[dbg] reverting buffer.report due to non-Insert vim mode (widget tried to edit)");
+                            self.buffer.report = prev_report;
+                        }
                     }
 
-                    use egui::Event;
+                    // Paint red squiggly spell underlines based on misspelled ranges.
+                    if self.spell_enabled {
+                        let painter = ui.painter();
+                        let text = &self.buffer.report;
+                        for r in miss_ranges_for_paint.iter() {
+                            let start_char = text[..r.start].chars().count();
+                            let word_len_chars = text[r.start..r.end].chars().count();
+                            let end_char = start_char + word_len_chars;
+
+                            let start_rect = output.galley.pos_from_cursor(CCursor::new(start_char));
+                            let end_rect = output.galley.pos_from_cursor(CCursor::new(end_char));
+                            let start_x = output.galley_pos.x + start_rect.min.x;
+                            let mut end_x = output.galley_pos.x + end_rect.min.x;
+                            if end_x <= start_x {
+                                end_x = output.galley_pos.x + end_rect.max.x;
+                            }
+                            let baseline_y = output.galley_pos.y + start_rect.max.y + 1.5;
+
+                            let mut pts: Vec<egui::Pos2> = Vec::new();
+                            let mut x = start_x;
+                            let step = 3.5_f32;
+                            let amp = 1.8_f32;
+                            let mut up = false;
+                            while x < end_x {
+                                let y = if up { baseline_y - amp } else { baseline_y + amp };
+                                pts.push(egui::pos2(x, y));
+                                x += step;
+                                up = !up;
+                            }
+                            pts.push(egui::pos2(end_x, baseline_y));
+                            if pts.len() >= 2 {
+                                painter.line(pts, egui::Stroke::new(1.5, egui::Color32::from_rgb(220, 40, 40)));
+                            }
+                        }
+                    }
 
                     // (No visible drag handles; mouse selection is handled via
                     // galley-based mapping and pointer drag logic below.)
 
-                    // Capture events once and use them both for global handling and
-                    // vim-specific handling below. Make undo/redo available even
-                    // when Vim emulation is disabled by handling Ctrl-Z / Ctrl-Y
-                    // here unconditionally.
-                    let events = ctx.input(|i| i.events.clone());
+                    // Make undo/redo available even when Vim emulation is disabled
+                    // by handling Ctrl-Z / Ctrl-Y here unconditionally.
 
                     for ev in events.iter() {
                         if let Event::Key { key, pressed: true, modifiers, .. } = ev {
@@ -378,62 +1455,20 @@ impl eframe::App for ReportApp {
                                     _ => {}
                                 }
                             }
-                            // Alt + number quick-insert handling. Map Num1..Num9 to visible templates 1..9.
-                            if modifiers.alt {
-                                // Build visible template index list on-demand (same filtering rules as rendering)
-                                let nicips: Vec<String> = self
-                                    .template_nicip
-                                    .split(',')
-                                    .map(|s| s.trim().to_string())
-                                    .filter(|s| !s.is_empty())
-                                    .collect();
-                                let mut visible_indices: Vec<usize> = Vec::new();
-                                for (i, t) in self.templates.iter().enumerate() {
-                                    if !nicips.is_empty() {
-                                        if !t.applicable_codes.is_empty() {
-                                            let mut matched = false;
-                                            for sc in &nicips {
-                                                if t.applicable_codes.iter().any(|ac| ac.eq_ignore_ascii_case(sc)) {
-                                                    matched = true;
-                                                    break;
-                                                }
-                                            }
-                                            if !matched { continue; }
-                                        }
-                                    }
-                                    let title = t.display_title();
-                                    if !self.template_search.is_empty()
-                                        && !title.to_lowercase().contains(&self.template_search.to_lowercase())
-                                        && !t.body.to_lowercase().contains(&self.template_search.to_lowercase())
-                                    {
-                                        continue;
-                                    }
-                                    visible_indices.push(i);
-                                }
 
-                                let target_opt = match key {
-                                    egui::Key::Num1 => Some(0usize),
-                                    egui::Key::Num2 => Some(1usize),
-                                    egui::Key::Num3 => Some(2usize),
-                                    egui::Key::Num4 => Some(3usize),
-                                    egui::Key::Num5 => Some(4usize),
-                                    egui::Key::Num6 => Some(5usize),
-                                    egui::Key::Num7 => Some(6usize),
-                                    egui::Key::Num8 => Some(7usize),
-                                    egui::Key::Num9 => Some(8usize),
-                                    egui::Key::Num0 => Some(9usize),
-                                    _ => None,
-                                };
+                        }
+                    }
 
-                                if let Some(pos) = target_opt {
-                                    if let Some(&tmpl_i) = visible_indices.get(pos) {
-                                        let t = &self.templates[tmpl_i];
-                                        let vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-                                        let rendered = templates::render_template(&t.body, &vars, &self.templates);
-                                        let prepared = self.prepare_body_for_insertion(t, rendered);
-                                        self.buffer.insert_at_caret(&prepared);
-                                    }
+                    // Handle context-menu paste requests in non-interactive mode,
+                    // where TextEdit won't consume Event::Paste itself.
+                    if self.context_paste_requested {
+                        for ev in events.iter() {
+                            if let Event::Paste(paste_text) = ev {
+                                if !is_interactive {
+                                    self.buffer.insert_at_caret(paste_text);
                                 }
+                                self.context_paste_requested = false;
+                                break;
                             }
                         }
                     }
@@ -455,6 +1490,86 @@ impl eframe::App for ReportApp {
                     // from the laid-out galley so the caret still moves without
                     // giving the widget keyboard focus.
                     for ev in events.iter() {
+                        // Capture right-click position so context menus can be anchored
+                        if let Event::PointerButton { pos, pressed, button, .. } = ev {
+                            if *button == egui::PointerButton::Secondary && *pressed {
+                                if output.response.rect.contains(*pos) {
+                                    self.last_right_click_pos = Some(*pos);
+                                } else {
+                                    self.last_right_click_pos = None;
+                                }
+                            }
+                            // Spell menu open: right-click any misspelled word glyph area in either mode.
+                            if *button == egui::PointerButton::Secondary && *pressed && self.spell_enabled {
+                                if output.response.rect.contains(*pos) {
+                                    self.spell_context = None;
+                                    let pointer_pos = *pos;
+                                    let re = regex::Regex::new(r"[A-Za-z']{2,}").unwrap();
+                                    let text = &self.buffer.report;
+                                    for m in re.find_iter(text) {
+                                        let start_byte = m.start();
+                                        let end_byte = m.end();
+                                        let start_char = text[..start_byte].chars().count();
+                                        let word_len_chars = text[start_byte..end_byte].chars().count();
+                                        let end_char = start_char + word_len_chars;
+
+                                        let start_cursor = CCursor::new(start_char);
+                                        let end_cursor = CCursor::new(end_char);
+                                        let start_rect = output.galley.pos_from_cursor(start_cursor);
+                                        let end_rect = output.galley.pos_from_cursor(end_cursor);
+                                        let start_x = output.galley_pos.x + start_rect.min.x;
+                                        let mut end_x = output.galley_pos.x + end_rect.min.x;
+                                        if end_x <= start_x {
+                                            end_x = output.galley_pos.x + end_rect.max.x;
+                                        }
+                                        let top_y = output.galley_pos.y + start_rect.min.y;
+                                        let bottom_y = output.galley_pos.y + start_rect.max.y;
+
+                                        if pointer_pos.x >= start_x && pointer_pos.x <= end_x
+                                            && pointer_pos.y >= top_y && pointer_pos.y <= bottom_y
+                                        {
+                                            let word = m.as_str().to_string();
+                                            if self.check_word_correct(&word) { break; }
+
+                                            // gather suggestions
+                                            let mut suggestions: Vec<String> = Vec::new();
+                                            #[cfg(feature = "hunspell")]
+                                            if let Some(hs) = &self.hunspell {
+                                                suggestions = hs.suggest(&word).clone();
+                                            }
+                                            if suggestions.is_empty() {
+                                                let target = word.to_lowercase();
+                                                let mut cand: Vec<(usize, String)> = self.spell_dict.iter()
+                                                    .filter(|w| {
+                                                        let lw = w.len();
+                                                        let lt = target.len();
+                                                        (lw as isize - lt as isize).abs() <= 3
+                                                    })
+                                                    .map(|w| (levenshtein(&target, w), w.clone()))
+                                                    .collect();
+                                                cand.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+                                                for (d, s) in cand.into_iter().take(8) {
+                                                    if d <= 4 {
+                                                        suggestions.push(s);
+                                                    }
+                                                }
+                                            }
+
+                                            eprintln!("[dbg] vim-mode context word='{}' suggestions={:?}", word, suggestions);
+                                            self.spell_context = Some(SpellContext {
+                                                word: word.clone(),
+                                                start_byte,
+                                                end_byte,
+                                                suggestions: suggestions.clone(),
+                                            });
+                                            self.last_right_click_pos = None;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         if let Event::PointerButton { pos, pressed, button, .. } = ev {
                             if *button != egui::PointerButton::Primary { continue; }
                             // No special handle hit-testing; fall through to normal logic
@@ -469,7 +1584,7 @@ impl eframe::App for ReportApp {
                                     self.buffer.caret_char_range = Some(sorted.clone());
                                     self.last_vim_key = None;
 
-                                    if *pressed {
+                                    if *pressed && self.vim_enabled {
                                         // start drag using the reported cursor position
                                         self.mouse_dragging = true;
                                         self.mouse_drag_anchor = Some(sorted.start);
@@ -500,7 +1615,7 @@ impl eframe::App for ReportApp {
                                 for idx in 0..=total {
                                     let cursor = CCursor::new(idx);
                                     let rect = output.galley.pos_from_cursor(cursor);
-                                    let screen = output.response.rect.min + rect.min.to_vec2();
+                                    let screen = output.galley_pos + rect.min.to_vec2();
                                     let dx = screen.x - pos.x;
                                     let dy = screen.y - pos.y;
                                     let dist = dx * dx + dy * dy;
@@ -552,6 +1667,9 @@ impl eframe::App for ReportApp {
                     for ev in events.iter() {
                         if let Event::PointerMoved(pos) = ev {
                             if !self.mouse_dragging { continue; }
+                            // In non-Vim interactive mode, let TextEdit own drag selection.
+                            // Custom drag mapping is only needed for non-interactive/Vim flows.
+                            if is_interactive && !self.vim_enabled { continue; }
                             // compute nearest char index to mouse pos
                             let pos = *pos;
                             let mut best = 0usize;
@@ -560,7 +1678,7 @@ impl eframe::App for ReportApp {
                             for idx in 0..=total {
                                 let cursor = CCursor::new(idx);
                                 let rect = output.galley.pos_from_cursor(cursor);
-                                let screen = output.response.rect.min + rect.min.to_vec2();
+                                let screen = output.galley_pos + rect.min.to_vec2();
                                 let dx = screen.x - pos.x;
                                 let dy = screen.y - pos.y;
                                 let dist = dx * dx + dy * dy;
@@ -622,16 +1740,26 @@ impl eframe::App for ReportApp {
                                         VimMode::Insert => {
                                             // in Insert mode, normal text events are handled by TextEdit; we only intercept Escape above
                                         }
-                                        _ => {}
                                     }
                                 }
                                 _ => {}
                             }
                         }
+
+                        // Mirror Vim's internal yank register to the OS clipboard by default.
+                        if let Some(yanked_text) = self.buffer.take_yank_for_clipboard() {
+                            ctx.copy_text(yanked_text);
+                        }
                     }
 
-                    // If we already have a desired caret position (e.g. from an insert earlier this frame), push it into widget state
-                    if self.vim_mode == VimMode::Visual || self.vim_mode == VimMode::VisualLine {
+                    // If we already have a desired caret position (e.g. from an insert earlier this frame),
+                    // push it into widget state for Vim/non-interactive flows only.
+                    // In non-Vim interactive mode, let TextEdit own cursor/selection state entirely
+                    // so drag direction (including reverse selection) works natively.
+                    let should_force_widget_cursor = self.vim_enabled || !is_interactive;
+                    if should_force_widget_cursor
+                        && (self.vim_mode == VimMode::Visual || self.vim_mode == VimMode::VisualLine)
+                    {
                         // When in Visual mode, prefer showing a selection between the visual anchor
                         // and the current caret. This drives the TextEdit's selection rendering.
                         if let Some(anchor) = self.visual_anchor {
@@ -671,7 +1799,7 @@ impl eframe::App for ReportApp {
                             output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
                             output.state.store(ui.ctx(), output.response.id);
                         }
-                    } else {
+                    } else if should_force_widget_cursor {
                         if let Some(range) = &self.buffer.caret_char_range {
                             let start = CCursor::new(range.start);
                             let end = CCursor::new(range.end);
@@ -680,8 +1808,10 @@ impl eframe::App for ReportApp {
                         }
                     }
 
-                    // Draw an unfocused caret indicator so the user can see the caret when the editor is not focused.
-                    if !output.response.has_focus() {
+                    // Keep rendering in built-in TextEdit as much as possible.
+                    // Only custom-paint the Vim block caret style, which TextEdit doesn't expose.
+                    let needs_custom_caret = self.vim_enabled && self.vim_mode != VimMode::Insert;
+                    if needs_custom_caret {
                         // Try to use the widget-reported cursor_range, otherwise fall back to our stored `caret_char_range`.
                         let maybe_ccr = output.cursor_range.or_else(|| {
                             self.buffer.caret_char_range.as_ref().map(|r| CCursorRange::two(CCursor::new(r.start), CCursor::new(r.end)))
@@ -692,110 +1822,112 @@ impl eframe::App for ReportApp {
                             let ccursor = ccr.primary;
                             // Position inside the laid-out galley (pos_from_cursor returns a Rect)
                             let galley_pos = output.galley.pos_from_cursor(ccursor);
-                            // Convert to screen coords: widget rect min + galley_pos offset
-                            // Note: `galley_pos` is already positioned relative to the widget; avoid double-adding `output.galley_pos`.
-                            let screen_pos = output.response.rect.min + galley_pos.min.to_vec2();
+                            // Convert to screen coords from galley-local cursor geometry.
+                            let screen_pos = output.galley_pos + galley_pos.min.to_vec2();
                             // Prepare painter for selection/caret drawing
                             let painter = ui.painter();
 
-                            // If Visual mode is active and we have an anchor, draw a selection background
-                            if self.vim_mode == VimMode::Visual || self.vim_mode == VimMode::VisualLine {
-                                if let Some(anchor) = self.visual_anchor {
-                                    let cur = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
-                                    let (s, e_display) = if self.vim_mode == VimMode::VisualLine {
-                                        let (a_s, a_e) = self.buffer.line_bounds_at(anchor);
-                                        let (c_s, c_e) = self.buffer.line_bounds_at(cur);
-                                        let s = a_s.min(c_s);
-                                        let e = a_e.max(c_e).min(self.buffer.char_len());
-                                        (s, e)
-                                    } else {
-                                        let s = anchor.min(cur);
-                                        let e = anchor.max(cur);
-                                        let e_display = if e > s { e.saturating_add(1) } else { e };
-                                        (s, e_display)
-                                    };
-                                    if s < e_display {
-                                        // Determine exact per-line glyph bounds by splitting the selected
-                                        // substring on newline boundaries and mapping each segment back
-                                        // to absolute char indices to query `pos_from_cursor`.
-                                        let report = &self.buffer.report;
-                                        // Avoid drawing a trailing empty segment when the selection
-                                        // ends exactly at a newline in VisualLine mode; that
-                                        // would produce a caret-width highlight on the next line.
-                                        let mut draw_end = e_display;
-                                        if self.vim_mode == VimMode::VisualLine && e_display > s {
-                                            if report.chars().nth(e_display.saturating_sub(1)) == Some('\n') {
-                                                draw_end = e_display.saturating_sub(1);
+                            // In Vim visual modes, TextEdit may not paint selection when non-interactive.
+                            // Paint selection using galley cursor geometry so it lines up with glyphs.
+                            if (self.vim_mode == VimMode::Visual || self.vim_mode == VimMode::VisualLine)
+                                && self.visual_anchor.is_some()
+                            {
+                                let anchor = self.visual_anchor.unwrap_or(0);
+                                let cur = self
+                                    .buffer
+                                    .caret_char_range
+                                    .as_ref()
+                                    .map(|r| r.start)
+                                    .unwrap_or(0);
+
+                                let (sel_start, mut sel_end) = if self.vim_mode == VimMode::VisualLine {
+                                    let (a_s, a_e) = self.buffer.line_bounds_at(anchor);
+                                    let (c_s, c_e) = self.buffer.line_bounds_at(cur);
+                                    (a_s.min(c_s), a_e.max(c_e).min(self.buffer.char_len()))
+                                } else {
+                                    let s = anchor.min(cur);
+                                    let e = anchor.max(cur);
+                                    (s, if e > s { e.saturating_add(1) } else { e })
+                                };
+
+                                sel_end = sel_end.min(self.buffer.char_len());
+                                if sel_start < sel_end {
+                                    let mut line_cursor = sel_start;
+                                    while line_cursor < sel_end {
+                                        let (_, line_end) = self.buffer.line_bounds_at(line_cursor);
+                                        let seg_start = line_cursor;
+                                        let seg_end = line_end.min(sel_end);
+                                        if seg_end <= seg_start {
+                                            break;
+                                        }
+
+                                        let start_pos = output.galley.pos_from_cursor(CCursor::new(seg_start));
+                                        let end_pos = output.galley.pos_from_cursor(CCursor::new(seg_end));
+                                        let mut x0 = output.galley_pos.x + start_pos.min.x;
+                                        let mut x1 = output.galley_pos.x + end_pos.min.x;
+
+                                        if seg_end > seg_start {
+                                            let prev_pos =
+                                                output.galley.pos_from_cursor(CCursor::new(seg_end.saturating_sub(1)));
+                                            let prev_x = output.galley_pos.x + prev_pos.max.x;
+                                            if prev_x > x1 {
+                                                x1 = prev_x;
                                             }
                                         }
-                                        let sel = report.chars().skip(s).take(draw_end.saturating_sub(s)).collect::<String>();
-                                        let mut offset = 0usize;
-                                        let mut abs_index = s;
-                                        for (i, line) in sel.split('\n').enumerate() {
-                                            let line_len = line.chars().count();
-                                            let line_start = abs_index;
-                                            let line_end = abs_index + line_len;
 
-                                            // compute screen coords for line_start and line_end (end is exclusive)
-                                            let start_cursor = CCursor::new(line_start);
-                                            let end_cursor = CCursor::new(line_end);
-                                            let start_pos = output.galley.pos_from_cursor(start_cursor);
-                                            let mut end_pos = output.galley.pos_from_cursor(end_cursor);
-                                            // Also compute the previous glyph rect and use the maximum
-                                            // right edge to ensure the last character is included
-                                            let prev_pos_opt = if line_len > 0 {
-                                                let prev_idx = line_end.saturating_sub(1);
-                                                Some(output.galley.pos_from_cursor(CCursor::new(prev_idx)))
-                                            } else { None };
-
-                                            let start_screen = output.response.rect.min + start_pos.min.to_vec2();
-                                            let mut end_screen_x = output.response.rect.min.x + end_pos.max.x;
-                                            if let Some(prev_pos) = prev_pos_opt {
-                                                let prev_x = output.response.rect.min.x + prev_pos.max.x;
-                                                if prev_x > end_screen_x {
-                                                    end_screen_x = prev_x;
-                                                }
-                                            }
-                                            let end_screen = egui::pos2(end_screen_x, output.response.rect.min.y);
-
-                                            // derive a per-line height from the glyph extents
-                                            let line_h = (start_pos.max.y - start_pos.min.y).abs().max(14.0_f32).min(48.0_f32);
-
-                                            // For empty lines (line_len == 0), draw a caret-width selection
-                                            let x0 = if line_len == 0 { start_screen.x } else { start_screen.x };
-                                            let x1 = if line_len == 0 { start_screen.x + 8.0 } else { end_screen.x };
-                                            let y0 = start_screen.y.clamp(output.response.rect.min.y, output.response.rect.max.y);
-                                            let y1 = (y0 + line_h).min(output.response.rect.max.y);
-                                            let sel_rect = egui::Rect::from_min_max(egui::pos2(x0.clamp(output.response.rect.min.x, output.response.rect.max.x), y0), egui::pos2(x1.clamp(output.response.rect.min.x, output.response.rect.max.x), y1));
-                                            painter.rect_filled(sel_rect, 0.0, egui::Color32::from_rgba_unmultiplied(120, 160, 255, 140));
-
-                                            // advance absolute index past this line and the newline (if present)
-                                            abs_index = line_end + 1; // skip the newline; safe even if at end because we'll not use abs_index further
-                                            offset += line_len + 1;
-                                            if abs_index > draw_end { break; }
+                                        if x1 <= x0 {
+                                            x1 = x0 + 8.0;
                                         }
+
+                                        let line_h = (start_pos.max.y - start_pos.min.y)
+                                            .abs()
+                                            .max(14.0)
+                                            .min(48.0);
+                                        let y0 = (output.galley_pos.y + start_pos.min.y)
+                                            .clamp(output.response.rect.min.y, output.response.rect.max.y);
+                                        let y1 = (y0 + line_h).min(output.response.rect.max.y);
+                                        x0 = x0.clamp(output.response.rect.min.x, output.response.rect.max.x);
+                                        x1 = x1.clamp(output.response.rect.min.x, output.response.rect.max.x);
+
+                                        if x1 > x0 && y1 > y0 {
+                                            let sel_rect = egui::Rect::from_min_max(
+                                                egui::pos2(x0, y0),
+                                                egui::pos2(x1, y1),
+                                            );
+                                            painter.rect_filled(
+                                                sel_rect,
+                                                0.0,
+                                                egui::Color32::from_rgba_unmultiplied(120, 160, 255, 140),
+                                            );
+                                        }
+
+                                        if line_end <= line_cursor {
+                                            break;
+                                        }
+                                        line_cursor = line_end;
                                     }
                                 }
                             }
-                            // No visible drag handles (selection is shown in-text).
-                            // Draw a visible caret as a filled rectangle the width of a character.
-                            let caret_height = 18.0_f32;
-                            // Use the galley cursor rect width as a best-effort char width; fallback to 8.0
+
+                            // Draw a visible caret aligned to the galley cursor rect.
                             let mut char_w = (galley_pos.max.x - galley_pos.min.x).abs();
                             if char_w <= 0.1 {
                                 char_w = 8.0;
                             }
-                            // Nudge the caret slightly right for visual alignment
-                            let nudge = 2.0_f32;
-                            let x = (screen_pos.x + self.caret_x_offset + nudge).clamp(output.response.rect.min.x, output.response.rect.max.x - 1.0);
-                            let y0 = screen_pos.y.clamp(output.response.rect.min.y, output.response.rect.max.y - caret_height);
-                            let y1 = y0 + caret_height;
-                            let x2 = (x + char_w).min(output.response.rect.max.x - 1.0);
+                            let caret_h = (galley_pos.max.y - galley_pos.min.y).abs().max(14.0);
+                            let caret_w = if self.vim_mode == VimMode::Insert { 1.5_f32 } else { char_w };
+                            let effective_x_offset = if self.show_caret_debug { self.caret_x_offset } else { 0.0 };
+                            let x = (screen_pos.x + effective_x_offset)
+                                .clamp(output.response.rect.min.x, output.response.rect.max.x - 1.0);
+                            let y0 = (output.galley_pos.y + galley_pos.min.y)
+                                .clamp(output.response.rect.min.y, output.response.rect.max.y - caret_h);
+                            let y1 = y0 + caret_h;
+                            let x2 = (x + caret_w).min(output.response.rect.max.x - 1.0);
                             let rect = egui::Rect::from_min_max(egui::pos2(x, y0), egui::pos2(x2, y1));
                             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(255, 80, 80));
                             if self.show_caret_debug {
                                 painter.circle_filled(egui::pos2(x, y0), 4.0, egui::Color32::from_rgb(80, 200, 255));
-                                let info = format!("screen: {:.1},{:.1}  char_range: {:?}", screen_pos.x + self.caret_x_offset, screen_pos.y, self.buffer.caret_char_range);
+                                let info = format!("screen: {:.1},{:.1}  char_range: {:?}", screen_pos.x + effective_x_offset, screen_pos.y, self.buffer.caret_char_range);
                                 painter.text(
                                     egui::pos2(output.response.rect.min.x + 6.0, output.response.rect.min.y + 6.0),
                                     egui::Align2::LEFT_TOP,
@@ -843,9 +1975,22 @@ impl eframe::App for ReportApp {
                         ui.checkbox(&mut self.show_caret_debug, "Debug caret pos");
                         let vim_resp = ui.checkbox(&mut self.vim_enabled, "Vim emulation");
                         if vim_resp.changed() {
+                            // ensure we always reset modal state when toggling
                             if self.vim_enabled {
+                                // enabling vim: start in Normal mode
                                 self.vim_mode = VimMode::Normal;
                                 self.last_vim_key = None;
+                                self.last_vim_object = None;
+                                // preserve caret selection as-is
+                            } else {
+                                // disabling vim: clear any visual-mode artifacts
+                                self.vim_mode = VimMode::Normal;
+                                self.last_vim_key = None;
+                                self.last_vim_object = None;
+                                self.visual_anchor = None;
+                                // collapse any selection to a canonical caret position
+                                let cur = self.buffer.caret_char_range.as_ref().map(|r| r.start).unwrap_or(0);
+                                self.buffer.caret_char_range = Some(cur..cur);
                             }
                             // persist settings when user toggles Vim emulation
                             let _ = save_settings(&self.to_settings());
@@ -903,6 +2048,14 @@ impl eframe::App for ReportApp {
                 ui.allocate_ui_at_rect(right_rect, |ui| {
                     ui.vertical(|ui| {
                         ui.heading("Templates");
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Global Vars").clicked() {
+                                // populate edit buffer from current global_vars
+                                let txt = self.global_vars.iter().map(|(k,v)| format!("{}: {}", k, v)).collect::<Vec<_>>().join("\n");
+                                self.global_vars_text = txt;
+                                self.show_global_vars_dialog = true;
+                            }
+                        });
                         ui.separator();
 
                         ui.horizontal(|ui| {
@@ -918,43 +2071,97 @@ impl eframe::App for ReportApp {
                             }
                         });
 
-                        // Template creation/edit/delete buttons removed — view-only in main UI.
+                        ui.separator();
+                        ui.label("Study context");
+                        let mut study_settings_changed = false;
+                        ui.horizontal(|ui| {
+                            ui.label("Source:");
+                            egui::ComboBox::from_id_salt("study_source_mode")
+                                .selected_text(match self.study_mode {
+                                    StudySourceMode::Manual => "Manual",
+                                    StudySourceMode::Integration => "Integration",
+                                    StudySourceMode::Merged => "Merged",
+                                })
+                                .show_ui(ui, |ui| {
+                                    study_settings_changed |= ui
+                                        .selectable_value(
+                                            &mut self.study_mode,
+                                            StudySourceMode::Manual,
+                                            "Manual",
+                                        )
+                                        .changed();
+                                    study_settings_changed |= ui
+                                        .selectable_value(
+                                            &mut self.study_mode,
+                                            StudySourceMode::Integration,
+                                            "Integration",
+                                        )
+                                        .changed();
+                                    study_settings_changed |= ui
+                                        .selectable_value(
+                                            &mut self.study_mode,
+                                            StudySourceMode::Merged,
+                                            "Merged",
+                                        )
+                                        .changed();
+                                });
+                        });
 
-                        let nicips: Vec<String> = self
-                            .template_nicip
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect();
+                        study_settings_changed |= ui
+                            .checkbox(&mut self.study_filter_templates, "Filter templates by active studies")
+                            .changed();
+
+                        ui.horizontal(|ui| {
+                            ui.label("Add manual study:");
+                            ui.text_edit_singleline(&mut self.new_study_input);
+                            if ui.button("Add").clicked() {
+                                for token in self.new_study_input.split(',') {
+                                    let s = Self::normalize_study_label(token);
+                                    if !s.is_empty()
+                                        && !self
+                                            .manual_studies
+                                            .iter()
+                                            .any(|x| x.eq_ignore_ascii_case(&s))
+                                    {
+                                        self.manual_studies.push(s);
+                                        study_settings_changed = true;
+                                    }
+                                }
+                                self.new_study_input.clear();
+                            }
+                            if ui.small_button("Clear manual").clicked() {
+                                self.manual_studies.clear();
+                                study_settings_changed = true;
+                            }
+                        });
+
+                        if !self.manual_studies.is_empty() {
+                            ui.label(format!("Manual: {}", self.manual_studies.join(", ")));
+                        }
+                        if !self.integrated_studies.is_empty() {
+                            ui.label(format!(
+                                "Integration: {}",
+                                self.integrated_studies.join(", ")
+                            ));
+                        }
+                        let active_studies = self.active_studies();
+                        if !active_studies.is_empty() {
+                            ui.label(format!("Active studies: {}", active_studies.join(", ")));
+                            if ui.small_button("Use active studies as NICIP filter").clicked() {
+                                self.template_nicip = active_studies.join(", ");
+                            }
+                        }
+
+                        if study_settings_changed {
+                            let _ = save_settings(&self.to_settings());
+                        }
+
+                        // Template creation/edit/delete buttons removed — view-only in main UI.
 
                         // Build a list of visible template indices after applying filters so
                         // we can both render numeric shortcuts and react to Alt+<n> keys.
                         let templates_list = self.templates.clone();
-                        let mut visible_indices: Vec<usize> = Vec::new();
-                        for (i, t) in templates_list.iter().enumerate() {
-                            if !nicips.is_empty() {
-                                if !t.applicable_codes.is_empty() {
-                                    let mut matched = false;
-                                    for sc in &nicips {
-                                        if t.applicable_codes.iter().any(|ac| ac.eq_ignore_ascii_case(sc)) {
-                                            matched = true;
-                                            break;
-                                        }
-                                    }
-                                    if !matched {
-                                        continue;
-                                    }
-                                }
-                            }
-                            let title = t.display_title();
-                            if !self.template_search.is_empty()
-                                && !title.to_lowercase().contains(&self.template_search.to_lowercase())
-                                && !t.body.to_lowercase().contains(&self.template_search.to_lowercase())
-                            {
-                                continue;
-                            }
-                            visible_indices.push(i);
-                        }
+                        let visible_indices = self.visible_template_indices();
 
                         // Render visible templates with numeric prefixes (1-based) and an Insert button.
                         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -964,20 +2171,18 @@ impl eframe::App for ReportApp {
                                 let num = pos + 1; // 1-based numbering for shortcut keys
                                 ui.horizontal(|ui| {
                                     ui.label(format!("[{}]", num));
-                                    // small insertion-mode indicator
+                                    // small insertion-mode icon
                                     if t.insert_inline {
-                                        ui.label("(inline)");
+                                        ui.label("🔡 Inline");
                                     } else if t.ensure_surrounding_newlines {
-                                        ui.label("(block)");
+                                        ui.label("📦 Block");
                                     } else {
-                                        ui.label("(soft)");
+                                        ui.label("↔️ Soft");
                                     }
                                     if ui.small_button("Insert").clicked() {
-                                        let vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-                                        let rendered = templates::render_template(&t.body, &vars, &self.templates);
-                                        let prepared = self.prepare_body_for_insertion(t, rendered);
-                                        self.buffer.insert_at_caret(&prepared);
+                                        self.insert_template_at_caret(t);
                                     }
+                                    // per-template vars editing removed from this panel (use dedicated dialog)
                                     let selected = self.selected_template.map(|s| s == i).unwrap_or(false);
                                     if ui.selectable_label(selected, title).clicked() {
                                         if selected {
@@ -1021,15 +2226,122 @@ impl eframe::App for ReportApp {
                                         ui.label("Ensure surrounding newlines:");
                                         ui.label(if t.ensure_surrounding_newlines { "yes" } else { "no" });
                                     });
-                                    ui.label("Body preview:");
-                                    let mut preview = t.body.clone();
+                                    ui.horizontal(|ui| {
+                                        ui.label("Body preview:");
+                                        ui.checkbox(&mut self.preview_replace_vars, "Replace variables");
+                                    });
+                                    let mut preview = if self.preview_replace_vars {
+                                        // build merged vars: template defaults <- user overrides <- global vars (fallback)
+                                        let mut vars: std::collections::HashMap<String, String> = t.vars.clone();
+                                        let key = t.id.clone().unwrap_or_else(|| t.title.clone().unwrap_or_else(|| t.display_title()));
+                                        if let Some(user_map) = self.user_template_vars.get(&key) {
+                                            for (k, v) in user_map.iter() {
+                                                vars.insert(k.clone(), v.clone());
+                                            }
+                                        }
+                                        for (k, v) in self.global_vars.iter() {
+                                            vars.entry(k.clone()).or_insert_with(|| v.clone());
+                                        }
+                                        templates::render_template(&t.body, &vars, &self.templates)
+                                    } else {
+                                        t.body.clone()
+                                    };
                                     ui.add(egui::TextEdit::multiline(&mut preview).desired_rows(8).font(egui::TextStyle::Monospace).interactive(false));
+                                    ui.horizontal(|ui| {
+                                        // per-template vars editing removed from this panel
+                                    });
                                 });
                             }
                         }
                     });
                 });
             }
+
+            // Edit-vars dialog (per-user overrides)
+            if let Some(key) = self.show_edit_vars_dialog.clone() {
+                let mut open = true;
+                let txt = &mut self.edit_vars_text;
+                egui::Window::new("Edit template variables").open(&mut open).show(ctx, |ui| {
+                    ui.label(format!("Template: {}", key));
+                    ui.label("Enter one key: value per line:");
+                    ui.add(egui::TextEdit::multiline(txt).desired_rows(10));
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() {
+                            // parse into map
+                            let mut m = HashMap::new();
+                            for line in txt.lines() {
+                                if let Some(idx) = line.find(':') {
+                                    let k = line[..idx].trim();
+                                    let v = line[idx+1..].trim();
+                                    if !k.is_empty() {
+                                        m.insert(k.to_string(), v.to_string());
+                                    }
+                                }
+                            }
+                            self.user_template_vars.insert(key.clone(), m);
+                            self.user_template_vars_dirty = true;
+                            self.show_edit_vars_dialog = None;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.show_edit_vars_dialog = None;
+                        }
+                    });
+                });
+                if !open { self.show_edit_vars_dialog = None; }
+                // persist settings after dialog closed if dirty
+                if self.user_template_vars_dirty {
+                    let _ = save_settings(&self.to_settings());
+                    self.user_template_vars_dirty = false;
+                }
+            }
+
+                // Global variables dialog (centralised vars)
+                if self.show_global_vars_dialog {
+                    let mut open = true;
+                    // collect names first to avoid simultaneous mutable/immutable borrows of self
+                    let var_names = self.collect_template_var_names();
+                    egui::Window::new("Global Variables").open(&mut open).show(ctx, |ui| {
+                        ui.label("Variables referenced by templates (marked = present in global vars):");
+                        ui.horizontal_wrapped(|ui| {
+                            for name in var_names.iter() {
+                                let present = self.global_vars.contains_key(name);
+                                if present {
+                                    ui.colored_label(egui::Color32::LIGHT_GREEN, format!("{} ✓", name));
+                                } else {
+                                    ui.colored_label(egui::Color32::LIGHT_RED, format!("{}", name));
+                                }
+                            }
+                        });
+                        ui.separator();
+                        ui.label("Enter one key: value per line:");
+                        ui.add(egui::TextEdit::multiline(&mut self.global_vars_text).desired_rows(12));
+                        ui.horizontal(|ui| {
+                            if ui.button("Save").clicked() {
+                                let mut m = HashMap::new();
+                                for line in self.global_vars_text.lines() {
+                                    if let Some(idx) = line.find(':') {
+                                        let k = line[..idx].trim();
+                                        let v = line[idx+1..].trim();
+                                        if !k.is_empty() {
+                                            m.insert(k.to_string(), v.to_string());
+                                        }
+                                    }
+                                }
+                                self.global_vars = m;
+                                self.global_vars_dirty = true;
+                                self.show_global_vars_dialog = false;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                self.show_global_vars_dialog = false;
+                            }
+                        });
+                    });
+                    if !open { self.show_global_vars_dialog = false; }
+                    if self.global_vars_dirty {
+                        let _ = save_settings(&self.to_settings());
+                        self.global_vars_dirty = false;
+                    }
+                }
 
             // Template editor window
             if self.show_template_editor {
@@ -1109,4 +2421,3 @@ fn main() {
         Box::new(|_cc| Ok(Box::new(ReportApp::default()))),
     );
 }
-

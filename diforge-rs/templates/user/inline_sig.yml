@@ -1,10 +1,8 @@
-id: inline_signature
+id: inline_sig
 title: Inline Signature
 applicable_codes: []
 modalities: []
-body: |
-  - Electronically signed by {{dr}}
-vars: {}
+body: '{{name}}'
 insert_inline: true
 ensure_surrounding_newlines: false
-inline_finish: None
+inline_finish: Both

@@ -1,10 +1,8 @@
-id: inline_signature
-title: Inline Signature
+id: inline_time
+title: Inline Time
 applicable_codes: []
 modalities: []
-body: |
-  - Electronically signed by {{dr}}
-vars: {}
+body: "Current time: {{time}}"
 insert_inline: true
 ensure_surrounding_newlines: false
 inline_finish: None
