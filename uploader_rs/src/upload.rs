@@ -3,7 +3,7 @@ use reqwest::blocking::multipart::{Form, Part};
 use std::path::{Path, PathBuf};
 use std::fs::File;
 use blake3;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use dicom_object::open_file;
 use dicom_object::Tag;
 use dicom_pixeldata::PixelDecoder;
@@ -120,13 +120,18 @@ pub fn evict_missing_ready_files() {
 }
 
 fn build_series_from_ready_files(items: &[ReadyFileInfo]) -> Vec<SeriesInfo> {
-    let mut grouped: HashMap<String, Vec<ReadyFileInfo>> = HashMap::new();
+    // Use BTreeMap for deterministic series ordering in UI snapshots.
+    let mut grouped: BTreeMap<String, Vec<ReadyFileInfo>> = BTreeMap::new();
     for it in items {
         grouped.entry(it.series_uid.clone()).or_default().push(it.clone());
     }
 
     let mut out: Vec<SeriesInfo> = Vec::new();
     for (series_uid, files) in grouped.into_iter() {
+        let mut files = files;
+        // Stable file ordering within each series prevents UI rows from jumping.
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+
         let mut entries: Vec<FileEntry> = Vec::new();
         let mut urls: HashSet<String> = HashSet::new();
         let mut total_bytes: u64 = 0;
@@ -195,11 +200,9 @@ pub fn snapshot_ready_series(anon_dir: &Path) -> Vec<SeriesInfo> {
 }
 
 pub fn upsert_ready_file(path: &Path, known_hash: Option<String>) -> Result<(), String> {
-    let hash = if let Some(h) = known_hash {
-        h
-    } else {
-        calculate_hash(path).ok_or_else(|| format!("Failed to hash {}", path.display()))?
-    };
+    // Empty hash means no PixelData was available; file remains uploadable
+    // but is skipped by duplicate precheck (which only accepts pixel hashes).
+    let hash = known_hash.or_else(|| calculate_pixel_hash(path)).unwrap_or_default();
 
     let obj = open_file(path).map_err(|e| format!("open_file {}: {}", path.display(), e))?;
     let series_uid = obj
@@ -710,8 +713,10 @@ pub fn make_client(token: Option<&str>) -> Result<Client, String> {
     Ok(client)
 }
 
-fn calculate_hash(path: &Path) -> Option<String> {
-    // Prefer hashing the PixelData element (7FE0,0010) if present
+pub fn calculate_pixel_hash(path: &Path) -> Option<String> {
+    // Duplicate detection must hash pixel data only.
+    // Full-file hashing is intentionally disallowed because metadata changes
+    // would produce different hashes for the same image content.
     if let Ok(obj) = open_file(path) {
         // Preferred: hash decoded pixel bytes.
         if let Ok(pixel_data) = obj.decode_pixel_data() {
@@ -732,12 +737,7 @@ fn calculate_hash(path: &Path) -> Option<String> {
             }
         }
     }
-
-    // Fallback: hash the entire file bytes
-    match std::fs::read(path) {
-        Ok(bytes) => Some(blake3::hash(&bytes).to_hex().to_string()),
-        Err(_) => None,
-    }
+    None
 }
 
 pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::sync::mpsc::Sender<String>>) -> Result<UploadResult, String> {
@@ -956,13 +956,6 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
                 } else if let Ok(s) = elem.to_str() {
                     h_opt = Some(blake3::hash(s.as_bytes()).to_hex().to_string());
                 }
-            }
-        }
-
-        // fallback: hash full file bytes if we don't have a pixel/hash yet
-        if h_opt.is_none() {
-            if let Ok(bytes) = std::fs::read(p) {
-                h_opt = Some(blake3::hash(&bytes).to_hex().to_string());
             }
         }
 

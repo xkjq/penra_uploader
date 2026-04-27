@@ -1,5 +1,11 @@
 Project: uploader (Python + Rust)
 
+Critical policy: duplicate detection hashing
+- Duplicate detection must use PixelData-only hashing.
+- Do not use full-file hashing for duplicate checks.
+- Reason: metadata may differ between exports while image pixels are identical; full-file hashes would miss true duplicates.
+- Canonical implementation location: uploader_rs/src/upload.rs (`calculate_pixel_hash`).
+
 Purpose
 - Anonymiser + uploader for DICOM files. Rust port (`uploader_rs`) aims for parity with Python dicognito-based anonymiser and the existing Nice uploader flow.
 

@@ -14,7 +14,6 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use rayon::prelude::*;
-use blake3;
 use std::fs;
 use rfd::FileDialog;
 use interprocess::local_socket::{LocalSocketListener, LocalSocketStream};
@@ -100,13 +99,14 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                         match anonymize_file(p, &anon_dir, true, false, false, seed.as_deref()) {
                             Ok(out) => {
                                 let _ = tx.send(format!("Anonymized: {}", out.display()));
-                                if let Ok(bytes) = fs::read(&out) {
-                                    let hash = blake3::hash(&bytes);
-                                    let hash_hex = hash.to_hex().to_string();
+                                let pixel_hash = upload::calculate_pixel_hash(&out);
+                                if let Some(hash_hex) = &pixel_hash {
                                     let _ = tx.send(format!("Hash {}: {}", out.display(), hash_hex));
-                                    if let Err(e) = upload::upsert_ready_file(&out, Some(hash_hex)) {
-                                        let _ = tx.send(format!("Ready-manifest update skipped for {}: {}", out.display(), e));
-                                    }
+                                } else {
+                                    let _ = tx.send(format!("Hash {}: <no PixelData>", out.display()));
+                                }
+                                if let Err(e) = upload::upsert_ready_file(&out, pixel_hash) {
+                                    let _ = tx.send(format!("Ready-manifest update skipped for {}: {}", out.display(), e));
                                 }
                             }
                             Err(e) => {
