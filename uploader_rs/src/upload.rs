@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use tracing::Level;
 
 static SCAN_RUNNING: AtomicBool = AtomicBool::new(false);
+static SCAN_PENDING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadyFileInfo {
@@ -297,59 +298,78 @@ pub fn refresh_duplicates_for_ready(anon_dir: &Path, tx: Option<std::sync::mpsc:
     let hashes: Vec<String> = items.iter().map(|it| it.hash.clone()).filter(|h| !h.is_empty()).collect();
     let mut duplicate_hashes: HashSet<String> = HashSet::new();
     let mut duplicate_urls_by_hash: HashMap<String, Vec<String>> = HashMap::new();
+    let mut duplicate_lookup_succeeded = hashes.is_empty();
 
     if !hashes.is_empty() {
         let client = make_client(load_api_token().as_deref())?;
         let base = base_site_url();
         let hash_check_url = format!("{}{}", base, "/api/atlas/check_image_hashes/");
         log_rpc(&format!("POST {} with {} hashes", hash_check_url, hashes.len()));
-        if let Ok(r) = client.post(&hash_check_url).json(&hashes).send() {
-            let status = r.status();
-            if let Ok(body) = r.text() {
-                if let Some(pf) = save_body_to_file(&body) {
-                    log_rpc_debug(&format!("Response {}: {} BODY_FILE:{}", hash_check_url, status, pf.display()));
-                }
-                if status.is_success() {
-                    if let Ok(map) = serde_json::from_str::<serde_json::Value>(&body) {
-                        if let Some(obj) = map.as_object() {
-                            for (hash_val, info) in obj.iter() {
-                                if let Some(id) = info.get("id") {
-                                    if json_value_truthy(id) {
-                                        duplicate_hashes.insert(hash_val.clone());
-                                        if let Some(urls) = info.get("url").and_then(|v| v.as_str()) {
-                                            let full = if urls.starts_with("http") {
-                                                urls.to_string()
-                                            } else if urls.starts_with('/') {
-                                                format!("{}{}", base.trim_end_matches('/'), urls)
-                                            } else {
-                                                format!("{}/{}", base.trim_end_matches('/'), urls)
-                                            };
-                                            duplicate_urls_by_hash.entry(hash_val.clone()).or_default().push(full);
+        match client.post(&hash_check_url).json(&hashes).send() {
+            Ok(r) => {
+                let status = r.status();
+                if let Ok(body) = r.text() {
+                    if let Some(pf) = save_body_to_file(&body) {
+                        log_rpc_debug(&format!("Response {}: {} BODY_FILE:{}", hash_check_url, status, pf.display()));
+                    }
+                    if status.is_success() {
+                        if let Ok(map) = serde_json::from_str::<serde_json::Value>(&body) {
+                            if let Some(obj) = map.as_object() {
+                                duplicate_lookup_succeeded = true;
+                                for (hash_val, info) in obj.iter() {
+                                    if let Some(id) = info.get("id") {
+                                        if json_value_truthy(id) {
+                                            duplicate_hashes.insert(hash_val.clone());
+                                            if let Some(urls) = info.get("url").and_then(|v| v.as_str()) {
+                                                let full = if urls.starts_with("http") {
+                                                    urls.to_string()
+                                                } else if urls.starts_with('/') {
+                                                    format!("{}{}", base.trim_end_matches('/'), urls)
+                                                } else {
+                                                    format!("{}/{}", base.trim_end_matches('/'), urls)
+                                                };
+                                                duplicate_urls_by_hash.entry(hash_val.clone()).or_default().push(full);
+                                            }
                                         }
                                     }
                                 }
                             }
+                        } else {
+                            log_rpc_warn("Duplicate lookup response JSON parse failed; preserving existing duplicate flags");
                         }
+                    } else {
+                        log_rpc_warn(&format!("Duplicate lookup failed HTTP {}; preserving existing duplicate flags", status));
                     }
+                } else {
+                    log_rpc_warn("Duplicate lookup body read failed; preserving existing duplicate flags");
                 }
+            }
+            Err(e) => {
+                log_rpc_warn(&format!("Duplicate lookup request failed: {}; preserving existing duplicate flags", e));
             }
         }
     }
 
-    if let Ok(mut g) = READY_FILES.lock() {
-        for rf in g.values_mut() {
-            if !rf.path.starts_with(anon_dir) {
-                continue;
+    if duplicate_lookup_succeeded {
+        if let Ok(mut g) = READY_FILES.lock() {
+            for rf in g.values_mut() {
+                if !rf.path.starts_with(anon_dir) {
+                    continue;
+                }
+                if duplicate_hashes.contains(&rf.hash) {
+                    rf.is_duplicate = true;
+                    rf.duplicate_series_urls = duplicate_urls_by_hash.get(&rf.hash).cloned().unwrap_or_default();
+                } else {
+                    rf.is_duplicate = false;
+                    rf.duplicate_series_urls.clear();
+                }
             }
-            if duplicate_hashes.contains(&rf.hash) {
-                rf.is_duplicate = true;
-                rf.duplicate_series_urls = duplicate_urls_by_hash.get(&rf.hash).cloned().unwrap_or_default();
-            } else {
-                rf.is_duplicate = false;
-                rf.duplicate_series_urls.clear();
-            }
+            persist_ready_manifest_locked(&g);
         }
-        persist_ready_manifest_locked(&g);
+    } else {
+        if let Some(ref s) = tx {
+            let _ = s.send("Duplicate refresh unavailable; keeping previous duplicate flags".to_string());
+        }
     }
 
     if let Some(ref s) = tx {
@@ -1159,37 +1179,50 @@ pub fn request_scan(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>
         let anon_dir = anon_dir.to_path_buf();
         // spawn background thread to refresh duplicate status from cached ready entries
         std::thread::spawn(move || {
-            if let Err(e) = ensure_ready_cache(&anon_dir, tx.clone()) {
-                if let Some(ref s) = tx {
-                    let _ = s.send(format!("Ready-cache bootstrap failed: {}", e));
+            loop {
+                if let Err(e) = ensure_ready_cache(&anon_dir, tx.clone()) {
+                    if let Some(ref s) = tx {
+                        let _ = s.send(format!("Ready-cache bootstrap failed: {}", e));
+                    }
                 }
-            }
-            match refresh_duplicates_for_ready(&anon_dir, tx.clone()) {
-                Ok(series) => {
-                    // store parsed series in-memory for quick UI pickup
-                    store_last_scan(series.clone());
-                    if let Ok(json) = serde_json::to_string(&series) {
-                        let _ = std::fs::write(".last_scan.json", json);
+
+                match refresh_duplicates_for_ready(&anon_dir, tx.clone()) {
+                    Ok(series) => {
+                        // store parsed series in-memory for quick UI pickup
+                        store_last_scan(series.clone());
+                        if let Ok(json) = serde_json::to_string(&series) {
+                            let _ = std::fs::write(".last_scan.json", json);
+                            if let Some(ref s) = tx {
+                                let _ = s.send("scan_written".to_string());
+                                let _ = s.send("done".to_string());
+                            }
+                        } else if let Some(ref s) = tx {
+                            let _ = s.send("scan_serialize_failed".to_string());
+                        }
+                    }
+                    Err(e) => {
                         if let Some(ref s) = tx {
-                            let _ = s.send("scan_written".to_string());
+                            let _ = s.send(format!("Scan failed: {}", e));
                             let _ = s.send("done".to_string());
                         }
-                    } else if let Some(ref s) = tx {
-                        let _ = s.send("scan_serialize_failed".to_string());
                     }
                 }
-                Err(e) => {
-                    if let Some(ref s) = tx {
-                        let _ = s.send(format!("Scan failed: {}", e));
-                        let _ = s.send("done".to_string());
-                    }
+
+                // If another scan request arrived while we were running,
+                // immediately run one more pass so UI reflects latest state.
+                if !SCAN_PENDING.swap(false, Ordering::SeqCst) {
+                    break;
+                }
+                if let Some(ref s) = tx {
+                    let _ = s.send("scan_rerun".to_string());
                 }
             }
             SCAN_RUNNING.store(false, Ordering::SeqCst);
         });
         Ok(())
     } else {
-        // a scan is already running; indicate queued/ignored
+        // a scan is already running; coalesce another pass when it completes
+        SCAN_PENDING.store(true, Ordering::SeqCst);
         if let Some(ref s) = tx {
             let _ = s.send("scan_queued".to_string());
         }
