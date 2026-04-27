@@ -18,6 +18,15 @@ static SCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 static SCAN_PENDING: AtomicBool = AtomicBool::new(false);
 const DUPLICATE_LOOKUP_TIMEOUT_SECS: u64 = 60;
 
+#[derive(Debug, Clone, Default)]
+struct DuplicateLookupResult {
+    is_duplicate: bool,
+    urls: Vec<String>,
+}
+
+static DUPLICATE_LOOKUP_CACHE: Lazy<Mutex<HashMap<String, DuplicateLookupResult>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadyFileInfo {
     pub path: PathBuf,
@@ -246,6 +255,125 @@ pub fn remove_ready_file(path: &Path) {
     }
 }
 
+pub fn clear_duplicate_lookup_cache() {
+    if let Ok(mut g) = DUPLICATE_LOOKUP_CACHE.lock() {
+        g.clear();
+    }
+}
+
+fn refresh_duplicate_lookup_cache(
+    hashes: &[String],
+    force_refresh: bool,
+) -> Result<bool, String> {
+    if hashes.is_empty() {
+        return Ok(true);
+    }
+
+    let query_hashes: Vec<String> = if force_refresh {
+        hashes.to_vec()
+    } else if let Ok(cache) = DUPLICATE_LOOKUP_CACHE.lock() {
+        hashes
+            .iter()
+            .filter(|h| !cache.contains_key((*h).as_str()))
+            .cloned()
+            .collect()
+    } else {
+        hashes.to_vec()
+    };
+
+    if query_hashes.is_empty() {
+        return Ok(true);
+    }
+
+    let client = make_client(load_api_token().as_deref())?;
+    let base = base_site_url();
+    let hash_check_url = format!("{}{}", base, "/api/atlas/check_image_hashes/");
+    log_rpc(&format!(
+        "POST {} with {} hashes",
+        hash_check_url,
+        query_hashes.len()
+    ));
+
+    let r = match client
+        .post(&hash_check_url)
+        .timeout(Duration::from_secs(DUPLICATE_LOOKUP_TIMEOUT_SECS))
+        .json(&query_hashes)
+        .send()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            log_rpc_warn(&format!(
+                "Duplicate lookup request failed: {}; preserving existing duplicate flags",
+                e
+            ));
+            return Ok(false);
+        }
+    };
+
+    let status = r.status();
+    let body = match r.text() {
+        Ok(b) => b,
+        Err(_) => {
+            log_rpc_warn("Duplicate lookup body read failed; preserving existing duplicate flags");
+            return Ok(false);
+        }
+    };
+
+    if let Some(pf) = save_body_to_file(&body) {
+        log_rpc_debug(&format!("Response {}: {} BODY_FILE:{}", hash_check_url, status, pf.display()));
+    }
+
+    if !status.is_success() {
+        log_rpc_warn(&format!(
+            "Duplicate lookup failed HTTP {}; preserving existing duplicate flags",
+            status
+        ));
+        return Ok(false);
+    }
+
+    let map = match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            log_rpc_warn("Duplicate lookup response JSON parse failed; preserving existing duplicate flags");
+            return Ok(false);
+        }
+    };
+
+    let obj = match map.as_object() {
+        Some(o) => o,
+        None => {
+            log_rpc_warn("Duplicate lookup response shape invalid; preserving existing duplicate flags");
+            return Ok(false);
+        }
+    };
+
+    if let Ok(mut cache) = DUPLICATE_LOOKUP_CACHE.lock() {
+        for h in &query_hashes {
+            let mut res = DuplicateLookupResult::default();
+            if let Some(info) = obj.get(h) {
+                if let Some(id) = info.get("id") {
+                    if json_value_truthy(id) {
+                        res.is_duplicate = true;
+                        if let Some(urls) = info.get("url").and_then(|v| v.as_str()) {
+                            let full = if urls.starts_with("http") {
+                                urls.to_string()
+                            } else if urls.starts_with('/') {
+                                format!("{}{}", base.trim_end_matches('/'), urls)
+                            } else {
+                                format!("{}/{}", base.trim_end_matches('/'), urls)
+                            };
+                            res.urls.push(full);
+                        }
+                    }
+                }
+            }
+            cache.insert(h.clone(), res);
+        }
+    }
+
+    Ok(true)
+}
+
 fn ensure_ready_cache(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>) -> Result<(), String> {
     let existing = collect_ready_for_dir(anon_dir);
     if !existing.is_empty() {
@@ -284,7 +412,25 @@ fn ensure_ready_cache(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String
     Ok(())
 }
 
-pub fn refresh_duplicates_for_ready(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>) -> Result<Vec<SeriesInfo>, String> {
+pub fn refresh_duplicates_for_ready(
+    anon_dir: &Path,
+    tx: Option<std::sync::mpsc::Sender<String>>,
+) -> Result<Vec<SeriesInfo>, String> {
+    refresh_duplicates_for_ready_mode(anon_dir, tx, false)
+}
+
+pub fn refresh_duplicates_for_ready_force(
+    anon_dir: &Path,
+    tx: Option<std::sync::mpsc::Sender<String>>,
+) -> Result<Vec<SeriesInfo>, String> {
+    refresh_duplicates_for_ready_mode(anon_dir, tx, true)
+}
+
+fn refresh_duplicates_for_ready_mode(
+    anon_dir: &Path,
+    tx: Option<std::sync::mpsc::Sender<String>>,
+    force_refresh: bool,
+) -> Result<Vec<SeriesInfo>, String> {
     evict_missing_ready_files();
     let items = collect_ready_for_dir(anon_dir);
     if items.is_empty() {
@@ -297,82 +443,27 @@ pub fn refresh_duplicates_for_ready(anon_dir: &Path, tx: Option<std::sync::mpsc:
     }
 
     let hashes: Vec<String> = items.iter().map(|it| it.hash.clone()).filter(|h| !h.is_empty()).collect();
-    let mut duplicate_hashes: HashSet<String> = HashSet::new();
-    let mut duplicate_urls_by_hash: HashMap<String, Vec<String>> = HashMap::new();
-    let mut duplicate_lookup_succeeded = hashes.is_empty();
+    let duplicate_lookup_succeeded = refresh_duplicate_lookup_cache(&hashes, force_refresh)?;
 
-    if !hashes.is_empty() {
-        let client = make_client(load_api_token().as_deref())?;
-        let base = base_site_url();
-        let hash_check_url = format!("{}{}", base, "/api/atlas/check_image_hashes/");
-        log_rpc(&format!("POST {} with {} hashes", hash_check_url, hashes.len()));
-        match client
-            .post(&hash_check_url)
-            .timeout(Duration::from_secs(DUPLICATE_LOOKUP_TIMEOUT_SECS))
-            .json(&hashes)
-            .send()
-        {
-            Ok(r) => {
-                let status = r.status();
-                if let Ok(body) = r.text() {
-                    if let Some(pf) = save_body_to_file(&body) {
-                        log_rpc_debug(&format!("Response {}: {} BODY_FILE:{}", hash_check_url, status, pf.display()));
-                    }
-                    if status.is_success() {
-                        if let Ok(map) = serde_json::from_str::<serde_json::Value>(&body) {
-                            if let Some(obj) = map.as_object() {
-                                duplicate_lookup_succeeded = true;
-                                for (hash_val, info) in obj.iter() {
-                                    if let Some(id) = info.get("id") {
-                                        if json_value_truthy(id) {
-                                            duplicate_hashes.insert(hash_val.clone());
-                                            if let Some(urls) = info.get("url").and_then(|v| v.as_str()) {
-                                                let full = if urls.starts_with("http") {
-                                                    urls.to_string()
-                                                } else if urls.starts_with('/') {
-                                                    format!("{}{}", base.trim_end_matches('/'), urls)
-                                                } else {
-                                                    format!("{}/{}", base.trim_end_matches('/'), urls)
-                                                };
-                                                duplicate_urls_by_hash.entry(hash_val.clone()).or_default().push(full);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            log_rpc_warn("Duplicate lookup response JSON parse failed; preserving existing duplicate flags");
-                        }
-                    } else {
-                        log_rpc_warn(&format!("Duplicate lookup failed HTTP {}; preserving existing duplicate flags", status));
-                    }
-                } else {
-                    log_rpc_warn("Duplicate lookup body read failed; preserving existing duplicate flags");
-                }
+    if let Ok(mut g) = READY_FILES.lock() {
+        let cache = DUPLICATE_LOOKUP_CACHE
+            .lock()
+            .ok()
+            .map(|c| c.clone())
+            .unwrap_or_default();
+        for rf in g.values_mut() {
+            if !rf.path.starts_with(anon_dir) {
+                continue;
             }
-            Err(e) => {
-                log_rpc_warn(&format!("Duplicate lookup request failed: {}; preserving existing duplicate flags", e));
+            if let Some(res) = cache.get(&rf.hash) {
+                rf.is_duplicate = res.is_duplicate;
+                rf.duplicate_series_urls = res.urls.clone();
             }
         }
+        persist_ready_manifest_locked(&g);
     }
 
-    if duplicate_lookup_succeeded {
-        if let Ok(mut g) = READY_FILES.lock() {
-            for rf in g.values_mut() {
-                if !rf.path.starts_with(anon_dir) {
-                    continue;
-                }
-                if duplicate_hashes.contains(&rf.hash) {
-                    rf.is_duplicate = true;
-                    rf.duplicate_series_urls = duplicate_urls_by_hash.get(&rf.hash).cloned().unwrap_or_default();
-                } else {
-                    rf.is_duplicate = false;
-                    rf.duplicate_series_urls.clear();
-                }
-            }
-            persist_ready_manifest_locked(&g);
-        }
-    } else {
+    if !duplicate_lookup_succeeded {
         if let Some(ref s) = tx {
             let _ = s.send("Duplicate refresh unavailable; keeping previous duplicate flags".to_string());
         }

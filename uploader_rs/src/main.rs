@@ -963,6 +963,29 @@ impl eframe::App for AppState {
                             });
                         }
                         ui.add_space(8.0);
+                        if ui.button("Refresh duplicate checks").clicked() {
+                            let anon_dir = self.anon_dir();
+                            let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
+                            thread::spawn(move || {
+                                upload::clear_duplicate_lookup_cache();
+                                match upload::refresh_duplicates_for_ready_force(&anon_dir, Some(tx.clone())) {
+                                    Ok(new_series) => {
+                                        if let Ok(json2) = serde_json::to_string(&new_series) {
+                                            upload::store_last_scan(new_series.clone());
+                                            let _ = std::fs::write(".last_scan.json", &json2);
+                                            let b64 = base64::encode(json2.as_bytes());
+                                            let _ = tx.send(format!("SCAN:SET:{}", b64));
+                                            let _ = tx.send("scan_written".to_string());
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(format!("Duplicate refresh failed: {}", e));
+                                    }
+                                }
+                                let _ = tx.send("done".to_string());
+                            });
+                        }
+                        ui.add_space(8.0);
                         if ui.button("Compare selected metadata").clicked() {
                             self.metadata_select_mode = true;
                             self.selected_files_for_meta.clear();
