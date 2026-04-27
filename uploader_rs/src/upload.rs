@@ -10,12 +10,28 @@ use dicom_pixeldata::PixelDecoder;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use serde::{Serialize, Deserialize};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender as MpscSender;
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use tracing::Level;
 
 static SCAN_RUNNING: AtomicBool = AtomicBool::new(false);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadyFileInfo {
+    pub path: PathBuf,
+    pub hash: String,
+    pub series_uid: String,
+    pub is_duplicate: bool,
+    pub duplicate_series_urls: Vec<String>,
+    pub patient_name: Option<String>,
+    pub examination: Option<String>,
+    pub patient_id: Option<String>,
+    pub study_date: Option<String>,
+    pub modality: Option<String>,
+    pub series_description: Option<String>,
+    pub series_number: Option<String>,
+    pub file_size: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -47,6 +63,296 @@ pub struct UploadResult {
     pub duplicates: Vec<(String, String)>,
     pub failed: Vec<String>,
     pub duplicate_series: HashSet<String>,
+}
+
+static READY_FILES: Lazy<Mutex<HashMap<String, ReadyFileInfo>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn ready_manifest_path() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let cfg = home.join(".uploader");
+    let _ = std::fs::create_dir_all(&cfg);
+    cfg.join("ready_manifest.json")
+}
+
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
+fn persist_ready_manifest_locked(map: &HashMap<String, ReadyFileInfo>) {
+    if let Ok(json) = serde_json::to_string(map) {
+        let _ = std::fs::write(ready_manifest_path(), json);
+    }
+}
+
+fn collect_ready_for_dir(anon_dir: &Path) -> Vec<ReadyFileInfo> {
+    if let Ok(g) = READY_FILES.lock() {
+        return g
+            .values()
+            .filter(|rf| rf.path.starts_with(anon_dir) && rf.path.exists())
+            .cloned()
+            .collect();
+    }
+    Vec::new()
+}
+
+pub fn load_ready_manifest() {
+    let p = ready_manifest_path();
+    if !p.exists() {
+        return;
+    }
+    if let Ok(s) = std::fs::read_to_string(&p) {
+        if let Ok(v) = serde_json::from_str::<HashMap<String, ReadyFileInfo>>(&s) {
+            if let Ok(mut g) = READY_FILES.lock() {
+                *g = v;
+            }
+        }
+    }
+}
+
+pub fn evict_missing_ready_files() {
+    if let Ok(mut g) = READY_FILES.lock() {
+        let before = g.len();
+        g.retain(|_, rf| rf.path.exists());
+        if g.len() != before {
+            persist_ready_manifest_locked(&g);
+        }
+    }
+}
+
+fn build_series_from_ready_files(items: &[ReadyFileInfo]) -> Vec<SeriesInfo> {
+    let mut grouped: HashMap<String, Vec<ReadyFileInfo>> = HashMap::new();
+    for it in items {
+        grouped.entry(it.series_uid.clone()).or_default().push(it.clone());
+    }
+
+    let mut out: Vec<SeriesInfo> = Vec::new();
+    for (series_uid, files) in grouped.into_iter() {
+        let mut entries: Vec<FileEntry> = Vec::new();
+        let mut urls: HashSet<String> = HashSet::new();
+        let mut total_bytes: u64 = 0;
+        let mut patient_name = None;
+        let mut examination = None;
+        let mut patient_id = None;
+        let mut study_date = None;
+        let mut modality = None;
+        let mut series_description = None;
+        let mut series_number = None;
+
+        for rf in &files {
+            entries.push(FileEntry {
+                path: rf.path.clone(),
+                hash: rf.hash.clone(),
+                is_duplicate: rf.is_duplicate,
+            });
+            for u in &rf.duplicate_series_urls {
+                urls.insert(u.clone());
+            }
+            total_bytes = total_bytes.saturating_add(rf.file_size);
+            if patient_name.is_none() {
+                patient_name = rf.patient_name.clone();
+            }
+            if examination.is_none() {
+                examination = rf.examination.clone();
+            }
+            if patient_id.is_none() {
+                patient_id = rf.patient_id.clone();
+            }
+            if study_date.is_none() {
+                study_date = rf.study_date.clone();
+            }
+            if modality.is_none() {
+                modality = rf.modality.clone();
+            }
+            if series_description.is_none() {
+                series_description = rf.series_description.clone();
+            }
+            if series_number.is_none() {
+                series_number = rf.series_number.clone();
+            }
+        }
+
+        out.push(SeriesInfo {
+            series_uid,
+            files: entries,
+            duplicate_series_urls: urls.into_iter().collect(),
+            patient_name,
+            examination,
+            patient_id,
+            study_date,
+            modality,
+            series_description,
+            series_number,
+            file_count: files.len(),
+            total_bytes,
+        });
+    }
+    out
+}
+
+pub fn snapshot_ready_series(anon_dir: &Path) -> Vec<SeriesInfo> {
+    let items = collect_ready_for_dir(anon_dir);
+    build_series_from_ready_files(&items)
+}
+
+pub fn upsert_ready_file(path: &Path, known_hash: Option<String>) -> Result<(), String> {
+    let hash = if let Some(h) = known_hash {
+        h
+    } else {
+        calculate_hash(path).ok_or_else(|| format!("Failed to hash {}", path.display()))?
+    };
+
+    let obj = open_file(path).map_err(|e| format!("open_file {}: {}", path.display(), e))?;
+    let series_uid = obj
+        .element(Tag(0x0020, 0x000E))
+        .ok()
+        .and_then(|e| e.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "NO_SERIES".to_string());
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
+    let info = ReadyFileInfo {
+        path: path.to_path_buf(),
+        hash,
+        series_uid,
+        is_duplicate: false,
+        duplicate_series_urls: Vec::new(),
+        patient_name: obj.element(Tag(0x0010, 0x0010)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()),
+        examination: obj.element(Tag(0x0008, 0x1030)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()),
+        patient_id: obj.element(Tag(0x0010, 0x0020)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()),
+        study_date: obj.element(Tag(0x0008, 0x0020)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()),
+        modality: obj.element(Tag(0x0008, 0x0060)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()),
+        series_description: obj.element(Tag(0x0008, 0x103E)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()),
+        series_number: obj.element(Tag(0x0020, 0x0011)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()),
+        file_size,
+    };
+
+    if let Ok(mut g) = READY_FILES.lock() {
+        g.insert(path_key(path), info);
+        persist_ready_manifest_locked(&g);
+    }
+    Ok(())
+}
+
+pub fn remove_ready_file(path: &Path) {
+    if let Ok(mut g) = READY_FILES.lock() {
+        if g.remove(&path_key(path)).is_some() {
+            persist_ready_manifest_locked(&g);
+        }
+    }
+}
+
+fn ensure_ready_cache(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>) -> Result<(), String> {
+    let existing = collect_ready_for_dir(anon_dir);
+    if !existing.is_empty() {
+        return Ok(());
+    }
+
+    let files = collect_files_recursive(anon_dir);
+    let mut dcm_like: Vec<PathBuf> = Vec::new();
+    for p in files {
+        if p.is_file() {
+            dcm_like.push(p);
+        }
+    }
+    if dcm_like.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(ref s) = tx {
+        let _ = s.send("PROC:STEP:Bootstrapping ready manifest".to_string());
+        let _ = s.send(format!("PROC:PROG:{}", 0.0));
+    }
+
+    let total = dcm_like.len();
+    for (i, p) in dcm_like.iter().enumerate() {
+        if upsert_ready_file(p, None).is_err() {
+            log_rpc_debug(&format!("Bootstrap skipped non-DICOM file: {}", p.display()));
+        }
+        if let Some(ref s) = tx {
+            let report_interval = std::cmp::max(1, total / 20);
+            if (i % report_interval == 0) || (i + 1 == total) {
+                let prog = ((i + 1) as f32 / total as f32).clamp(0.0, 1.0);
+                let _ = s.send(format!("PROC:PROG:{}", prog));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn refresh_duplicates_for_ready(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>) -> Result<Vec<SeriesInfo>, String> {
+    evict_missing_ready_files();
+    let items = collect_ready_for_dir(anon_dir);
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if let Some(ref s) = tx {
+        let _ = s.send("PROC:STEP:Refreshing duplicate status".to_string());
+        let _ = s.send(format!("PROC:PROG:{}", 0.0));
+    }
+
+    let hashes: Vec<String> = items.iter().map(|it| it.hash.clone()).filter(|h| !h.is_empty()).collect();
+    let mut duplicate_hashes: HashSet<String> = HashSet::new();
+    let mut duplicate_urls_by_hash: HashMap<String, Vec<String>> = HashMap::new();
+
+    if !hashes.is_empty() {
+        let client = make_client(load_api_token().as_deref())?;
+        let base = base_site_url();
+        let hash_check_url = format!("{}{}", base, "/api/atlas/check_image_hashes/");
+        log_rpc(&format!("POST {} with {} hashes", hash_check_url, hashes.len()));
+        if let Ok(r) = client.post(&hash_check_url).json(&hashes).send() {
+            let status = r.status();
+            if let Ok(body) = r.text() {
+                if let Some(pf) = save_body_to_file(&body) {
+                    log_rpc_debug(&format!("Response {}: {} BODY_FILE:{}", hash_check_url, status, pf.display()));
+                }
+                if status.is_success() {
+                    if let Ok(map) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if let Some(obj) = map.as_object() {
+                            for (hash_val, info) in obj.iter() {
+                                if let Some(id) = info.get("id") {
+                                    if json_value_truthy(id) {
+                                        duplicate_hashes.insert(hash_val.clone());
+                                        if let Some(urls) = info.get("url").and_then(|v| v.as_str()) {
+                                            let full = if urls.starts_with("http") {
+                                                urls.to_string()
+                                            } else if urls.starts_with('/') {
+                                                format!("{}{}", base.trim_end_matches('/'), urls)
+                                            } else {
+                                                format!("{}/{}", base.trim_end_matches('/'), urls)
+                                            };
+                                            duplicate_urls_by_hash.entry(hash_val.clone()).or_default().push(full);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(mut g) = READY_FILES.lock() {
+        for rf in g.values_mut() {
+            if !rf.path.starts_with(anon_dir) {
+                continue;
+            }
+            if duplicate_hashes.contains(&rf.hash) {
+                rf.is_duplicate = true;
+                rf.duplicate_series_urls = duplicate_urls_by_hash.get(&rf.hash).cloned().unwrap_or_default();
+            } else {
+                rf.is_duplicate = false;
+                rf.duplicate_series_urls.clear();
+            }
+        }
+        persist_ready_manifest_locked(&g);
+    }
+
+    if let Some(ref s) = tx {
+        let _ = s.send(format!("PROC:PROG:{}", 1.0));
+    }
+    Ok(snapshot_ready_series(anon_dir))
 }
 
 pub fn base_site_url() -> String {
@@ -435,18 +741,12 @@ fn calculate_hash(path: &Path) -> Option<String> {
 }
 
 pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::sync::mpsc::Sender<String>>) -> Result<UploadResult, String> {
-    // Use `scan_for_upload` to determine which files are considered ready-to-upload
-    // This ensures we reuse the same hashing and server precheck that `scan_for_upload` performed,
-    // avoiding inconsistencies between the UI and the uploader.
-    let series = match scan_for_upload(anon_dir, tx.clone()) {
-        Ok(s) => s,
-        Err(e) => return Err(e),
-    };
+    ensure_ready_cache(anon_dir, tx.clone())?;
+    let series = refresh_duplicates_for_ready(anon_dir, tx.clone())?;
 
     // Build file lists from series info returned by the scanner. Files already
     // marked as duplicates by the scanner's precheck will be skipped here.
     let mut files_to_upload: Vec<(PathBuf, String)> = Vec::new();
-    let mut pre_duplicate_file_list: Vec<(String, String)> = Vec::new();
     let mut pre_duplicate_series: HashSet<String> = HashSet::new();
 
     for si in &series {
@@ -454,7 +754,6 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
         let mut series_has_dup = false;
         for f in &si.files {
             if f.is_duplicate {
-                pre_duplicate_file_list.push((f.path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string(), f.hash.clone()));
                 series_has_dup = true;
             } else {
                 files_to_upload.push((f.path.clone(), f.path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string()));
@@ -467,8 +766,8 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
         }
     }
 
-    // At this point `series` already contains duplication information from `scan_for_upload`.
-    // Use the precomputed lists we assembled above (`files_to_upload`, `pre_duplicate_file_list`, `pre_duplicate_series`).
+    // At this point `series` already contains duplication information from cache + precheck.
+    // Use the precomputed lists we assembled above (`files_to_upload`, `pre_duplicate_series`).
     let chunk_size = 10usize;
     let mut uploaded = Vec::new();
     let mut duplicates = Vec::new();
@@ -478,7 +777,7 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
     let client = make_client(load_api_token().as_deref())?;
     let base = base_site_url();
 
-    let total_chunks = (files_to_upload.len() + chunk_size - 1) / chunk_size;
+    let _total_chunks = (files_to_upload.len() + chunk_size - 1) / chunk_size;
     let total_files = files_to_upload.len();
     let mut files_processed = 0usize;
 
@@ -488,7 +787,7 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
         if total_files > 0 { let _ = s.send(format!("PROC:PROG:{}", 0.0)); }
     }
 
-    for (i, chunk) in files_to_upload.chunks(chunk_size).enumerate() {
+    for (_i, chunk) in files_to_upload.chunks(chunk_size).enumerate() {
         let chunk_pairs: Vec<(PathBuf, String)> = chunk.iter().map(|(p, f)| (p.clone(), f.clone())).collect();
 
         let endpoint = if let Some(cid) = case_id { format!("{}/api/atlas/upload_dicom_case/{}", base, cid) } else { format!("{}/api/atlas/upload_dicom", base) };
@@ -528,6 +827,7 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
                                                         if f == fname {
                                                             if std::fs::remove_file(p).is_ok() {
                                                                 log_rpc_debug(&format!("Deleted uploaded file: {}", p.display()));
+                                                                remove_ready_file(p);
                                                             } else {
                                                                 log_rpc_warn(&format!("Failed to delete uploaded file: {}", p.display()));
                                                             }
@@ -550,6 +850,7 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
                                                         if f == fname {
                                                             if std::fs::remove_file(p).is_ok() {
                                                                 log_rpc_debug(&format!("Deleted duplicate local file: {}", p.display()));
+                                                                remove_ready_file(p);
                                                             } else {
                                                                 log_rpc_warn(&format!("Failed to delete duplicate local file: {}", p.display()));
                                                             }
@@ -863,13 +1164,14 @@ pub fn scan_for_upload_quick(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender
 pub fn request_scan(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>) -> Result<(), String> {
     if SCAN_RUNNING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
         let anon_dir = anon_dir.to_path_buf();
-        // spawn background thread to perform the scan and write .last_scan.json
+        // spawn background thread to refresh duplicate status from cached ready entries
         std::thread::spawn(move || {
-            if let Some(ref s) = tx {
-                let _ = s.send("PROC:STEP:Scanning files".to_string());
-                let _ = s.send(format!("PROC:PROG:{}", 0.0));
+            if let Err(e) = ensure_ready_cache(&anon_dir, tx.clone()) {
+                if let Some(ref s) = tx {
+                    let _ = s.send(format!("Ready-cache bootstrap failed: {}", e));
+                }
             }
-            match scan_for_upload(&anon_dir, tx.clone()) {
+            match refresh_duplicates_for_ready(&anon_dir, tx.clone()) {
                 Ok(series) => {
                     // store parsed series in-memory for quick UI pickup
                     store_last_scan(series.clone());

@@ -133,7 +133,10 @@ def main():
     ap.add_argument("--interval", type=float, default=5.0, help="Seconds to wait after notifying uploader before next set")
     ap.add_argument("--repeat", type=int, default=1, help="How many times to cycle through available sets (0 = infinite)")
     ap.add_argument("--clear", action="store_true", help="Clear export folder before copying each set")
-    ap.add_argument("--send-ipc", action="store_true", help="Send a 'loaded' message over the same local IPC used by uploader_rs (interprocess)")
+    ap.add_argument("--send-ipc", dest="send_ipc", action="store_true", default=True,
+                    help="Send a 'loaded' message over local IPC (default: enabled)")
+    ap.add_argument("--no-send-ipc", dest="send_ipc", action="store_false",
+                    help="Do not send local IPC notifications")
     ap.add_argument("--ipc-name", default=None, help="IPC name to connect to (defaults to uploader_rs_<USER>)")
     ap.add_argument("--run-uploader", action="store_true", help="Run the main Rust `uploader_rs` binary to trigger IPC if an instance is running")
     ap.add_argument("--uploader-bin", default="../uploader_rs/target/debug/uploader_rs", help="Path to compiled uploader_rs binary (falls back to `cargo run --bin uploader_rs`)")
@@ -149,6 +152,7 @@ def main():
         sys.exit(2)
 
     logger.info(f"Found {len(sets)} set(s) to publish: {[str(s) for s in sets]}")
+    logger.info(f"IPC notifications enabled: {args.send_ipc}")
 
     loop_forever = args.repeat == 0
     cycles = 0
@@ -170,6 +174,8 @@ def main():
                     logger.info(f"IPC send ok={ok}")
                 except Exception as e:
                     logger.warning(f"IPC send failed: {e}")
+            else:
+                logger.info("IPC send skipped (--no-send-ipc)")
 
             if args.run_uploader:
                 ub = Path(args.uploader_bin).expanduser()

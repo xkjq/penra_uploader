@@ -4,7 +4,7 @@ use dicor_rs::anonymize_file;
 mod upload;
 mod assets;
 mod install;
-use upload::{upload_anon_dir, UploadResult, scan_for_upload, request_scan, SeriesInfo, FileEntry};
+use upload::{upload_anon_dir, request_scan, SeriesInfo};
 use dicom_viewer::{read_metadata, read_metadata_all};
 use divue_rs::run_meta_viewer;
 use std::collections::{HashMap, HashSet};
@@ -102,7 +102,11 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                                 let _ = tx.send(format!("Anonymized: {}", out.display()));
                                 if let Ok(bytes) = fs::read(&out) {
                                     let hash = blake3::hash(&bytes);
-                                    let _ = tx.send(format!("Hash {}: {}", out.display(), hash.to_hex()));
+                                    let hash_hex = hash.to_hex().to_string();
+                                    let _ = tx.send(format!("Hash {}: {}", out.display(), hash_hex));
+                                    if let Err(e) = upload::upsert_ready_file(&out, Some(hash_hex)) {
+                                        let _ = tx.send(format!("Ready-manifest update skipped for {}: {}", out.display(), e));
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -132,10 +136,6 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                     } else {
                         let _ = tx.send("Failed to connect to IPC socket".to_string());
                     }
-                }
-
-                if let Err(e) = request_scan(&anon_dir, Some(tx.clone())) {
-                    let _ = tx.send(format!("Post-process scan failed: {}", e));
                 }
 
                 // attempt to clean up the processing directory we created (best-effort)
@@ -178,11 +178,86 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                         }
                     }
                 }
+
+                // Refresh duplicate flags using cached hashes and push latest ready list.
+                if let Err(e) = request_scan(&anon_dir, Some(tx.clone())) {
+                    let _ = tx.send(format!("Ready-list refresh failed: {}", e));
+                }
             }
         }
     });
     s
 });
+
+fn enqueue_export_processing(
+    export: PathBuf,
+    tx: std_mpsc::Sender<String>,
+    notify_flag: bool,
+    seed_clone: Option<String>,
+) {
+    thread::spawn(move || {
+        let anon_dir = export
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("anon");
+
+        // ensure export and anon directories exist (create if missing)
+        if let Err(e) = fs::create_dir_all(&export) {
+            let _ = tx.send(format!("Failed to create export dir {}: {}", export.display(), e));
+        }
+        if let Err(e) = fs::create_dir_all(&anon_dir) {
+            let _ = tx.send(format!("Failed to create anon dir {}: {}", anon_dir.display(), e));
+        }
+
+        // Move current export contents into a timestamped processing directory
+        // so exporter cleanup does not race anonymization.
+        let processing_parent = export
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("processing");
+        let processing_dir = processing_parent.join(format!("run-{}", Utc::now().timestamp_millis()));
+        if let Err(e) = fs::create_dir_all(&processing_dir) {
+            let _ = tx.send(format!("Failed to create processing dir {}: {}", processing_dir.display(), e));
+        } else if let Ok(entries) = fs::read_dir(&export) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if let Some(fname) = p.file_name() {
+                    let dest = processing_dir.join(fname);
+                    match fs::rename(&p, &dest) {
+                        Ok(_) => {
+                            let _ = tx.send(format!("Moved {} -> {}", p.display(), dest.display()));
+                        }
+                        Err(_) => match fs::copy(&p, &dest) {
+                            Ok(_) => {
+                                let _ = fs::remove_file(&p);
+                                let _ = tx.send(format!("Copied+removed {} -> {}", p.display(), dest.display()));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(format!("Failed to move {}: {}", p.display(), e));
+                            }
+                        },
+                    }
+                }
+            }
+        }
+
+        let qi = QueueItem {
+            dir: processing_dir.clone(),
+            notify: notify_flag,
+            seed: seed_clone,
+            tx: tx.clone(),
+        };
+        if let Err(e) = PROCESS_QUEUE.send(qi) {
+            let _ = tx.send(format!("Failed to enqueue processing dir: {}", e));
+        } else {
+            let _ = tx.send(format!("Enqueued processing run: {}", processing_dir.display()));
+        }
+
+        let _ = tx.send("done".to_string());
+    });
+}
 
 fn human_size(bytes: u64) -> String {
     if bytes >= 1_000_000 {
@@ -459,71 +534,10 @@ impl AppState {
     // Reused by the UI button and by IPC 'loaded' notifications.
     fn trigger_process_export(&self) {
         let export = self.export_dir.clone();
-        let anon_dir = export
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("anon");
         let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
         let notify_flag = self.notify_on_process;
         let seed_clone = self.seed.clone();
-
-        thread::spawn(move || {
-            // ensure export and anon directories exist (create if missing)
-            if let Err(e) = fs::create_dir_all(&export) {
-                let _ = tx.send(format!("Failed to create export dir {}: {}", export.display(), e));
-            }
-            if let Err(e) = fs::create_dir_all(&anon_dir) {
-                let _ = tx.send(format!("Failed to create anon dir {}: {}", anon_dir.display(), e));
-            }
-
-                        // Move the current export contents into a timestamped processing directory
-                        // to avoid the exporter clearing the files before we can act on them.
-                        let processing_parent = export
-                            .parent()
-                            .map(|p| p.to_path_buf())
-                            .unwrap_or_else(|| PathBuf::from("."))
-                            .join("processing");
-                        let processing_dir = processing_parent.join(format!("run-{}", Utc::now().timestamp_millis()));
-                        if let Err(e) = fs::create_dir_all(&processing_dir) {
-                            let _ = tx.send(format!("Failed to create processing dir {}: {}", processing_dir.display(), e));
-                        } else {
-                            // move (rename) each top-level entry from export -> processing_dir
-                            if let Ok(entries) = fs::read_dir(&export) {
-                                for e in entries.flatten() {
-                                    let p = e.path();
-                                    if let Some(fname) = p.file_name() {
-                                        let dest = processing_dir.join(fname);
-                                        match fs::rename(&p, &dest) {
-                                            Ok(_) => { let _ = tx.send(format!("Moved {} -> {}", p.display(), dest.display())); },
-                                            Err(_) => {
-                                                // fallback: copy + remove (handles cross-device moves)
-                                                match fs::copy(&p, &dest) {
-                                                    Ok(_) => { let _ = fs::remove_file(&p); let _ = tx.send(format!("Copied+removed {} -> {}", p.display(), dest.display())); },
-                                                    Err(e) => { let _ = tx.send(format!("Failed to move {}: {}", p.display(), e)); }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Enqueue the processing dir for background processing (debounced/coalesced)
-                        let qi = QueueItem {
-                            dir: processing_dir.clone(),
-                            notify: notify_flag,
-                            seed: seed_clone.clone(),
-                            tx: tx.clone(),
-                        };
-                        if let Err(e) = PROCESS_QUEUE.send(qi) {
-                            let _ = tx.send(format!("Failed to enqueue processing dir: {}", e));
-                        } else {
-                            let _ = tx.send(format!("Enqueued processing run: {}", processing_dir.display()));
-                        }
-
-            let _ = tx.send("done".to_string());
-        });
+        enqueue_export_processing(export, tx, notify_flag, seed_clone);
     }
 
     // Handle an incoming message string (extracted from the UI update loop).
@@ -963,76 +977,49 @@ impl eframe::App for AppState {
                                 let anon_dir = self.anon_dir();
                                 let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
                                 thread::spawn(move || {
-                                    match scan_for_upload(&anon_dir, Some(tx.clone())) {
+                                    match upload::refresh_duplicates_for_ready(&anon_dir, Some(tx.clone())) {
                                         Ok(series) => {
-                                                let mut deleted = 0usize;
-                                                let total_dup: usize = series.iter().map(|s| s.files.iter().filter(|f| f.is_duplicate).count()).sum();
-                                                if total_dup > 0 {
-                                                    let _ = tx.send("PROC:STEP:Removing duplicates".to_string());
-                                                    let _ = tx.send(format!("PROC:PROG:{}", 0.0));
-                                                }
-                                                let mut processed_dup = 0usize;
-                                                // throttle duplicate-removal progress updates to ~50 updates
-                                                let dup_report_interval = std::cmp::max(1, total_dup / 50);
-                                                for s in &series {
-                                                    for f in &s.files {
-                                                        if f.is_duplicate {
-                                                            if std::fs::remove_file(&f.path).is_ok() {
-                                                                upload::log_rpc_debug(&format!("Deleted duplicate file: {}", f.path.display()));
-                                                                deleted += 1;
-                                                            } else {
-                                                                upload::log_rpc_warn(&format!("Failed to delete duplicate file: {}", f.path.display()));
-                                                            }
-                                                            processed_dup = processed_dup.saturating_add(1);
-                                                            if total_dup > 0 {
-                                                                if (processed_dup % dup_report_interval == 0) || (processed_dup == total_dup) {
-                                                                    let prog = (processed_dup as f32 / total_dup as f32).clamp(0.0, 1.0);
-                                                                    let _ = tx.send(format!("PROC:PROG:{}", prog));
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            // update the GUI state using the `series` we already computed
-                                            let mut new_series: Vec<SeriesInfo> = Vec::new();
-                                            for s in &series {
-                                                let mut files: Vec<FileEntry> = Vec::new();
-                                                let mut total_bytes: u64 = 0;
-                                                for f in &s.files {
-                                                    if !f.is_duplicate {
-                                                        if let Ok(md) = std::fs::metadata(&f.path) {
-                                                            total_bytes = total_bytes.saturating_add(md.len());
-                                                        }
-                                                        files.push(FileEntry { path: f.path.clone(), hash: f.hash.clone(), is_duplicate: false });
-                                                    }
-                                                }
-                                                new_series.push(SeriesInfo {
-                                                    series_uid: s.series_uid.clone(),
-                                                    files,
-                                                    duplicate_series_urls: s.duplicate_series_urls.clone(),
-                                                    patient_name: s.patient_name.clone(),
-                                                    examination: s.examination.clone(),
-                                                    patient_id: s.patient_id.clone(),
-                                                    study_date: s.study_date.clone(),
-                                                    modality: s.modality.clone(),
-                                                    series_description: s.series_description.clone(),
-                                                    series_number: s.series_number.clone(),
-                                                    file_count: 0, // not critical for GUI here
-                                                    total_bytes,
-                                                });
+                                            let mut deleted = 0usize;
+                                            let total_dup: usize = series.iter().map(|s| s.files.iter().filter(|f| f.is_duplicate).count()).sum();
+                                            if total_dup > 0 {
+                                                let _ = tx.send("PROC:STEP:Removing duplicates".to_string());
+                                                let _ = tx.send(format!("PROC:PROG:{}", 0.0));
                                             }
+                                            let mut processed_dup = 0usize;
+                                            let dup_report_interval = std::cmp::max(1, total_dup / 50);
+                                            for s in &series {
+                                                for f in &s.files {
+                                                    if f.is_duplicate {
+                                                        if std::fs::remove_file(&f.path).is_ok() {
+                                                            upload::remove_ready_file(&f.path);
+                                                            upload::log_rpc_debug(&format!("Deleted duplicate file: {}", f.path.display()));
+                                                            deleted += 1;
+                                                        } else {
+                                                            upload::log_rpc_warn(&format!("Failed to delete duplicate file: {}", f.path.display()));
+                                                        }
+                                                        processed_dup = processed_dup.saturating_add(1);
+                                                        if total_dup > 0 {
+                                                            if (processed_dup % dup_report_interval == 0) || (processed_dup == total_dup) {
+                                                                let prog = (processed_dup as f32 / total_dup as f32).clamp(0.0, 1.0);
+                                                                let _ = tx.send(format!("PROC:PROG:{}", prog));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            let new_series = upload::snapshot_ready_series(&anon_dir);
                                             if let Ok(json2) = serde_json::to_string(&new_series) {
-                                                // update in-memory cache so UI picks up new series without re-parsing
                                                 upload::store_last_scan(new_series.clone());
-                                                                let _ = std::fs::write(".last_scan.json", &json2);
-                                                                // also send the parsed series as a SCAN:SET message (base64-encoded)
-                                                                let b64 = base64::encode(json2.as_bytes());
+                                                let _ = std::fs::write(".last_scan.json", &json2);
+                                                let b64 = base64::encode(json2.as_bytes());
                                                 let _ = tx.send(format!("SCAN:SET:{}", b64));
                                                 let _ = tx.send("scan_written".to_string());
                                             }
                                             let _ = tx.send(format!("duplicates_cleared:{}", deleted));
                                         }
-                                        Err(e) => { let _ = tx.send(format!("Clear duplicates failed: {}", e)); }
+                                        Err(e) => {
+                                            let _ = tx.send(format!("Clear duplicates failed: {}", e));
+                                        }
                                     }
                                     let _ = tx.send("done".to_string());
                                 });
@@ -1777,8 +1764,7 @@ fn main() {
         // Spawn IPC listener thread to accept notifications from exporter app.
         // Binds to a per-user local socket and forwards received messages to the GUI via `tx`.
         let tx_clone = tx.clone();
-        let export_dir_clone = app.export_dir.clone();
-        let anon_dir_clone = app.anon_dir();
+        let export_dir_for_ipc = app.export_dir.clone();
         let seed_for_ipc = app.seed.clone();
         let ipc_name_clone = ipc_name.clone();
         thread::spawn(move || {
@@ -1792,12 +1778,23 @@ fn main() {
                     loop {
                         match listener.accept() {
                             Ok(mut conn) => {
-                                let mut buf = Vec::new();
-                                if conn.read_to_end(&mut buf).is_ok() {
-                                    if let Ok(text) = String::from_utf8(buf) {
-                                        let _ = tx_clone.send(format!("IPC:RECV:{}", text));
+                                let tx_conn = tx_clone.clone();
+                                let export_conn = export_dir_for_ipc.clone();
+                                let seed_conn = seed_for_ipc.clone();
+                                thread::spawn(move || {
+                                    let _ = conn.write_all(b"ok");
+                                    let mut buf = [0u8; 512];
+                                    let text = match conn.read(&mut buf) {
+                                        Ok(n) if n > 0 => String::from_utf8_lossy(&buf[..n]).trim().to_string(),
+                                        _ => String::new(),
+                                    };
+                                    if text == "loaded" {
+                                        enqueue_export_processing(export_conn, tx_conn.clone(), false, seed_conn);
+                                        let _ = tx_conn.send("IPC:RECV:loaded (enqueued)".to_string());
+                                    } else if !text.is_empty() {
+                                        let _ = tx_conn.send(format!("IPC:RECV:{}", text));
                                     }
-                                }
+                                });
                             }
                             Err(e) => {
                                 let _ = tx_clone.send(format!("IPC accept error: {:?}", e));
@@ -1830,12 +1827,23 @@ fn main() {
                                         loop {
                                             match listener.accept() {
                                                 Ok(mut conn) => {
-                                                    let mut buf = Vec::new();
-                                                    if conn.read_to_end(&mut buf).is_ok() {
-                                                        if let Ok(text) = String::from_utf8(buf) {
-                                                            let _ = tx_clone.send(format!("IPC:RECV:{}", text));
+                                                    let tx_conn = tx_clone.clone();
+                                                    let export_conn = export_dir_for_ipc.clone();
+                                                    let seed_conn = seed_for_ipc.clone();
+                                                    thread::spawn(move || {
+                                                        let _ = conn.write_all(b"ok");
+                                                        let mut buf = [0u8; 512];
+                                                        let text = match conn.read(&mut buf) {
+                                                            Ok(n) if n > 0 => String::from_utf8_lossy(&buf[..n]).trim().to_string(),
+                                                            _ => String::new(),
+                                                        };
+                                                        if text == "loaded" {
+                                                            enqueue_export_processing(export_conn, tx_conn.clone(), false, seed_conn);
+                                                            let _ = tx_conn.send("IPC:RECV:loaded (enqueued)".to_string());
+                                                        } else if !text.is_empty() {
+                                                            let _ = tx_conn.send(format!("IPC:RECV:{}", text));
                                                         }
-                                                    }
+                                                    });
                                                 }
                                                 Err(e) => {
                                                     let _ = tx_clone.send(format!("IPC accept error: {:?}", e));
@@ -1857,14 +1865,24 @@ fn main() {
             }
         });
 
-        // Kick off initial scan in background so the GUI can appear immediately.
-        // Use `request_scan` so the parsed result is stored and a `scan_written`
-        // notification is sent for the UI to pick up the ready-series.
+        // Load previously extracted ready metadata from disk and avoid a full
+        // startup re-scan of DICOM files.
+        upload::load_ready_manifest();
+        upload::evict_missing_ready_files();
         let anon_dir = app.anon_dir();
-        app.last_msg = format!("Starting initial scan: {}", anon_dir.display());
+        let initial_series = upload::snapshot_ready_series(&anon_dir);
+        app.ready_series = initial_series.clone();
+        app.selected_series = vec![true; app.ready_series.len()];
+        if let Ok(json) = serde_json::to_string(&initial_series) {
+            upload::store_last_scan(initial_series);
+            let _ = std::fs::write(".last_scan.json", json);
+        }
+        app.last_msg = format!("Loaded ready manifest: {}", anon_dir.display());
+
+        // Lightweight startup refresh: only checks duplicate status from cached hashes.
         let tx_scan = tx.clone();
         if let Err(e) = request_scan(&anon_dir, Some(tx_scan.clone())) {
-            let _ = tx_scan.send(format!("Initial scan request failed: {}", e));
+            let _ = tx_scan.send(format!("Initial ready refresh request failed: {}", e));
         }
 
         Ok(Box::new(app))

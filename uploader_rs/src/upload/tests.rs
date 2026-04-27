@@ -1,12 +1,31 @@
 use super::*;
 use tempfile::tempdir;
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::env;
+use dicom_object::{InMemDicomObject, FileMetaTableBuilder, Tag};
+use dicom_core::header::VR;
+
+const EXPLICIT_VR_LE_UID: &str = "1.2.840.10008.1.2.1";
 
 // Use httpmock to simulate server endpoints for hash-check and upload
 use httpmock::MockServer;
 use httpmock::Method::POST;
+
+fn make_minimal_dcm(path: &std::path::Path, sop_instance: &str, patient: &str) {
+    let mut obj = InMemDicomObject::new_empty();
+    let _ = obj.put_str(Tag(0x0008, 0x0016), VR::UI, "1.2.840.10008.5.1.4.1.1.1");
+    let _ = obj.put_str(Tag(0x0008, 0x0018), VR::UI, sop_instance);
+    let _ = obj.put_str(Tag(0x0010, 0x0010), VR::PN, patient);
+    let file_obj = obj
+        .with_meta(
+            FileMetaTableBuilder::new()
+                .transfer_syntax(EXPLICIT_VR_LE_UID)
+                .media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.1")
+                .media_storage_sop_instance_uid(sop_instance),
+        )
+        .expect("with_meta");
+    file_obj.write_to_file(path).expect("write dcm");
+}
 
 #[test]
 fn test_scan_and_upload_with_mock_server() {
@@ -18,8 +37,7 @@ fn test_scan_and_upload_with_mock_server() {
     let anon = td.path().join("anon_dir");
     fs::create_dir_all(&anon).unwrap();
     let file_path = anon.join("test.dcm");
-    let mut f = File::create(&file_path).unwrap();
-    let _ = f.write_all(b"dummy dicom content");
+    make_minimal_dcm(&file_path, "2.25.777", "Doe^John");
 
     // start mock server
     let server = MockServer::start();
