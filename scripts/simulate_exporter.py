@@ -132,7 +132,7 @@ def main():
     ap.add_argument("--export", default="/home/ross/uploader/uploader_rs/export", help="Uploader export folder to copy into")
     ap.add_argument("--interval", type=float, default=5.0, help="Seconds to wait after notifying uploader before next set")
     ap.add_argument("--repeat", type=int, default=1, help="How many times to cycle through available sets (0 = infinite)")
-    ap.add_argument("--clear", action="store_true", help="Clear export folder before copying each set")
+    ap.add_argument("--clear", default=True, action="store_true", help="Clear export folder before copying each set")
     ap.add_argument("--send-ipc", dest="send_ipc", action="store_true", default=True,
                     help="Send a 'loaded' message over local IPC (default: enabled)")
     ap.add_argument("--no-send-ipc", dest="send_ipc", action="store_false",

@@ -942,6 +942,14 @@ impl eframe::App for AppState {
 
             ui.separator();
             ui.collapsing("Ready to Upload", |ui| {
+                let ready_total_files: usize = self.ready_series.iter().map(|s| s.files.len()).sum();
+                let ready_total_bytes: u64 = self.ready_series.iter().map(|s| s.total_bytes).sum();
+                ui.label(format!(
+                    "Summary: {} files, {} total",
+                    ready_total_files,
+                    human_size(ready_total_bytes)
+                ));
+                ui.separator();
                 egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         // Styled Upload button moved here to Ready-to-Upload (prominent)
