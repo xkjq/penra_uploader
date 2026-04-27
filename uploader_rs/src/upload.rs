@@ -16,6 +16,7 @@ use tracing::Level;
 
 static SCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 static SCAN_PENDING: AtomicBool = AtomicBool::new(false);
+const DUPLICATE_LOOKUP_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadyFileInfo {
@@ -305,7 +306,12 @@ pub fn refresh_duplicates_for_ready(anon_dir: &Path, tx: Option<std::sync::mpsc:
         let base = base_site_url();
         let hash_check_url = format!("{}{}", base, "/api/atlas/check_image_hashes/");
         log_rpc(&format!("POST {} with {} hashes", hash_check_url, hashes.len()));
-        match client.post(&hash_check_url).json(&hashes).send() {
+        match client
+            .post(&hash_check_url)
+            .timeout(Duration::from_secs(DUPLICATE_LOOKUP_TIMEOUT_SECS))
+            .json(&hashes)
+            .send()
+        {
             Ok(r) => {
                 let status = r.status();
                 if let Ok(body) = r.text() {
@@ -1002,7 +1008,12 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
         let base = base_site_url();
         let hash_check_url = format!("{}{}", base, "/api/atlas/check_image_hashes/");
         log_rpc(&format!("POST {} with {} hashes", hash_check_url, hash_list.len()));
-        if let Ok(r) = client.post(&hash_check_url).json(&hash_list).send() {
+        if let Ok(r) = client
+            .post(&hash_check_url)
+            .timeout(Duration::from_secs(DUPLICATE_LOOKUP_TIMEOUT_SECS))
+            .json(&hash_list)
+            .send()
+        {
             let status = r.status();
             if let Ok(body) = r.text() {
                 if let Some(pf) = save_body_to_file(&body) {
