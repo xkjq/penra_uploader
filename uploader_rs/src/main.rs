@@ -432,6 +432,62 @@ impl AppState {
         }
     }
 
+    /// Launch diviz-rs with the given file paths. Tries PATH first, then workspace fallback.
+    fn launch_diviz(&mut self, paths: Vec<String>) {
+        if paths.is_empty() {
+            self.last_msg = "No files to view".to_string();
+            return;
+        }
+        let try_spawn = |cmd: &str, args: &[String]| -> Result<std::process::Child, std::io::Error> {
+            Command::new(cmd).args(args).spawn()
+        };
+        match try_spawn("diviz-rs", &paths) {
+            Ok(_) => { self.last_msg = "Launched diviz-rs".to_string(); }
+            Err(_) => {
+                let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+                let mut push_targets = |root: &std::path::Path| {
+                    candidates.push(root.join("diviz-rs/target/debug/diviz-rs"));
+                    candidates.push(root.join("diviz-rs/target/release/diviz-rs"));
+                };
+                if let Ok(cwd) = std::env::current_dir() {
+                    let mut cur = Some(cwd.as_path());
+                    for _ in 0..6 {
+                        if let Some(p) = cur { push_targets(p); cur = p.parent(); } else { break; }
+                    }
+                }
+                if let Ok(exe) = std::env::current_exe() {
+                    let mut cur = exe.parent();
+                    for _ in 0..8 {
+                        if let Some(p) = cur { push_targets(p); cur = p.parent(); } else { break; }
+                    }
+                }
+                if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+                    let mut cur = std::path::Path::new(&manifest_dir).parent();
+                    for _ in 0..6 {
+                        if let Some(p) = cur { push_targets(p); cur = p.parent(); } else { break; }
+                    }
+                }
+                let mut launched = false;
+                let mut seen = std::collections::HashSet::new();
+                for cand in candidates {
+                    let key = cand.to_string_lossy().to_string();
+                    if !seen.insert(key.clone()) { continue; }
+                    if cand.exists() {
+                        if try_spawn(cand.to_str().unwrap_or(""), &paths).is_ok() {
+                            launched = true;
+                            break;
+                        }
+                    }
+                }
+                self.last_msg = if launched {
+                    "Launched diviz-rs (fallback)".to_string()
+                } else {
+                    "Failed to launch diviz-rs; ensure it is built or in PATH".to_string()
+                };
+            }
+        }
+    }
+
     fn refresh_log_cache(&mut self, force: bool) {
         let now = Instant::now();
         if !force {
@@ -1141,10 +1197,19 @@ impl eframe::App for AppState {
                                 .map(|s| format!(" — {}", s))
                                 .unwrap_or_default(),
                         );
-                        egui::CollapsingHeader::new(study_header)
-                            .default_open(true)
-                            .id_source(format!("study-{}", group_key))
-                            .show(ui, |ui| {
+                        let study_all_paths: Vec<String> = series_indices.iter()
+                            .flat_map(|&si| self.ready_series[si].files.iter()
+                                .map(|f| f.path.to_string_lossy().to_string()))
+                            .collect();
+                        let study_id = ui.make_persistent_id(format!("study-{}", group_key));
+                        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), study_id, true)
+                            .show_header(ui, |ui| {
+                                ui.strong(&study_header);
+                                if ui.small_button("View study").clicked() {
+                                    self.launch_diviz(study_all_paths);
+                                }
+                            })
+                            .body(|ui| {
                         for &si in series_indices.iter() {
                         let series = self.ready_series[si].clone();
                         let mut checked = *self.selected_series.get(si).unwrap_or(&true);
@@ -1254,86 +1319,10 @@ impl eframe::App for AppState {
                                 }
                             }
                             if ui.small_button("View series").clicked() {
-                                // collect file paths for this series
-                                let mut paths: Vec<String> = Vec::new();
-                                for f in &series.files {
-                                    paths.push(f.path.to_string_lossy().to_string());
-                                }
-                                if paths.is_empty() {
-                                    self.last_msg = "No files in series to view".to_string();
-                                } else {
-                                    // Try to launch `diviz-rs` (in PATH) with all file args; fall back to workspace target path
-                                    let try_spawn = |cmd: &str, args: &[String]| -> Result<std::process::Child, std::io::Error> {
-                                        Command::new(cmd).args(args).spawn()
-                                    };
-
-                                    // first try by name (in PATH)
-                                    match try_spawn("diviz-rs", &paths) {
-                                        Ok(_) => { self.last_msg = "Launched diviz-rs".to_string(); }
-                                        Err(_) => {
-                                            // Attempt to locate a workspace-built binary by walking up ancestor directories
-                                            let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-                                            // helper to push debug/release targets for a root path
-                                            let mut push_targets = |root: &std::path::Path| {
-                                                candidates.push(root.join("diviz-rs/target/debug/diviz-rs"));
-                                                candidates.push(root.join("diviz-rs/target/release/diviz-rs"));
-                                            };
-
-                                            if let Ok(cwd) = std::env::current_dir() {
-                                                let mut cur = Some(cwd.as_path());
-                                                for _ in 0..6 {
-                                                    if let Some(p) = cur {
-                                                        push_targets(p);
-                                                        cur = p.parent();
-                                                    } else { break; }
-                                                }
-                                            }
-
-                                            if let Ok(exe) = std::env::current_exe() {
-                                                let mut cur = exe.parent();
-                                                for _ in 0..8 {
-                                                    if let Some(p) = cur {
-                                                        push_targets(p);
-                                                        cur = p.parent();
-                                                    } else { break; }
-                                                }
-                                            }
-
-                                            // Also try the parent of the uploader_rs directory (workspace root sibling)
-                                            if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-                                                let mut cur = std::path::Path::new(&manifest_dir).parent();
-                                                for _ in 0..6 {
-                                                    if let Some(p) = cur {
-                                                        push_targets(p);
-                                                        cur = p.parent();
-                                                    } else { break; }
-                                                }
-                                            }
-
-                                            // remove duplicates and try each candidate
-                                            let mut launched = false;
-                                            use std::collections::HashSet;
-                                            let mut seen = HashSet::new();
-                                            for cand in candidates.into_iter() {
-                                                let key = cand.to_string_lossy().to_string();
-                                                if seen.contains(&key) { continue; }
-                                                seen.insert(key.clone());
-                                                if cand.exists() {
-                                                    if try_spawn(cand.to_string_lossy().as_ref(), &paths).is_ok() {
-                                                        launched = true;
-                                                        break;
-                                                    }
-                                                }
-                                            }
-
-                                            if launched {
-                                                self.last_msg = "Launched diviz-rs (fallback)".to_string();
-                                            } else {
-                                                self.last_msg = "Failed to launch diviz-rs; ensure it is built or in PATH".to_string();
-                                            }
-                                        }
-                                    }
-                                }
+                                let paths: Vec<String> = series.files.iter()
+                                    .map(|f| f.path.to_string_lossy().to_string())
+                                    .collect();
+                                self.launch_diviz(paths);
                             }
 
                             if ui.add(egui::Button::new("Delete series").fill(egui::Color32::from_rgb(170, 35, 35))).clicked() {
@@ -1417,7 +1406,7 @@ impl eframe::App for AppState {
 
                         ui.separator();
                         } // end series loop
-                        }); // end ui.indent
+                        }); // end .body
                         ui.add_space(4.0);
                     } // end study groups
                 });
