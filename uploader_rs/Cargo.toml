@@ -34,8 +34,9 @@ dicom_viewer = { path = "../dicom_viewer" }
 divue_rs = { package = "divue-rs", path = "../divue-rs" }
 dicom-pixeldata = "0.9"
 dicom-object = "0.9"
+dicom-core = "0.9"
+dicom-dictionary-std = "0.9"
 
 [dev-dependencies]
 tempfile = "3.6"
 httpmock = "0.6"
-dicom-core = "0.9"

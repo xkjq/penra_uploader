@@ -1350,5 +1350,134 @@ pub fn get_last_scan() -> Option<Vec<SeriesInfo>> {
     None
 }
 
+/// Split the files of a single series into sub-series by the value of a DICOM tag keyword
+/// (e.g. "ImageType", "EchoNumbers") or a `(GGGG,EEEE)` hex tag string.
+///
+/// Files are re-written in-place with a new SeriesInstanceUID derived deterministically from
+/// the original UID + the group index (1-based; group 0 keeps the original UID).
+/// Returns the number of distinct sub-series created, or an error if the tag is unknown /
+/// all files have the same value (nothing to split).
+pub fn split_series_by_tag(paths: &[PathBuf], tag_keyword: &str) -> Result<usize, String> {
+    use dicom_core::DataDictionary;
+    use dicom_core::dictionary::DataDictionaryEntry;
+    use dicom_dictionary_std::StandardDataDictionary;
+    use num_bigint::BigUint;
+
+    // Resolve the keyword to a Tag.
+    let split_tag = {
+        let kw = tag_keyword.trim();
+        // Try (XXXX,XXXX) hex notation first.
+        let hex_re = kw.trim_start_matches('(').trim_end_matches(')');
+        if let Some((g, e)) = hex_re.split_once(',') {
+            let g = g.trim();
+            let e = e.trim();
+            match (u16::from_str_radix(g, 16), u16::from_str_radix(e, 16)) {
+                (Ok(gv), Ok(ev)) => Tag(gv, ev),
+                _ => {
+                    // Fall through to keyword lookup.
+                    StandardDataDictionary
+                        .by_name(kw)
+                        .map(|entry| entry.tag())
+                        .ok_or_else(|| format!("Unknown DICOM tag keyword: {}", kw))?
+                }
+            }
+        } else {
+            StandardDataDictionary
+                .by_name(kw)
+                .map(|entry| entry.tag())
+                .ok_or_else(|| format!("Unknown DICOM tag keyword: {}", kw))?
+        }
+    };
+
+    // Read each file and get the tag value string (empty string if absent).
+    let mut file_groups: Vec<(PathBuf, String)> = Vec::new();
+    for p in paths {
+        let val = open_file(p)
+            .ok()
+            .and_then(|obj| obj.element(split_tag).ok().and_then(|e| e.to_str().ok().map(|s| s.trim().to_string())))
+            .unwrap_or_default();
+        file_groups.push((p.clone(), val));
+    }
+
+    // Collect unique values in stable insertion order.
+    let mut seen_vals: Vec<String> = Vec::new();
+    {
+        let mut set = std::collections::HashSet::new();
+        for (_, v) in &file_groups {
+            if set.insert(v.clone()) {
+                seen_vals.push(v.clone());
+            }
+        }
+    }
+
+    if seen_vals.len() <= 1 {
+        return Err(format!(
+            "All files have the same value for {}; nothing to split",
+            tag_keyword
+        ));
+    }
+
+    // Helper: derive a new UID from the original series UID + group suffix.
+    let derive_uid = |original_uid: &str, suffix: &str| -> String {
+        let input = format!("{}:split:{}", original_uid, suffix);
+        let h = blake3::hash(input.as_bytes());
+        let num = BigUint::from_bytes_be(h.as_bytes());
+        format!("2.25.{}", num)
+    };
+
+    // Read the original SeriesInstanceUID from the first file.
+    let original_series_uid = open_file(&file_groups[0].0)
+        .ok()
+        .and_then(|obj| {
+            obj.element(Tag(0x0020, 0x000E)).ok()
+                .and_then(|e| e.to_str().ok().map(|s| s.to_string()))
+        })
+        .unwrap_or_else(|| "UNKNOWN".to_string());
+
+    // Pre-compute new UIDs: group-index 0 keeps the original UID; others get derived UIDs.
+    let new_uid_for_group: Vec<String> = seen_vals
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            if i == 0 {
+                original_series_uid.clone()
+            } else {
+                derive_uid(&original_series_uid, v)
+            }
+        })
+        .collect();
+
+    // Rewrite files that belong to groups 1+ (group 0 keeps the existing UID).
+    use dicom_core::header::VR;
+    let mut rewritten = 0usize;
+    for (path, val) in &file_groups {
+        let group_index = seen_vals.iter().position(|v| v == val).unwrap_or(0);
+        if group_index == 0 {
+            continue; // keep original UID
+        }
+        let new_uid = &new_uid_for_group[group_index];
+        match open_file(path) {
+            Ok(mut obj) => {
+                let _ = obj.put_str(Tag(0x0020, 0x000E), VR::UI, new_uid);
+                if let Err(e) = obj.write_to_file(path) {
+                    return Err(format!("Failed to write {}: {}", path.display(), e));
+                }
+                // Update the ready manifest entry.
+                if let Ok(mut guard) = READY_FILES.lock() {
+                    let key = path_key(path);
+                    if let Some(rfi) = guard.get_mut(&key) {
+                        rfi.series_uid = new_uid.clone();
+                    }
+                }
+                rewritten += 1;
+            }
+            Err(e) => return Err(format!("Failed to open {}: {}", path.display(), e)),
+        }
+    }
+    persist_ready_manifest_locked(&READY_FILES.lock().unwrap_or_else(|e| e.into_inner()).clone());
+
+    Ok(seen_vals.len())
+}
+
 #[cfg(test)]
 mod tests;
