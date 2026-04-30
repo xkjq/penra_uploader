@@ -325,6 +325,8 @@ struct AppState {
     // split-series UI state: which series index has the panel open, and the tag keyword
     split_series_open: Option<usize>,
     split_tag_input: String,
+    /// None = individual states; Some(true) = all expanded; Some(false) = all collapsed
+    studies_collapsed: Option<bool>,
 }
 
 impl Default for AppState {
@@ -413,6 +415,7 @@ impl Default for AppState {
             log_cache_last_refresh: None,
             split_series_open: None,
             split_tag_input: String::new(),
+            studies_collapsed: None,
             log_level: std::env::var("RUST_LOG").ok().or_else(|| upload::load_log_level()).unwrap_or_else(|| "info".to_string()),
             logo_tex: None,
         }
@@ -1159,11 +1162,21 @@ impl eframe::App for AppState {
                 ui.separator();
                 let ready_total_files: usize = self.ready_series.iter().map(|s| s.files.len()).sum();
                 let ready_total_bytes: u64 = self.ready_series.iter().map(|s| s.total_bytes).sum();
-                ui.label(format!(
-                    "Summary: {} files, {} total",
-                    ready_total_files,
-                    human_size(ready_total_bytes)
-                ));
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "Summary: {} files, {} total",
+                        ready_total_files,
+                        human_size(ready_total_bytes)
+                    ));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Collapse all").clicked() {
+                            self.studies_collapsed = Some(false);
+                        }
+                        if ui.small_button("Expand all").clicked() {
+                            self.studies_collapsed = Some(true);
+                        }
+                    });
+                });
                 ui.separator();
                 egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                     // Group series indices by study: (patient_name, examination, study_date)
@@ -1202,8 +1215,11 @@ impl eframe::App for AppState {
                                 .map(|f| f.path.to_string_lossy().to_string()))
                             .collect();
                         let study_id = ui.make_persistent_id(format!("study-{}", group_key));
-                        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), study_id, true)
-                            .show_header(ui, |ui| {
+                        let mut cs = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), study_id, true);
+                        if let Some(open) = self.studies_collapsed {
+                            cs.set_open(open);
+                        }
+                        cs.show_header(ui, |ui| {
                                 ui.strong(&study_header);
                                 if ui.small_button("View study").clicked() {
                                     self.launch_diviz(study_all_paths);
@@ -1409,6 +1425,8 @@ impl eframe::App for AppState {
                         }); // end .body
                         ui.add_space(4.0);
                     } // end study groups
+                    // Reset after one frame so individual collapse clicks aren't overridden
+                    self.studies_collapsed = None;
                 });
             });
 
