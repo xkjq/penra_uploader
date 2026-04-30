@@ -349,7 +349,19 @@ impl Default for AppState {
             processing_progress: 0.0,
             tx: None,
             processed: Vec::new(),
-            seed: None,
+            seed: {
+                // Generate a unique session seed so all studies anonymized within this
+                // session share the same seed, keeping patient pseudonyms and date shifts
+                // consistent across the session without requiring user input.
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let t = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let pid = std::process::id() as u128;
+                let raw = t.wrapping_add(pid.wrapping_mul(0x9e3779b97f4a7c15u128));
+                Some(format!("{:016x}", raw & 0xFFFF_FFFF_FFFF_FFFFu128))
+            },
             username: String::new(),
             password: String::new(),
             logged_in_user: upload::token_username(),

@@ -20,10 +20,10 @@ fn uid_from_hash_bytes(bytes: &[u8]) -> String {
     format!("2.25.{}", num)
 }
 
-fn shift_date_by_study(study_uid: &str, seed: Option<&str>) -> i64 {
+fn shift_date_by_patient(patient_key: &str, seed: Option<&str>) -> i64 {
     let key = match seed {
-        Some(s) if !s.is_empty() => format!("{}:{}", s, study_uid),
-        _ => study_uid.to_string(),
+        Some(s) if !s.is_empty() => format!("{}:{}", s, patient_key),
+        _ => patient_key.to_string(),
     };
     let h = blake3::hash(key.as_bytes());
     let v = u64::from_le_bytes({
@@ -36,10 +36,10 @@ fn shift_date_by_study(study_uid: &str, seed: Option<&str>) -> i64 {
     offset
 }
 
-fn minute_offset_by_study(study_uid: &str, seed: Option<&str>) -> i64 {
+fn minute_offset_by_patient(patient_key: &str, seed: Option<&str>) -> i64 {
     let key = match seed {
-        Some(s) if !s.is_empty() => format!("{}:{}", s, study_uid),
-        _ => study_uid.to_string(),
+        Some(s) if !s.is_empty() => format!("{}:{}", s, patient_key),
+        _ => patient_key.to_string(),
     };
     let h = blake3::hash(key.as_bytes());
     let v = u64::from_le_bytes({
@@ -91,7 +91,7 @@ fn sanitize_text_field(s: &str, orig_name: &str, orig_pid: &str, shift_days: i64
 
 fn process_inmem_top<D: dicom_core::DataDictionary + Clone>(
     ds: &mut dicom_object::InMemDicomObject<D>,
-    study_uid: &str,
+    patient_key: &str,
     preserve_private: bool,
     seed: Option<&str>,
     clear_tags: &Vec<Tag>,
@@ -142,7 +142,7 @@ fn process_inmem_top<D: dicom_core::DataDictionary + Clone>(
                         if s.len() >= 8 {
                             let date_part = &s[0..8];
                             if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
-                                let shifted = dt + Duration::days(shift_date_by_study(study_uid, seed));
+                                let shifted = dt + Duration::days(shift_date_by_patient(patient_key, seed));
                                 let new = shifted.format("%Y%m%d").to_string();
                                 puts.push((t, VR::DA, new));
                                 continue;
@@ -156,7 +156,7 @@ fn process_inmem_top<D: dicom_core::DataDictionary + Clone>(
                         if s.len() >= 8 {
                             let date_part = &s[0..8];
                             if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
-                                let shifted = dt + Duration::days(shift_date_by_study(study_uid, seed));
+                                let shifted = dt + Duration::days(shift_date_by_patient(patient_key, seed));
                                 let new_date = shifted.format("%Y%m%d").to_string();
                                 let mut new = s.to_string();
                                 new.replace_range(0..8, &new_date);
@@ -178,7 +178,7 @@ fn process_inmem_top<D: dicom_core::DataDictionary + Clone>(
                             }
                         }
                         if let Some(tm) = parsed {
-                            let minutes = minute_offset_by_study(study_uid, seed);
+                            let minutes = minute_offset_by_patient(patient_key, seed);
                             let shifted_time = tm + Duration::minutes(minutes);
                             let secs = shifted_time.num_seconds_from_midnight();
                             let new = NaiveTime::from_num_seconds_from_midnight_opt(secs, 0).map(|t| t.format("%H%M%S").to_string()).unwrap_or_else(|| s.to_string());
@@ -236,83 +236,83 @@ fn process_inmem_top<D: dicom_core::DataDictionary + Clone>(
                 }
             }
             if let Ok(s) = el.to_str() {
-                let cleaned = sanitize_text_field(&s, &orig_name, &orig_pid, shift_date_by_study(study_uid, seed));
-                puts.push((t, el.vr(), cleaned));
-            } else {
-                puts.push((t, el.vr(), "".to_string()));
-            }
-            continue;
+let cleaned = sanitize_text_field(&s, &orig_name, &orig_pid, shift_date_by_patient(patient_key, seed));
+            puts.push((t, el.vr(), cleaned));
+        } else {
+            puts.push((t, el.vr(), "".to_string()));
         }
+        continue;
+    }
 
-        if el.vr() == VR::DA || date_tags.contains(&t) {
-            if let Ok(s) = el.to_str() {
-                if s.len() >= 8 {
-                    let date_part = &s[0..8];
-                    if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
-                        let shifted = dt + Duration::days(shift_date_by_study(study_uid, seed));
-                        let new = shifted.format("%Y%m%d").to_string();
-                        puts.push((t, VR::DA, new));
-                        continue;
-                    }
-                }
-            }
-        }
-
-        if el.vr() == VR::DT {
-            if let Ok(s) = el.to_str() {
-                if s.len() >= 8 {
-                    let date_part = &s[0..8];
-                    if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
-                        let shifted = dt + Duration::days(shift_date_by_study(study_uid, seed));
-                        let new_date = shifted.format("%Y%m%d").to_string();
-                        let mut new = s.to_string();
-                        new.replace_range(0..8, &new_date);
-                        puts.push((t, VR::DT, new));
-                        continue;
-                    }
-                }
-            }
-        }
-
-        if el.vr() == VR::TM || t == Tag(0x0010,0x0032) {
-            if let Ok(s) = el.to_str() {
-                let patterns = ["%H%M%S", "%H%M", "%H:%M:%S"];
-                let mut parsed: Option<NaiveTime> = None;
-                for p in &patterns {
-                    if let Ok(tm) = NaiveTime::parse_from_str(&s, p) {
-                        parsed = Some(tm);
-                        break;
-                    }
-                }
-                if let Some(tm) = parsed {
-                    let minutes = minute_offset_by_study(study_uid, seed);
-                    let shifted_time = tm + Duration::minutes(minutes);
-                    let secs = shifted_time.num_seconds_from_midnight();
-                    let new = NaiveTime::from_num_seconds_from_midnight_opt(secs, 0).map(|t| t.format("%H%M%S").to_string()).unwrap_or_else(|| s.to_string());
-                    puts.push((t, VR::TM, new));
+    if el.vr() == VR::DA || date_tags.contains(&t) {
+        if let Ok(s) = el.to_str() {
+            if s.len() >= 8 {
+                let date_part = &s[0..8];
+                if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
+                    let shifted = dt + Duration::days(shift_date_by_patient(patient_key, seed));
+                    let new = shifted.format("%Y%m%d").to_string();
+                    puts.push((t, VR::DA, new));
                     continue;
                 }
             }
         }
+    }
 
-        if el.vr() == VR::SQ {
-            seq_tags.push(t);
+    if el.vr() == VR::DT {
+        if let Ok(s) = el.to_str() {
+            if s.len() >= 8 {
+                let date_part = &s[0..8];
+                if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
+                    let shifted = dt + Duration::days(shift_date_by_patient(patient_key, seed));
+                    let new_date = shifted.format("%Y%m%d").to_string();
+                    let mut new = s.to_string();
+                    new.replace_range(0..8, &new_date);
+                    puts.push((t, VR::DT, new));
+                    continue;
+                }
+            }
         }
     }
 
-    for t in to_remove {
-        let _ = ds.remove_element(t);
+    if el.vr() == VR::TM || t == Tag(0x0010,0x0032) {
+        if let Ok(s) = el.to_str() {
+            let patterns = ["%H%M%S", "%H%M", "%H:%M:%S"];
+            let mut parsed: Option<NaiveTime> = None;
+            for p in &patterns {
+                if let Ok(tm) = NaiveTime::parse_from_str(&s, p) {
+                    parsed = Some(tm);
+                    break;
+                }
+            }
+            if let Some(tm) = parsed {
+                let minutes = minute_offset_by_patient(patient_key, seed);
+                let shifted_time = tm + Duration::minutes(minutes);
+                let secs = shifted_time.num_seconds_from_midnight();
+                let new = NaiveTime::from_num_seconds_from_midnight_opt(secs, 0).map(|t| t.format("%H%M%S").to_string()).unwrap_or_else(|| s.to_string());
+                puts.push((t, VR::TM, new));
+                continue;
+            }
+        }
     }
 
-    for (t, vr, val) in puts {
-        let _ = ds.put_str(t, vr, &val);
+    if el.vr() == VR::SQ {
+        seq_tags.push(t);
     }
+}
 
-    for t in seq_tags {
-        let _ = ds.update_value(t, |v| {
-            if let Some(items) = v.items_mut() {
-                for item in items.iter_mut() {
-                    process_inmem_top(item, study_uid, preserve_private, seed, clear_tags, date_tags, map, text_vrs, vr_whitelist);
+for t in to_remove {
+    let _ = ds.remove_element(t);
+}
+
+for (t, vr, val) in puts {
+    let _ = ds.put_str(t, vr, &val);
+}
+
+for t in seq_tags {
+    let _ = ds.update_value(t, |v| {
+        if let Some(items) = v.items_mut() {
+            for item in items.iter_mut() {
+                process_inmem_top(item, patient_key, preserve_private, seed, clear_tags, date_tags, map, text_vrs, vr_whitelist);
                 }
             }
         });
@@ -321,7 +321,7 @@ fn process_inmem_top<D: dicom_core::DataDictionary + Clone>(
 
 fn process_file<D: dicom_core::DataDictionary + Clone>(
     ds: &mut dicom_object::FileDicomObject<dicom_object::InMemDicomObject<D>>,
-    study_uid: &str,
+    patient_key: &str,
     preserve_private: bool,
     seed: Option<&str>,
     clear_tags: &Vec<Tag>,
@@ -375,7 +375,7 @@ fn process_file<D: dicom_core::DataDictionary + Clone>(
                             if s.len() >= 8 {
                                 let date_part = &s[0..8];
                                 if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
-                                    let shifted = dt + Duration::days(shift_date_by_study(study_uid, seed));
+                                    let shifted = dt + Duration::days(shift_date_by_patient(patient_key, seed));
                                     let new = shifted.format("%Y%m%d").to_string();
                                     puts.push((t, VR::DA, new));
                                     continue;
@@ -389,7 +389,7 @@ fn process_file<D: dicom_core::DataDictionary + Clone>(
                             if s.len() >= 8 {
                                 let date_part = &s[0..8];
                                 if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
-                                    let shifted = dt + Duration::days(shift_date_by_study(study_uid, seed));
+                                    let shifted = dt + Duration::days(shift_date_by_patient(patient_key, seed));
                                     let new_date = shifted.format("%Y%m%d").to_string();
                                     let mut new = s.to_string();
                                     new.replace_range(0..8, &new_date);
@@ -411,7 +411,7 @@ fn process_file<D: dicom_core::DataDictionary + Clone>(
                                 }
                             }
                             if let Some(tm) = parsed {
-                                let minutes = minute_offset_by_study(&study_uid, seed);
+                                let minutes = minute_offset_by_patient(patient_key, seed);
                                 let shifted_time = tm + Duration::minutes(minutes);
                                 let secs = shifted_time.num_seconds_from_midnight();
                                 let new = NaiveTime::from_num_seconds_from_midnight_opt(secs, 0).map(|t| t.format("%H%M%S").to_string()).unwrap_or_else(|| s.to_string());
@@ -468,7 +468,7 @@ fn process_file<D: dicom_core::DataDictionary + Clone>(
                 }
             }
             if let Ok(s) = el.to_str() {
-                let cleaned = sanitize_text_field(&s, &orig_name, &orig_pid, shift_date_by_study(study_uid, seed));
+                let cleaned = sanitize_text_field(&s, &orig_name, &orig_pid, shift_date_by_patient(patient_key, seed));
                 puts.push((t, el.vr(), cleaned));
             } else {
                 puts.push((t, el.vr(), "".to_string()));
@@ -480,7 +480,7 @@ fn process_file<D: dicom_core::DataDictionary + Clone>(
                 if s.len() >= 8 {
                     let date_part = &s[0..8];
                     if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
-                        let shifted = dt + Duration::days(shift_date_by_study(study_uid, seed));
+                        let shifted = dt + Duration::days(shift_date_by_patient(patient_key, seed));
                         let new = shifted.format("%Y%m%d").to_string();
                         puts.push((t, VR::DA, new));
                         continue;
@@ -493,7 +493,7 @@ fn process_file<D: dicom_core::DataDictionary + Clone>(
                 if s.len() >= 8 {
                     let date_part = &s[0..8];
                     if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
-                        let shifted = dt + Duration::days(shift_date_by_study(study_uid, seed));
+                        let shifted = dt + Duration::days(shift_date_by_patient(patient_key, seed));
                         let new_date = shifted.format("%Y%m%d").to_string();
                         let mut new = s.to_string();
                         new.replace_range(0..8, &new_date);
@@ -520,7 +520,7 @@ fn process_file<D: dicom_core::DataDictionary + Clone>(
         let _ = ds.update_value(t, |v| {
             if let Some(items) = v.items_mut() {
                 for item in items.iter_mut() {
-                    process_inmem_top(item, study_uid, preserve_private, seed, clear_tags, date_tags, map, text_vrs, vr_whitelist);
+                    process_inmem_top(item, patient_key, preserve_private, seed, clear_tags, date_tags, map, text_vrs, vr_whitelist);
                 }
             }
         });
@@ -539,7 +539,6 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, pr
         }
     }
 
-    let study_uid = obj.element(Tag(0x0020, 0x000D)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()).unwrap_or_else(|| "NO_STUDY_UID".to_string());
     let pat_name = obj.element(Tag(0x0010, 0x0010)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()).unwrap_or_else(|| "ANON".to_string());
 
     // Patient-level hashes should not vary by study so that the same patient
@@ -584,7 +583,7 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, pr
         }
     }
 
-    let shift_days = shift_date_by_study(&study_uid, seed);
+    let shift_days = shift_date_by_patient(&pat_name, seed);
 
     // Capture original PatientID (for PHI scanning inside free-text)
     let orig_patient_id = obj.element(Tag(0x0010,0x0020)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()).unwrap_or_else(|| String::new());
@@ -691,7 +690,7 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, pr
         let _ = obj.update_value(Tag(0x0040,0xA730), |v| {
             if let Some(items) = v.items_mut() {
                     for item in items.iter_mut() {
-                    process_inmem_top(item, &study_uid, preserve_private, seed, &clear_tags, &date_tags, &mut map, &text_vrs, &vr_whitelist);
+                    process_inmem_top(item, &pat_name, preserve_private, seed, &clear_tags, &date_tags, &mut map, &text_vrs, &vr_whitelist);
                 }
             }
         });
@@ -720,7 +719,7 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, pr
         }
     }
 
-    process_file(&mut obj, &study_uid, preserve_private, seed, &clear_tags, &date_tags, &mut map, &text_vrs, &vr_whitelist);
+    process_file(&mut obj, &pat_name, preserve_private, seed, &clear_tags, &date_tags, &mut map, &text_vrs, &vr_whitelist);
 
     // (private tags restoration will be applied below)
 
@@ -766,7 +765,7 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, pr
                                         }
                                     }
                                     if let Some(tm) = parsed {
-                                        let minutes = minute_offset_by_study(&study_uid, seed);
+                                        let minutes = minute_offset_by_patient(&pat_name, seed);
                                         let shifted_time = tm + Duration::minutes(minutes);
                                         let secs = shifted_time.num_seconds_from_midnight();
                                         let new = NaiveTime::from_num_seconds_from_midnight_opt(secs, 0).map(|t| t.format("%H%M%S").to_string()).unwrap_or_else(|| s.to_string());
