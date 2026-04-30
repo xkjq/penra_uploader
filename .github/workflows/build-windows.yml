@@ -38,11 +38,6 @@ jobs:
         env:
           RUSTFLAGS: "-C link-args=/DEFAULTLIB:Advapi32.lib"
         run: cargo build --release
-      - name: Upload dicor-rs MSVC artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dicor-rs-windows-msvc
-          path: dicor-rs\\target\\release\\dicor-rs.exe
       - name: Build divue-rs (MSVC)
         working-directory: divue-rs
         env:
@@ -52,7 +47,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: divue-rs-windows-msvc
-          path: divue-rs\\target\\release\\divue-rs.exe
+          path: divue-rs\\target\\release\\divue.exe
       - name: Upload diviz-rs MSVC artifact
         uses: actions/upload-artifact@v4
         with:
