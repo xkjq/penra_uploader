@@ -269,6 +269,14 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
+fn is_duplicate_refresh_step(step: &str) -> bool {
+    step.trim() == "Refreshing duplicate status"
+}
+
+fn duplicate_status_color() -> egui::Color32 {
+    egui::Color32::from_rgb(196, 172, 96)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StudySortMode {
     LoadedOrder,
@@ -461,6 +469,7 @@ struct AppState {
     series_sort_direction: SortDirection,
     uploaded_series: HashSet<String>,
     uploaded_studies: HashSet<String>,
+    duplicate_refresh_in_progress: bool,
     /// None = individual states; Some(true) = all expanded; Some(false) = all collapsed
     studies_collapsed: Option<bool>,
 }
@@ -558,6 +567,7 @@ impl Default for AppState {
             series_sort_direction: SortDirection::Asc,
             uploaded_series: HashSet::new(),
             uploaded_studies: HashSet::new(),
+            duplicate_refresh_in_progress: false,
             log_level: std::env::var("RUST_LOG").ok().or_else(|| upload::load_log_level()).unwrap_or_else(|| "info".to_string()),
             logo_tex: None,
         }
@@ -565,6 +575,17 @@ impl Default for AppState {
 }
 
 impl AppState {
+    fn mark_duplicate_check_pending(&mut self) {
+        for series in &mut self.ready_series {
+            for f in &mut series.files {
+                if !f.hash.is_empty() {
+                    f.duplicate_checked = false;
+                }
+            }
+            series.duplicate_checked_files = series.files.iter().filter(|f| f.duplicate_checked).count();
+        }
+    }
+
     fn add_toast(&mut self, msg: String, duration_ms: u64) {
         let expire = Instant::now() + Duration::from_millis(duration_ms);
         self.toasts.push((msg, expire));
@@ -799,7 +820,12 @@ impl AppState {
                 return;
             }
         }
-        if m == "UPLOAD:RESET" {
+        if m == "DUPCHECK:START" {
+            self.duplicate_refresh_in_progress = true;
+            self.mark_duplicate_check_pending();
+        } else if m == "DUPCHECK:DONE" {
+            self.duplicate_refresh_in_progress = false;
+        } else if m == "UPLOAD:RESET" {
             self.uploaded_series.clear();
             self.uploaded_studies.clear();
         } else if let Some(rest) = m.strip_prefix("UPLOAD:SERIES_DONE:") {
@@ -815,16 +841,19 @@ impl AppState {
                 self.uploaded_studies.insert(key.to_string());
             }
         } else if m == "done" {
+            self.duplicate_refresh_in_progress = false;
             self.last_msg = "Processing complete".to_string();
             upload::log_rpc("Processing complete");
             self.processing_step = None;
             self.processing_progress = 0.0;
         } else if m == "PROC:DONE" {
+            self.duplicate_refresh_in_progress = false;
             self.last_msg = "Processing complete".to_string();
             upload::log_rpc("Processing complete");
             self.processing_step = None;
             self.processing_progress = 0.0;
         } else if m == "scan_written" {
+            self.duplicate_refresh_in_progress = false;
             // retrieve the parsed scan result stored by the background thread
             if let Some(v) = upload::get_last_scan() {
                 self.ready_series = v;
@@ -853,6 +882,12 @@ impl AppState {
             }
         } else if m.starts_with("PROC:STEP:") {
             if let Some(step) = m.strip_prefix("PROC:STEP:") {
+                if is_duplicate_refresh_step(step) {
+                    self.duplicate_refresh_in_progress = true;
+                    self.mark_duplicate_check_pending();
+                } else {
+                    self.duplicate_refresh_in_progress = false;
+                }
                 upload::log_rpc_debug(&format!("Processing step: {}", step));
                 self.processing_step = Some(step.to_string());
                 self.last_msg = step.to_string();
@@ -901,9 +936,11 @@ impl eframe::App for AppState {
                         }
                     }
                     if let Some(step) = &self.processing_step {
-                        let pct = (self.processing_progress * 100.0).clamp(0.0, 100.0);
-                        let label = format!("{} — {:.0}%", step, pct);
-                        ui.add(egui::ProgressBar::new(self.processing_progress).text(label));
+                        if !is_duplicate_refresh_step(step) {
+                            let pct = (self.processing_progress * 100.0).clamp(0.0, 100.0);
+                            let label = format!("{} — {:.0}%", step, pct);
+                            ui.add(egui::ProgressBar::new(self.processing_progress).text(label));
+                        }
                     }
                 });
             });
@@ -1203,6 +1240,8 @@ impl eframe::App for AppState {
                         if ui.button("Refresh duplicate checks").clicked() {
                             let anon_dir = self.anon_dir();
                             let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
+                            self.duplicate_refresh_in_progress = true;
+                            let _ = tx.send("DUPCHECK:START".to_string());
                             thread::spawn(move || {
                                 upload::clear_duplicate_lookup_cache();
                                 match upload::refresh_duplicates_for_ready_force(&anon_dir, Some(tx.clone())) {
@@ -1219,6 +1258,7 @@ impl eframe::App for AppState {
                                         let _ = tx.send(format!("Duplicate refresh failed: {}", e));
                                     }
                                 }
+                                let _ = tx.send("DUPCHECK:DONE".to_string());
                                 let _ = tx.send("done".to_string());
                             });
                         }
@@ -1227,6 +1267,11 @@ impl eframe::App for AppState {
                             self.metadata_select_mode = true;
                             self.selected_files_for_meta.clear();
                             self.last_msg = "Select files for metadata compare".to_string();
+                        }
+                        if self.duplicate_refresh_in_progress {
+                            ui.add_space(6.0);
+                            ui.add(egui::Spinner::new());
+                            ui.label(egui::RichText::new("Checking duplicates...").small().color(duplicate_status_color()));
                         }
                         ui.add_space(8.0);
                         if ui.small_button("Clear duplicates").clicked() {
@@ -1420,6 +1465,14 @@ impl eframe::App for AppState {
                             .filter(|&&si| self.uploaded_series.contains(&self.ready_series[si].series_uid))
                             .count();
                         let study_uploaded = self.uploaded_studies.contains(group_key) || (uploaded_series_count == sorted_series_indices.len() && !sorted_series_indices.is_empty());
+                        let study_checked_series = sorted_series_indices
+                            .iter()
+                            .filter(|&&si| {
+                                let s = &self.ready_series[si];
+                                !s.files.is_empty() && s.duplicate_checked_files >= s.files.len()
+                            })
+                            .count();
+                        let study_total_series = sorted_series_indices.len();
 
                         let study_header = format!(
                             "Study: {}{}",
@@ -1439,7 +1492,23 @@ impl eframe::App for AppState {
                                     if study_uploaded {
                                         ui.colored_label(egui::Color32::from_rgb(46, 160, 67), "Uploaded");
                                     } else if uploaded_series_count > 0 {
-                                        ui.colored_label(egui::Color32::YELLOW, format!("Uploading {} / {} series", uploaded_series_count, sorted_series_indices.len()));
+                                        ui.colored_label(duplicate_status_color(), format!("Uploading {} / {} series", uploaded_series_count, sorted_series_indices.len()));
+                                    }
+                                    if study_total_series > 0 {
+                                        if study_checked_series >= study_total_series {
+                                            ui.colored_label(egui::Color32::from_rgb(46, 160, 67), "Dup check complete");
+                                        } else if self.duplicate_refresh_in_progress {
+                                            ui.colored_label(
+                                                duplicate_status_color(),
+                                                format!("Dup check {} / {} series", study_checked_series, study_total_series),
+                                            );
+                                        } else {
+                                            ui.label(
+                                                egui::RichText::new(format!("Dup check {} / {} series", study_checked_series, study_total_series))
+                                                    .weak()
+                                                    .small(),
+                                            );
+                                        }
                                     }
                                     if ui.small_button("View study").clicked() {
                                         self.launch_diviz(study_all_paths.clone());
@@ -1472,7 +1541,23 @@ impl eframe::App for AppState {
                                         if self.uploaded_series.contains(&series.series_uid) {
                                             ui.colored_label(egui::Color32::from_rgb(46, 160, 67), "Uploaded");
                                         } else if !series.duplicate_series_urls.is_empty() {
-                                            ui.colored_label(egui::Color32::YELLOW, "Matched on server");
+                                            ui.colored_label(duplicate_status_color(), "Matched on server");
+                                        }
+                                        if !series.files.is_empty() {
+                                            if series.duplicate_checked_files >= series.files.len() {
+                                                ui.colored_label(egui::Color32::from_rgb(46, 160, 67), "Checked");
+                                            } else if self.duplicate_refresh_in_progress {
+                                                ui.colored_label(
+                                                    duplicate_status_color(),
+                                                    format!("Checking {} / {}", series.duplicate_checked_files, series.files.len()),
+                                                );
+                                            } else {
+                                                ui.label(
+                                                    egui::RichText::new(format!("Awaiting check {} / {}", series.duplicate_checked_files, series.files.len()))
+                                                        .weak()
+                                                        .small(),
+                                                );
+                                            }
                                         }
                                         if !series.duplicate_series_urls.is_empty() {
                                             let url = series.duplicate_series_urls.get(0).cloned().unwrap_or_default();
@@ -1502,7 +1587,7 @@ impl eframe::App for AppState {
                                         }
                                     });
                                     if !series.duplicate_series_urls.is_empty() {
-                                        ui.colored_label(egui::Color32::YELLOW, format!("{} duplicate(s) found on server", series.duplicate_series_urls.len()));
+                                        ui.colored_label(duplicate_status_color(), format!("{} duplicate(s) found on server", series.duplicate_series_urls.len()));
                                         if let Some(u) = series.duplicate_series_urls.get(0) {
                                             ui.label(u);
                                         }

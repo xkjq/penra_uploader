@@ -36,6 +36,8 @@ pub struct ReadyFileInfo {
     pub study_uid: Option<String>,
     #[serde(default)]
     pub load_order: u64,
+    #[serde(default)]
+    pub duplicate_checked: bool,
     pub is_duplicate: bool,
     pub duplicate_series_urls: Vec<String>,
     pub patient_name: Option<String>,
@@ -52,6 +54,8 @@ pub struct ReadyFileInfo {
 pub struct FileEntry {
     pub path: PathBuf,
     pub hash: String,
+    #[serde(default)]
+    pub duplicate_checked: bool,
     pub is_duplicate: bool,
 }
 
@@ -64,6 +68,8 @@ pub struct SeriesInfo {
     pub study_uid: Option<String>,
     #[serde(default)]
     pub loaded_order: u64,
+    #[serde(default)]
+    pub duplicate_checked_files: usize,
     // common metadata to present in the GUI
     pub patient_name: Option<String>,
     pub examination: Option<String>,
@@ -251,6 +257,7 @@ fn build_series_from_ready_files(items: &[ReadyFileInfo]) -> Vec<SeriesInfo> {
         let mut entries: Vec<FileEntry> = Vec::new();
         let mut urls: HashSet<String> = HashSet::new();
         let mut total_bytes: u64 = 0;
+        let mut duplicate_checked_files: usize = 0;
         let mut loaded_order = u64::MAX;
         let mut patient_name = None;
         let mut examination = None;
@@ -265,12 +272,16 @@ fn build_series_from_ready_files(items: &[ReadyFileInfo]) -> Vec<SeriesInfo> {
             entries.push(FileEntry {
                 path: rf.path.clone(),
                 hash: rf.hash.clone(),
+                duplicate_checked: rf.duplicate_checked,
                 is_duplicate: rf.is_duplicate,
             });
             for u in &rf.duplicate_series_urls {
                 urls.insert(u.clone());
             }
             total_bytes = total_bytes.saturating_add(rf.file_size);
+            if rf.duplicate_checked {
+                duplicate_checked_files = duplicate_checked_files.saturating_add(1);
+            }
             loaded_order = loaded_order.min(rf.load_order);
             if patient_name.is_none() {
                 patient_name = rf.patient_name.clone();
@@ -304,6 +315,7 @@ fn build_series_from_ready_files(items: &[ReadyFileInfo]) -> Vec<SeriesInfo> {
             duplicate_series_urls: urls.into_iter().collect(),
             study_uid,
             loaded_order: if loaded_order == u64::MAX { 0 } else { loaded_order },
+            duplicate_checked_files,
             patient_name,
             examination,
             patient_id,
@@ -355,6 +367,7 @@ fn upsert_ready_file_internal(
         series_uid,
         study_uid,
         load_order,
+        duplicate_checked: false,
         is_duplicate: false,
         duplicate_series_urls: Vec::new(),
         patient_name: read_dicom_string(&obj, Tag(0x0010, 0x0010)),
@@ -592,9 +605,20 @@ fn refresh_duplicates_for_ready_mode(
             if !rf.path.starts_with(anon_dir) {
                 continue;
             }
+            if rf.hash.is_empty() {
+                // Cannot precheck duplicates without PixelData hash; treat as
+                // check-complete for UI state so it does not stay "awaiting" forever.
+                rf.duplicate_checked = true;
+                continue;
+            }
             if let Some(res) = cache.get(&rf.hash) {
                 rf.is_duplicate = res.is_duplicate;
                 rf.duplicate_series_urls = res.urls.clone();
+                rf.duplicate_checked = true;
+            } else if force_refresh {
+                // Force refresh explicitly invalidates stale checked state for
+                // hashes that have not returned from the lookup yet.
+                rf.duplicate_checked = false;
             }
         }
         persist_ready_manifest_locked(&g);
@@ -1327,13 +1351,19 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
         let mut total_bytes: u64 = 0;
         for (p, h) in &items {
             let is_dup = duplicate_hashes.contains(h);
+            let duplicate_checked = h.is_empty() || is_dup || duplicate_series_urls.contains_key(h);
             if let Some(u) = duplicate_series_urls.get(h) {
                 for s in u { urls.push(s.clone()); }
             }
             if let Ok(md) = std::fs::metadata(p) {
                 total_bytes = total_bytes.saturating_add(md.len());
             }
-            entries.push(FileEntry { path: p.clone(), hash: h.clone(), is_duplicate: is_dup });
+            entries.push(FileEntry {
+                path: p.clone(),
+                hash: h.clone(),
+                duplicate_checked,
+                is_duplicate: is_dup,
+            });
         }
 
         // pick first file to extract study/series metadata
@@ -1364,6 +1394,10 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
             duplicate_series_urls: urls,
             study_uid: None,
             loaded_order,
+            duplicate_checked_files: items
+                .iter()
+                .filter(|(_, h)| h.is_empty() || duplicate_hashes.contains(h) || duplicate_series_urls.contains_key(h))
+                .count(),
             patient_name,
             examination,
             patient_id,
@@ -1433,7 +1467,12 @@ pub fn scan_for_upload_quick(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender
         let total_bytes: u64 = 0;
         for (p, _h) in &items {
             // avoid stat() to keep this fast; file sizes are non-critical for delete-only flows
-            entries.push(FileEntry { path: p.clone(), hash: "".to_string(), is_duplicate: false });
+            entries.push(FileEntry {
+                path: p.clone(),
+                hash: "".to_string(),
+                duplicate_checked: true,
+                is_duplicate: false,
+            });
         }
 
         let loaded_order = series_first_seen.get(&series_uid).copied().unwrap_or(0);
@@ -1444,6 +1483,7 @@ pub fn scan_for_upload_quick(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender
             duplicate_series_urls: Vec::new(),
             study_uid: None,
             loaded_order,
+            duplicate_checked_files: items.len(),
             patient_name: None,
             examination: None,
             patient_id: None,
