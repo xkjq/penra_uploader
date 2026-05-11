@@ -15,6 +15,7 @@
         "/^python3 /home/ross/uploader/\\.scripts/check_delims\\.py$/": {
             "approve": true,
             "matchCommandLine": true
-        }
+        },
+        "cargo check": true
     }
 }

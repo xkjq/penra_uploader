@@ -9,7 +9,7 @@ use dicom_object::Tag;
 use dicom_pixeldata::PixelDecoder;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use serde::{Serialize, Deserialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
 use tracing::Level;
@@ -32,6 +32,10 @@ pub struct ReadyFileInfo {
     pub path: PathBuf,
     pub hash: String,
     pub series_uid: String,
+    #[serde(default)]
+    pub study_uid: Option<String>,
+    #[serde(default)]
+    pub load_order: u64,
     pub is_duplicate: bool,
     pub duplicate_series_urls: Vec<String>,
     pub patient_name: Option<String>,
@@ -56,6 +60,10 @@ pub struct SeriesInfo {
     pub series_uid: String,
     pub files: Vec<FileEntry>,
     pub duplicate_series_urls: Vec<String>,
+    #[serde(default)]
+    pub study_uid: Option<String>,
+    #[serde(default)]
+    pub loaded_order: u64,
     // common metadata to present in the GUI
     pub patient_name: Option<String>,
     pub examination: Option<String>,
@@ -77,6 +85,102 @@ pub struct UploadResult {
 }
 
 static READY_FILES: Lazy<Mutex<HashMap<String, ReadyFileInfo>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static NEXT_READY_ORDER: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
+
+fn read_dicom_string(obj: &dicom_object::DefaultDicomObject, tag: Tag) -> Option<String> {
+    obj.element(tag).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string())
+}
+
+fn sync_ready_order_counter(map: &HashMap<String, ReadyFileInfo>) {
+    let max_order = map.values().map(|rf| rf.load_order).max().unwrap_or(0);
+    NEXT_READY_ORDER.store(max_order.saturating_add(1), Ordering::SeqCst);
+}
+
+fn normalize_ready_manifest_load_order(map: &mut HashMap<String, ReadyFileInfo>) {
+    if map.values().any(|rf| rf.load_order == 0) {
+        let mut keys: Vec<String> = map.keys().cloned().collect();
+        keys.sort();
+        let mut next = map.values().map(|rf| rf.load_order).max().unwrap_or(0).saturating_add(1);
+        for key in keys {
+            if let Some(rf) = map.get_mut(&key) {
+                if rf.load_order == 0 {
+                    rf.load_order = next;
+                    next = next.saturating_add(1);
+                }
+            }
+        }
+    }
+    sync_ready_order_counter(map);
+}
+
+pub fn study_group_key(series: &SeriesInfo) -> String {
+    if let Some(uid) = series.study_uid.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        return format!("study_uid:{}", uid);
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    for value in [
+        series.patient_name.as_deref(),
+        series.examination.as_deref(),
+        series.study_date.as_deref(),
+    ] {
+        if let Some(text) = value.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            parts.push(text.to_string());
+        }
+    }
+
+    if parts.is_empty() {
+        format!("study_fallback:{}", series.loaded_order)
+    } else {
+        format!("study_fallback:{}", parts.join("|"))
+    }
+}
+
+fn record_uploaded_file(
+    fname: &str,
+    file_owner: &HashMap<String, (String, String)>,
+    series_total_files: &HashMap<String, usize>,
+    series_handled_files: &mut HashMap<String, usize>,
+    study_total_series: &HashMap<String, usize>,
+    study_completed_series: &mut HashMap<String, usize>,
+    tx: &Option<std::sync::mpsc::Sender<String>>,
+) {
+    let Some((series_uid, study_key)) = file_owner.get(fname).cloned() else {
+        return;
+    };
+
+    let series_total = series_total_files.get(&series_uid).copied().unwrap_or(0);
+    if series_total == 0 {
+        return;
+    }
+
+    let series_done = {
+        let handled = series_handled_files.entry(series_uid.clone()).or_insert(0);
+        *handled = handled.saturating_add(1);
+        *handled >= series_total
+    };
+
+    if series_done {
+        if let Some(ref s) = tx {
+            let _ = s.send(format!("UPLOAD:SERIES_DONE:{}:{}", series_uid, study_key));
+        }
+
+        let study_total = study_total_series.get(&study_key).copied().unwrap_or(0);
+        if study_total > 0 {
+            let study_done = {
+                let handled = study_completed_series.entry(study_key.clone()).or_insert(0);
+                *handled = handled.saturating_add(1);
+                *handled >= study_total
+            };
+
+            if study_done {
+                if let Some(ref s) = tx {
+                    let _ = s.send(format!("UPLOAD:STUDY_DONE:{}", study_key));
+                }
+            }
+        }
+    }
+}
 
 fn ready_manifest_path() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -115,6 +219,7 @@ pub fn load_ready_manifest() {
         if let Ok(v) = serde_json::from_str::<HashMap<String, ReadyFileInfo>>(&s) {
             if let Ok(mut g) = READY_FILES.lock() {
                 *g = v;
+                normalize_ready_manifest_load_order(&mut g);
             }
         }
     }
@@ -141,11 +246,12 @@ fn build_series_from_ready_files(items: &[ReadyFileInfo]) -> Vec<SeriesInfo> {
     for (series_uid, files) in grouped.into_iter() {
         let mut files = files;
         // Stable file ordering within each series prevents UI rows from jumping.
-        files.sort_by(|a, b| a.path.cmp(&b.path));
+        files.sort_by(|a, b| a.load_order.cmp(&b.load_order).then_with(|| a.path.cmp(&b.path)));
 
         let mut entries: Vec<FileEntry> = Vec::new();
         let mut urls: HashSet<String> = HashSet::new();
         let mut total_bytes: u64 = 0;
+        let mut loaded_order = u64::MAX;
         let mut patient_name = None;
         let mut examination = None;
         let mut patient_id = None;
@@ -153,6 +259,7 @@ fn build_series_from_ready_files(items: &[ReadyFileInfo]) -> Vec<SeriesInfo> {
         let mut modality = None;
         let mut series_description = None;
         let mut series_number = None;
+        let mut study_uid = None;
 
         for rf in &files {
             entries.push(FileEntry {
@@ -164,6 +271,7 @@ fn build_series_from_ready_files(items: &[ReadyFileInfo]) -> Vec<SeriesInfo> {
                 urls.insert(u.clone());
             }
             total_bytes = total_bytes.saturating_add(rf.file_size);
+            loaded_order = loaded_order.min(rf.load_order);
             if patient_name.is_none() {
                 patient_name = rf.patient_name.clone();
             }
@@ -185,12 +293,17 @@ fn build_series_from_ready_files(items: &[ReadyFileInfo]) -> Vec<SeriesInfo> {
             if series_number.is_none() {
                 series_number = rf.series_number.clone();
             }
+            if study_uid.is_none() {
+                study_uid = rf.study_uid.clone();
+            }
         }
 
         out.push(SeriesInfo {
             series_uid,
             files: entries,
             duplicate_series_urls: urls.into_iter().collect(),
+            study_uid,
+            loaded_order: if loaded_order == u64::MAX { 0 } else { loaded_order },
             patient_name,
             examination,
             patient_id,
@@ -211,38 +324,54 @@ pub fn snapshot_ready_series(anon_dir: &Path) -> Vec<SeriesInfo> {
 }
 
 pub fn upsert_ready_file(path: &Path, known_hash: Option<String>) -> Result<(), String> {
+    upsert_ready_file_internal(path, known_hash, true)
+}
+
+fn upsert_ready_file_internal(
+    path: &Path,
+    known_hash: Option<String>,
+    persist_manifest: bool,
+) -> Result<(), String> {
+    let obj = open_file(path).map_err(|e| format!("open_file {}: {}", path.display(), e))?;
     // Empty hash means no PixelData was available; file remains uploadable
     // but is skipped by duplicate precheck (which only accepts pixel hashes).
-    let hash = known_hash.or_else(|| calculate_pixel_hash(path)).unwrap_or_default();
+    let hash = known_hash
+        .or_else(|| calculate_pixel_hash_from_obj(&obj))
+        .unwrap_or_default();
 
-    let obj = open_file(path).map_err(|e| format!("open_file {}: {}", path.display(), e))?;
     let series_uid = obj
         .element(Tag(0x0020, 0x000E))
         .ok()
         .and_then(|e| e.to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_else(|| "NO_SERIES".to_string());
+    let study_uid = read_dicom_string(&obj, Tag(0x0020, 0x000D));
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let load_order = NEXT_READY_ORDER.fetch_add(1, Ordering::SeqCst);
 
     let info = ReadyFileInfo {
         path: path.to_path_buf(),
         hash,
         series_uid,
+        study_uid,
+        load_order,
         is_duplicate: false,
         duplicate_series_urls: Vec::new(),
-        patient_name: obj.element(Tag(0x0010, 0x0010)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()),
-        examination: obj.element(Tag(0x0008, 0x1030)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()),
-        patient_id: obj.element(Tag(0x0010, 0x0020)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()),
-        study_date: obj.element(Tag(0x0008, 0x0020)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()),
-        modality: obj.element(Tag(0x0008, 0x0060)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()),
-        series_description: obj.element(Tag(0x0008, 0x103E)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()),
-        series_number: obj.element(Tag(0x0020, 0x0011)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string()),
+        patient_name: read_dicom_string(&obj, Tag(0x0010, 0x0010)),
+        examination: read_dicom_string(&obj, Tag(0x0008, 0x1030)),
+        patient_id: read_dicom_string(&obj, Tag(0x0010, 0x0020)),
+        study_date: read_dicom_string(&obj, Tag(0x0008, 0x0020)),
+        modality: read_dicom_string(&obj, Tag(0x0008, 0x0060)),
+        series_description: read_dicom_string(&obj, Tag(0x0008, 0x103E)),
+        series_number: read_dicom_string(&obj, Tag(0x0020, 0x0011)),
         file_size,
     };
 
     if let Ok(mut g) = READY_FILES.lock() {
         g.insert(path_key(path), info);
-        persist_ready_manifest_locked(&g);
+        if persist_manifest {
+            persist_ready_manifest_locked(&g);
+        }
     }
     Ok(())
 }
@@ -397,9 +526,12 @@ fn ensure_ready_cache(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String
     }
 
     let total = dcm_like.len();
+    let mut changed = false;
     for (i, p) in dcm_like.iter().enumerate() {
-        if upsert_ready_file(p, None).is_err() {
+        if upsert_ready_file_internal(p, None, false).is_err() {
             log_rpc_debug(&format!("Bootstrap skipped non-DICOM file: {}", p.display()));
+        } else {
+            changed = true;
         }
         if let Some(ref s) = tx {
             let report_interval = std::cmp::max(1, total / 20);
@@ -407,6 +539,11 @@ fn ensure_ready_cache(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String
                 let prog = ((i + 1) as f32 / total as f32).clamp(0.0, 1.0);
                 let _ = s.send(format!("PROC:PROG:{}", prog));
             }
+        }
+    }
+    if changed {
+        if let Ok(g) = READY_FILES.lock() {
+            persist_ready_manifest_locked(&g);
         }
     }
     Ok(())
@@ -835,23 +972,28 @@ pub fn calculate_pixel_hash(path: &Path) -> Option<String> {
     // Full-file hashing is intentionally disallowed because metadata changes
     // would produce different hashes for the same image content.
     if let Ok(obj) = open_file(path) {
-        // Preferred: hash decoded pixel bytes.
-        if let Ok(pixel_data) = obj.decode_pixel_data() {
-            let bytes = pixel_data.data();
-            return Some(blake3::hash(bytes).to_hex().to_string());
-        }
+        return calculate_pixel_hash_from_obj(&obj);
+    }
+    None
+}
 
-        // Prefer the PixelData element bytes when present. Decoding helpers
-        // vary across `dicom-object` versions; use direct element access
-        // as a reliable fallback that works with the current dependency.
-        if let Ok(elem) = obj.element(Tag(0x7FE0, 0x0010)) {
-            if let Ok(bytes) = elem.to_bytes() {
-                return Some(blake3::hash(&bytes).to_hex().to_string());
-            }
-            if let Ok(s) = elem.to_str() {
-                let b = s.as_bytes();
-                return Some(blake3::hash(b).to_hex().to_string());
-            }
+fn calculate_pixel_hash_from_obj(obj: &dicom_object::DefaultDicomObject) -> Option<String> {
+    // Preferred: hash decoded pixel bytes.
+    if let Ok(pixel_data) = obj.decode_pixel_data() {
+        let bytes = pixel_data.data();
+        return Some(blake3::hash(bytes).to_hex().to_string());
+    }
+
+    // Prefer the PixelData element bytes when present. Decoding helpers
+    // vary across `dicom-object` versions; use direct element access
+    // as a reliable fallback that works with the current dependency.
+    if let Ok(elem) = obj.element(Tag(0x7FE0, 0x0010)) {
+        if let Ok(bytes) = elem.to_bytes() {
+            return Some(blake3::hash(&bytes).to_hex().to_string());
+        }
+        if let Ok(s) = elem.to_str() {
+            let b = s.as_bytes();
+            return Some(blake3::hash(b).to_hex().to_string());
         }
     }
     None
@@ -865,11 +1007,20 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
     // marked as duplicates by the scanner's precheck will be skipped here.
     let mut files_to_upload: Vec<(PathBuf, String)> = Vec::new();
     let mut pre_duplicate_series: HashSet<String> = HashSet::new();
+    let mut file_owner: HashMap<String, (String, String)> = HashMap::new();
+    let mut series_total_files: HashMap<String, usize> = HashMap::new();
+    let mut study_total_series: HashMap<String, usize> = HashMap::new();
 
     for si in &series {
+        let study_key = study_group_key(si);
+        series_total_files.insert(si.series_uid.clone(), si.files.len());
+        *study_total_series.entry(study_key.clone()).or_insert(0) += 1;
         // collect duplicate series URLs for any series where at least one file is duplicate
         let mut series_has_dup = false;
         for f in &si.files {
+            if let Some(fname) = f.path.file_name().and_then(|s| s.to_str()) {
+                file_owner.insert(fname.to_string(), (si.series_uid.clone(), study_key.clone()));
+            }
             if f.is_duplicate {
                 series_has_dup = true;
             } else {
@@ -890,6 +1041,8 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
     let mut duplicates = Vec::new();
     let mut failed = Vec::new();
     let mut duplicate_series = pre_duplicate_series.clone();
+    let mut series_handled_files: HashMap<String, usize> = HashMap::new();
+    let mut study_completed_series: HashMap<String, usize> = HashMap::new();
     // Prepare HTTP client and base URL for upload requests
     let client = make_client(load_api_token().as_deref())?;
     let base = base_site_url();
@@ -945,6 +1098,15 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
                                                             if std::fs::remove_file(p).is_ok() {
                                                                 log_rpc_debug(&format!("Deleted uploaded file: {}", p.display()));
                                                                 remove_ready_file(p);
+                                                                record_uploaded_file(
+                                                                    fname,
+                                                                    &file_owner,
+                                                                    &series_total_files,
+                                                                    &mut series_handled_files,
+                                                                    &study_total_series,
+                                                                    &mut study_completed_series,
+                                                                    &tx,
+                                                                );
                                                             } else {
                                                                 log_rpc_warn(&format!("Failed to delete uploaded file: {}", p.display()));
                                                             }
@@ -968,6 +1130,15 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
                                                             if std::fs::remove_file(p).is_ok() {
                                                                 log_rpc_debug(&format!("Deleted duplicate local file: {}", p.display()));
                                                                 remove_ready_file(p);
+                                                                record_uploaded_file(
+                                                                    fname,
+                                                                    &file_owner,
+                                                                    &series_total_files,
+                                                                    &mut series_handled_files,
+                                                                    &study_total_series,
+                                                                    &mut study_completed_series,
+                                                                    &tx,
+                                                                );
                                                             } else {
                                                                 log_rpc_warn(&format!("Failed to delete duplicate local file: {}", p.display()));
                                                             }
@@ -1045,6 +1216,7 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
 
     // compute hashes and series mapping — open each file once and reuse the object
     let mut series_map: HashMap<String, Vec<(PathBuf, String)>> = HashMap::new();
+    let mut series_first_seen: HashMap<String, u64> = HashMap::new();
     let mut hash_list: Vec<String> = Vec::new();
 
     let total_files = files.len();
@@ -1078,6 +1250,7 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
 
         let h = h_opt.clone().unwrap_or_else(|| "".to_string());
         if h_opt.is_some() { hash_list.push(h.clone()); }
+        series_first_seen.entry(series_uid.clone()).or_insert(i as u64);
         series_map.entry(series_uid).or_default().push((p.clone(), h));
 
         // report incremental progress
@@ -1183,10 +1356,14 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
             }
         }
 
+        let loaded_order = series_first_seen.get(&series_uid).copied().unwrap_or(0);
+
         out.push(SeriesInfo {
             series_uid,
             files: entries,
             duplicate_series_urls: urls,
+            study_uid: None,
+            loaded_order,
             patient_name,
             examination,
             patient_id,
@@ -1236,9 +1413,12 @@ pub fn scan_for_upload_quick(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender
     // Avoid calling `metadata` per file and avoid per-file progress updates; only
     // emit periodic progress to keep the UI responsive.
     let mut series_map: HashMap<String, Vec<(PathBuf, String)>> = HashMap::new();
+    let mut series_first_seen: HashMap<String, u64> = HashMap::new();
     let report_interval = std::cmp::max(1, total_files / 10); // ~10 updates
     for (i, p) in files.iter().enumerate() {
-        let _ = series_map.entry("NO_SERIES".to_string()).or_default().push((p.clone(), "".to_string()));
+        let series_uid = "NO_SERIES".to_string();
+        series_first_seen.entry(series_uid.clone()).or_insert(i as u64);
+        let _ = series_map.entry(series_uid).or_default().push((p.clone(), "".to_string()));
         if let Some(ref s) = tx {
             if (i % report_interval == 0) || (i + 1 == total_files) {
                 let prog = ((i + 1) as f32 / total_files as f32).clamp(0.0, 1.0);
@@ -1256,10 +1436,14 @@ pub fn scan_for_upload_quick(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender
             entries.push(FileEntry { path: p.clone(), hash: "".to_string(), is_duplicate: false });
         }
 
+        let loaded_order = series_first_seen.get(&series_uid).copied().unwrap_or(0);
+
         out.push(SeriesInfo {
             series_uid,
             files: entries,
             duplicate_series_urls: Vec::new(),
+            study_uid: None,
+            loaded_order,
             patient_name: None,
             examination: None,
             patient_id: None,

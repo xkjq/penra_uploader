@@ -269,6 +269,136 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StudySortMode {
+    LoadedOrder,
+    StudyDate,
+    PatientName,
+    Examination,
+    StudyUid,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortDirection {
+    Asc,
+    Desc,
+}
+
+impl SortDirection {
+    fn label(self) -> &'static str {
+        match self {
+            SortDirection::Asc => "Asc",
+            SortDirection::Desc => "Desc",
+        }
+    }
+
+    fn apply(self, ordering: std::cmp::Ordering) -> std::cmp::Ordering {
+        match self {
+            SortDirection::Asc => ordering,
+            SortDirection::Desc => ordering.reverse(),
+        }
+    }
+}
+
+impl StudySortMode {
+    fn label(self) -> &'static str {
+        match self {
+            StudySortMode::LoadedOrder => "Loaded order",
+            StudySortMode::StudyDate => "Study date",
+            StudySortMode::PatientName => "Patient name",
+            StudySortMode::Examination => "Examination",
+            StudySortMode::StudyUid => "Study UID",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeriesSortMode {
+    LoadedOrder,
+    SeriesNumber,
+    Modality,
+    Description,
+    FileName,
+}
+
+impl SeriesSortMode {
+    fn label(self) -> &'static str {
+        match self {
+            SeriesSortMode::LoadedOrder => "Loaded order",
+            SeriesSortMode::SeriesNumber => "Series number",
+            SeriesSortMode::Modality => "Modality",
+            SeriesSortMode::Description => "Description",
+            SeriesSortMode::FileName => "File name",
+        }
+    }
+}
+
+fn cmp_optional_text(a: Option<&str>, b: Option<&str>) -> std::cmp::Ordering {
+    match (
+        a.map(|s| s.trim()).filter(|s| !s.is_empty()),
+        b.map(|s| s.trim()).filter(|s| !s.is_empty()),
+    ) {
+        (Some(a), Some(b)) => a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()).then_with(|| a.cmp(b)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn cmp_optional_number_text(a: Option<&str>, b: Option<&str>) -> std::cmp::Ordering {
+    let parse = |value: Option<&str>| {
+        value
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.parse::<i64>().ok())
+    };
+    match (parse(a), parse(b)) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => cmp_optional_text(a, b),
+    }
+}
+
+fn compare_study_series(a: &SeriesInfo, b: &SeriesInfo, mode: StudySortMode) -> std::cmp::Ordering {
+    match mode {
+        StudySortMode::LoadedOrder => a.loaded_order.cmp(&b.loaded_order).then_with(|| a.series_uid.cmp(&b.series_uid)),
+        StudySortMode::StudyDate => cmp_optional_text(a.study_date.as_deref(), b.study_date.as_deref()).then_with(|| a.loaded_order.cmp(&b.loaded_order)),
+        StudySortMode::PatientName => cmp_optional_text(a.patient_name.as_deref(), b.patient_name.as_deref()).then_with(|| a.loaded_order.cmp(&b.loaded_order)),
+        StudySortMode::Examination => cmp_optional_text(a.examination.as_deref(), b.examination.as_deref()).then_with(|| a.loaded_order.cmp(&b.loaded_order)),
+        StudySortMode::StudyUid => cmp_optional_text(a.study_uid.as_deref(), b.study_uid.as_deref()).then_with(|| a.loaded_order.cmp(&b.loaded_order)),
+    }
+}
+
+fn compare_study_series_with_direction(
+    a: &SeriesInfo,
+    b: &SeriesInfo,
+    mode: StudySortMode,
+    direction: SortDirection,
+) -> std::cmp::Ordering {
+    direction.apply(compare_study_series(a, b, mode))
+}
+
+fn compare_series_entries(
+    a: &SeriesInfo,
+    b: &SeriesInfo,
+    mode: SeriesSortMode,
+    direction: SortDirection,
+) -> std::cmp::Ordering {
+    let ordering = match mode {
+        SeriesSortMode::LoadedOrder => a.loaded_order.cmp(&b.loaded_order).then_with(|| a.series_uid.cmp(&b.series_uid)),
+        SeriesSortMode::SeriesNumber => cmp_optional_number_text(a.series_number.as_deref(), b.series_number.as_deref()).then_with(|| a.loaded_order.cmp(&b.loaded_order)),
+        SeriesSortMode::Modality => cmp_optional_text(a.modality.as_deref(), b.modality.as_deref()).then_with(|| a.loaded_order.cmp(&b.loaded_order)),
+        SeriesSortMode::Description => cmp_optional_text(a.series_description.as_deref(), b.series_description.as_deref()).then_with(|| a.loaded_order.cmp(&b.loaded_order)),
+        SeriesSortMode::FileName => {
+            let a_name = a.files.first().and_then(|f| f.path.file_name()).and_then(|s| s.to_str());
+            let b_name = b.files.first().and_then(|f| f.path.file_name()).and_then(|s| s.to_str());
+            cmp_optional_text(a_name, b_name).then_with(|| a.loaded_order.cmp(&b.loaded_order))
+        }
+    };
+    direction.apply(ordering)
+}
+
 struct AppState {
     last_msg: String,
     export_dir: PathBuf,
@@ -325,6 +455,12 @@ struct AppState {
     // split-series UI state: which series index has the panel open, and the tag keyword
     split_series_open: Option<usize>,
     split_tag_input: String,
+    study_sort_mode: StudySortMode,
+    study_sort_direction: SortDirection,
+    series_sort_mode: SeriesSortMode,
+    series_sort_direction: SortDirection,
+    uploaded_series: HashSet<String>,
+    uploaded_studies: HashSet<String>,
     /// None = individual states; Some(true) = all expanded; Some(false) = all collapsed
     studies_collapsed: Option<bool>,
 }
@@ -416,6 +552,12 @@ impl Default for AppState {
             split_series_open: None,
             split_tag_input: String::new(),
             studies_collapsed: None,
+            study_sort_mode: StudySortMode::LoadedOrder,
+            study_sort_direction: SortDirection::Asc,
+            series_sort_mode: SeriesSortMode::LoadedOrder,
+            series_sort_direction: SortDirection::Asc,
+            uploaded_series: HashSet::new(),
+            uploaded_studies: HashSet::new(),
             log_level: std::env::var("RUST_LOG").ok().or_else(|| upload::load_log_level()).unwrap_or_else(|| "info".to_string()),
             logo_tex: None,
         }
@@ -657,7 +799,22 @@ impl AppState {
                 return;
             }
         }
-        if m == "done" {
+        if m == "UPLOAD:RESET" {
+            self.uploaded_series.clear();
+            self.uploaded_studies.clear();
+        } else if let Some(rest) = m.strip_prefix("UPLOAD:SERIES_DONE:") {
+            let mut parts = rest.splitn(2, ':');
+            if let Some(series_uid) = parts.next() {
+                if !series_uid.trim().is_empty() {
+                    self.uploaded_series.insert(series_uid.to_string());
+                }
+            }
+        } else if let Some(study_key) = m.strip_prefix("UPLOAD:STUDY_DONE:") {
+            let key = study_key.trim();
+            if !key.is_empty() {
+                self.uploaded_studies.insert(key.to_string());
+            }
+        } else if m == "done" {
             self.last_msg = "Processing complete".to_string();
             upload::log_rpc("Processing complete");
             self.processing_step = None;
@@ -1011,6 +1168,10 @@ impl eframe::App for AppState {
                         if ui.add(egui::Button::new("Upload anonymized files").fill(egui::Color32::from_rgb(0,150,60))).clicked() {
                             let anon_dir = self.anon_dir();
                             let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
+                                self.uploaded_series.clear();
+                                self.uploaded_studies.clear();
+                                self.last_msg = "Uploading anonymized files".to_string();
+                                let _ = tx.send("UPLOAD:RESET".to_string());
                             let _ = tx.send("PROC:STEP:Uploading anonymized files".to_string());
                             let _ = tx.send(format!("PROC:PROG:{}", 0.0));
                             thread::spawn(move || {
@@ -1177,255 +1338,309 @@ impl eframe::App for AppState {
                         }
                     });
                 });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Study order:");
+                    egui::ComboBox::from_id_source("study-sort-mode")
+                        .selected_text(self.study_sort_mode.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.study_sort_mode, StudySortMode::LoadedOrder, StudySortMode::LoadedOrder.label());
+                            ui.selectable_value(&mut self.study_sort_mode, StudySortMode::StudyDate, StudySortMode::StudyDate.label());
+                            ui.selectable_value(&mut self.study_sort_mode, StudySortMode::PatientName, StudySortMode::PatientName.label());
+                            ui.selectable_value(&mut self.study_sort_mode, StudySortMode::Examination, StudySortMode::Examination.label());
+                            ui.selectable_value(&mut self.study_sort_mode, StudySortMode::StudyUid, StudySortMode::StudyUid.label());
+                        });
+                    if ui.small_button(self.study_sort_direction.label()).clicked() {
+                        self.study_sort_direction = match self.study_sort_direction {
+                            SortDirection::Asc => SortDirection::Desc,
+                            SortDirection::Desc => SortDirection::Asc,
+                        };
+                    }
+                    ui.add_space(12.0);
+                    ui.label("Series order:");
+                    egui::ComboBox::from_id_source("series-sort-mode")
+                        .selected_text(self.series_sort_mode.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.series_sort_mode, SeriesSortMode::LoadedOrder, SeriesSortMode::LoadedOrder.label());
+                            ui.selectable_value(&mut self.series_sort_mode, SeriesSortMode::SeriesNumber, SeriesSortMode::SeriesNumber.label());
+                            ui.selectable_value(&mut self.series_sort_mode, SeriesSortMode::Modality, SeriesSortMode::Modality.label());
+                            ui.selectable_value(&mut self.series_sort_mode, SeriesSortMode::Description, SeriesSortMode::Description.label());
+                            ui.selectable_value(&mut self.series_sort_mode, SeriesSortMode::FileName, SeriesSortMode::FileName.label());
+                        });
+                    if ui.small_button(self.series_sort_direction.label()).clicked() {
+                        self.series_sort_direction = match self.series_sort_direction {
+                            SortDirection::Asc => SortDirection::Desc,
+                            SortDirection::Desc => SortDirection::Asc,
+                        };
+                    }
+                });
                 ui.separator();
                 egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                    // Group series indices by study: (patient_name, examination, study_date)
                     let mut study_groups: Vec<(String, Vec<usize>)> = Vec::new();
-                    {
-                        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-                        for si in 0..self.ready_series.len() {
-                            let s = &self.ready_series[si];
-                            let key = format!("{}|{}|{}",
-                                s.patient_name.as_deref().unwrap_or(""),
-                                s.examination.as_deref().unwrap_or(""),
-                                s.study_date.as_deref().unwrap_or(""),
-                            );
-                            if let Some(&gi) = seen.get(&key) {
-                                study_groups[gi].1.push(si);
-                            } else {
-                                let gi = study_groups.len();
-                                seen.insert(key.clone(), gi);
-                                study_groups.push((key, vec![si]));
-                            }
+                    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                    for si in 0..self.ready_series.len() {
+                        let s = &self.ready_series[si];
+                        let key = upload::study_group_key(s);
+                        if let Some(&gi) = seen.get(&key) {
+                            study_groups[gi].1.push(si);
+                        } else {
+                            let gi = study_groups.len();
+                            seen.insert(key.clone(), gi);
+                            study_groups.push((key, vec![si]));
                         }
                     }
 
+                    study_groups.sort_by(|(a_key, a_indices), (b_key, b_indices)| {
+                        let a = &self.ready_series[a_indices[0]];
+                        let b = &self.ready_series[b_indices[0]];
+                        compare_study_series_with_direction(a, b, self.study_sort_mode, self.study_sort_direction).then_with(|| a_key.cmp(b_key))
+                    });
+
                     for (group_key, series_indices) in &study_groups {
-                        // Study-level collapsible header
-                        let first = &self.ready_series[series_indices[0]];
-                        let study_header = format!("Study: {}{}",
-                            first.study_date.as_deref().unwrap_or("date unknown"),
-                            first.examination.as_deref()
-                                .filter(|s| !s.trim().is_empty())
-                                .map(|s| format!(" — {}", s))
-                                .unwrap_or_default(),
-                        );
-                        let study_all_paths: Vec<String> = series_indices.iter()
-                            .flat_map(|&si| self.ready_series[si].files.iter()
-                                .map(|f| f.path.to_string_lossy().to_string()))
+                        let mut sorted_series_indices = series_indices.clone();
+                        sorted_series_indices.sort_by(|a, b| compare_series_entries(&self.ready_series[*a], &self.ready_series[*b], self.series_sort_mode, self.series_sort_direction));
+
+                        let first = &self.ready_series[sorted_series_indices[0]];
+                        let study_loaded_order = sorted_series_indices
+                            .iter()
+                            .map(|&si| self.ready_series[si].loaded_order)
+                            .min()
+                            .unwrap_or(0);
+                        let study_all_paths: Vec<String> = sorted_series_indices
+                            .iter()
+                            .flat_map(|&si| self.ready_series[si].files.iter().map(|f| f.path.to_string_lossy().to_string()))
                             .collect();
                         let study_id = ui.make_persistent_id(format!("study-{}", group_key));
                         let mut cs = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), study_id, true);
                         if let Some(open) = self.studies_collapsed {
                             cs.set_open(open);
                         }
+
+                        let uploaded_series_count = sorted_series_indices
+                            .iter()
+                            .filter(|&&si| self.uploaded_series.contains(&self.ready_series[si].series_uid))
+                            .count();
+                        let study_uploaded = self.uploaded_studies.contains(group_key) || (uploaded_series_count == sorted_series_indices.len() && !sorted_series_indices.is_empty());
+
+                        let study_header = format!(
+                            "Study: {}{}",
+                            first.study_date.as_deref().unwrap_or("date unknown"),
+                            first.examination.as_deref()
+                                .filter(|s| !s.trim().is_empty())
+                                .map(|s| format!(" — {}", s))
+                                .unwrap_or_default(),
+                        );
+
                         cs.show_header(ui, |ui| {
-                                ui.strong(&study_header);
-                                if ui.small_button("View study").clicked() {
-                                    self.launch_diviz(study_all_paths);
-                                }
+                                ui.horizontal(|ui| {
+                                    ui.strong(&study_header);
+                                    if study_loaded_order > 0 {
+                                        ui.label(egui::RichText::new(format!("load #{}", study_loaded_order)).weak().small());
+                                    }
+                                    if study_uploaded {
+                                        ui.colored_label(egui::Color32::from_rgb(46, 160, 67), "Uploaded");
+                                    } else if uploaded_series_count > 0 {
+                                        ui.colored_label(egui::Color32::YELLOW, format!("Uploading {} / {} series", uploaded_series_count, sorted_series_indices.len()));
+                                    }
+                                    if ui.small_button("View study").clicked() {
+                                        self.launch_diviz(study_all_paths.clone());
+                                    }
+                                });
                             })
                             .body(|ui| {
-                        for &si in series_indices.iter() {
-                        let series = self.ready_series[si].clone();
-                        let mut checked = *self.selected_series.get(si).unwrap_or(&true);
-                        ui.horizontal(|ui| {
-                            let desc = series.series_description.as_deref()
-                                .filter(|s| !s.trim().is_empty())
-                                .unwrap_or_else(|| series.series_number.as_deref().unwrap_or("Series"));
-                            let header = format!(
-                                "{} — {} — {} files — {}",
-                                series.modality.as_deref().unwrap_or("?"),
-                                desc,
-                                series.file_count,
-                                human_size(series.total_bytes)
-                            );
-                            if ui.checkbox(&mut checked, header).changed() {
-                                if si < self.selected_series.len() { self.selected_series[si] = checked; }
-                            }
-                            ui.add_space(8.0);
-                            // single button per series: either open the duplicate series URL
-                            // reported by the server (first entry), or redirect to the
-                            // server's uploads page when the series is awaiting import.
-                            if !series.duplicate_series_urls.is_empty() {
-                                let url = series.duplicate_series_urls.get(0).cloned().unwrap_or_default();
-                                if ui.small_button("View on server").clicked() {
-                                    if !url.is_empty() {
-                                        #[cfg(target_os = "windows")]
-                                        let _ = std::process::Command::new("explorer").arg(url.clone()).spawn();
-                                        #[cfg(target_os = "macos")]
-                                        let _ = std::process::Command::new("open").arg(url.clone()).spawn();
-                                        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-                                        let _ = std::process::Command::new("xdg-open").arg(url.clone()).spawn();
-                                    } else {
-                                        self.last_msg = "No duplicate URL available".to_string();
-                                    }
-                                }
-                            } else {
-                                // fallback: series likely awaiting import — open the uploads page
-                                let base = upload::base_site_url();
-                                let uploads = format!("{}/atlas/uploads", base.trim_end_matches('/'));
-                                if ui.small_button("Open uploads").clicked() {
-                                    #[cfg(target_os = "windows")]
-                                    let _ = std::process::Command::new("explorer").arg(uploads.clone()).spawn();
-                                    #[cfg(target_os = "macos")]
-                                    let _ = std::process::Command::new("open").arg(uploads.clone()).spawn();
-                                    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-                                    let _ = std::process::Command::new("xdg-open").arg(uploads.clone()).spawn();
-                                }
-                            }
-                        });
-                        if !series.duplicate_series_urls.is_empty() {
-                            ui.colored_label(egui::Color32::YELLOW, format!("{} duplicate(s) found on server", series.duplicate_series_urls.len()));
-                            // show the first URL (full) as plain text for clarity
-                            if let Some(u) = series.duplicate_series_urls.get(0) {
-                                ui.label(u);
-                            }
-                        }
-                        // files are hidden by default inside a collapsing header to reduce UI noise
-                        egui::CollapsingHeader::new(format!("Files ({})", series.files.len()))
-                            .default_open(false)
-                            .id_source(format!("files-{}", si))
-                            .show(ui, |ui| {
-                                for f in &series.files {
+                                for &si in &sorted_series_indices {
+                                    let series = self.ready_series[si].clone();
+                                    let mut checked = *self.selected_series.get(si).unwrap_or(&true);
                                     ui.horizontal(|ui| {
-                                        // selection checkbox for metadata compare (visible only in selection mode)
-                                        let pstr = f.path.to_string_lossy().to_string();
-                                        if self.metadata_select_mode {
-                                            let mut sel = self.selected_files_for_meta.contains(&pstr);
-                                            if ui.checkbox(&mut sel, "").changed() {
-                                                if sel { self.selected_files_for_meta.insert(pstr.clone()); } else { self.selected_files_for_meta.remove(&pstr); }
+                                        let desc = series.series_description.as_deref()
+                                            .filter(|s| !s.trim().is_empty())
+                                            .unwrap_or_else(|| series.series_number.as_deref().unwrap_or("Series"));
+                                        let header = format!(
+                                            "{} — {} — {} files — {}{}",
+                                            series.modality.as_deref().unwrap_or("?"),
+                                            desc,
+                                            series.file_count,
+                                            human_size(series.total_bytes),
+                                            series.series_number.as_deref().map(|s| format!(" [series #{}]", s)).unwrap_or_default()
+                                        );
+                                        if ui.checkbox(&mut checked, header).changed() {
+                                            if si < self.selected_series.len() { self.selected_series[si] = checked; }
+                                        }
+                                        if series.loaded_order > 0 {
+                                            ui.label(egui::RichText::new(format!("load #{}", series.loaded_order)).weak().small());
+                                        }
+                                        ui.add_space(8.0);
+                                        if self.uploaded_series.contains(&series.series_uid) {
+                                            ui.colored_label(egui::Color32::from_rgb(46, 160, 67), "Uploaded");
+                                        } else if !series.duplicate_series_urls.is_empty() {
+                                            ui.colored_label(egui::Color32::YELLOW, "Matched on server");
+                                        }
+                                        if !series.duplicate_series_urls.is_empty() {
+                                            let url = series.duplicate_series_urls.get(0).cloned().unwrap_or_default();
+                                            if ui.small_button("View on server").clicked() {
+                                                if !url.is_empty() {
+                                                    #[cfg(target_os = "windows")]
+                                                    let _ = std::process::Command::new("explorer").arg(url.clone()).spawn();
+                                                    #[cfg(target_os = "macos")]
+                                                    let _ = std::process::Command::new("open").arg(url.clone()).spawn();
+                                                    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                                                    let _ = std::process::Command::new("xdg-open").arg(url.clone()).spawn();
+                                                } else {
+                                                    self.last_msg = "No duplicate URL available".to_string();
+                                                }
                                             }
                                         } else {
-                                            ui.add_space(16.0);
+                                            let base = upload::base_site_url();
+                                            let uploads = format!("{}/atlas/uploads", base.trim_end_matches('/'));
+                                            if ui.small_button("Open uploads").clicked() {
+                                                #[cfg(target_os = "windows")]
+                                                let _ = std::process::Command::new("explorer").arg(uploads.clone()).spawn();
+                                                #[cfg(target_os = "macos")]
+                                                let _ = std::process::Command::new("open").arg(uploads.clone()).spawn();
+                                                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                                                let _ = std::process::Command::new("xdg-open").arg(uploads.clone()).spawn();
+                                            }
                                         }
-                                        if f.is_duplicate {
-                                            ui.colored_label(egui::Color32::LIGHT_RED, "DUP");
+                                    });
+                                    if !series.duplicate_series_urls.is_empty() {
+                                        ui.colored_label(egui::Color32::YELLOW, format!("{} duplicate(s) found on server", series.duplicate_series_urls.len()));
+                                        if let Some(u) = series.duplicate_series_urls.get(0) {
+                                            ui.label(u);
                                         }
-                                        ui.label(f.path.file_name().and_then(|s| s.to_str()).unwrap_or("file"));
-                                        if ui.small_button("View meta").clicked() {
-                                            // launch standalone viewer for a single file
-                                            match std::env::current_exe() {
-                                                Ok(exe) => {
-                                                    match Command::new(exe).arg("--meta-view").arg(pstr.clone()).spawn() {
-                                                        Ok(_) => { self.last_msg = format!("Opened metadata viewer for {}", f.path.display()); }
-                                                        Err(e) => { self.last_msg = format!("Failed to spawn viewer: {}", e); }
+                                    }
+                                    egui::CollapsingHeader::new(format!("Files ({})", series.files.len()))
+                                        .default_open(false)
+                                        .id_source(format!("files-{}", si))
+                                        .show(ui, |ui| {
+                                            for f in &series.files {
+                                                ui.horizontal(|ui| {
+                                                    let pstr = f.path.to_string_lossy().to_string();
+                                                    if self.metadata_select_mode {
+                                                        let mut sel = self.selected_files_for_meta.contains(&pstr);
+                                                        if ui.checkbox(&mut sel, "").changed() {
+                                                            if sel { self.selected_files_for_meta.insert(pstr.clone()); } else { self.selected_files_for_meta.remove(&pstr); }
+                                                        }
+                                                    } else {
+                                                        ui.add_space(16.0);
                                                     }
-                                                }
-                                                Err(e) => { self.last_msg = format!("Failed to locate executable: {}", e); }
-                                            }
-                                        }
-                                        ui.label(format!("hash: {}", f.hash));
-                                    });
-                                }
-                            });
-                        // Add series-level actions.
-                        ui.horizontal(|ui| {
-                            // Toggle split panel
-                            let split_open = self.split_series_open == Some(si);
-                            let split_label = if split_open { "Cancel split" } else { "Split…" };
-                            if ui.small_button(split_label).clicked() {
-                                if split_open {
-                                    self.split_series_open = None;
-                                } else {
-                                    self.split_series_open = Some(si);
-                                    if self.split_tag_input.is_empty() {
-                                        self.split_tag_input = "ImageType".to_string();
-                                    }
-                                }
-                            }
-                            if ui.small_button("View series").clicked() {
-                                let paths: Vec<String> = series.files.iter()
-                                    .map(|f| f.path.to_string_lossy().to_string())
-                                    .collect();
-                                self.launch_diviz(paths);
-                            }
-
-                            if ui.add(egui::Button::new("Delete series").fill(egui::Color32::from_rgb(170, 35, 35))).clicked() {
-                                let to_delete: Vec<std::path::PathBuf> = series.files.iter().map(|f| f.path.clone()).collect();
-                                let anon_dir = self.anon_dir();
-                                let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
-                                thread::spawn(move || {
-                                    let mut deleted = 0usize;
-                                    for p in &to_delete {
-                                        if std::fs::remove_file(p).is_ok() {
-                                            upload::remove_ready_file(p);
-                                            deleted = deleted.saturating_add(1);
-                                        }
-                                    }
-                                    let new_series = upload::snapshot_ready_series(&anon_dir);
-                                    if let Ok(json2) = serde_json::to_string(&new_series) {
-                                        upload::store_last_scan(new_series.clone());
-                                        let _ = std::fs::write(".last_scan.json", &json2);
-                                        let b64 = base64::encode(json2.as_bytes());
-                                        let _ = tx.send(format!("SCAN:SET:{}", b64));
-                                        let _ = tx.send("scan_written".to_string());
-                                    }
-                                    let _ = tx.send(format!("Deleted series files: {}", deleted));
-                                    let _ = tx.send("done".to_string());
-                                });
-                            }
-                        });
-
-                        // Inline split-series panel
-                        if self.split_series_open == Some(si) {
-                            egui::Frame::none()
-                                .fill(if self.theme_dark {
-                                    egui::Color32::from_rgb(40, 40, 55)
-                                } else {
-                                    egui::Color32::from_rgb(225, 225, 240)
-                                })
-                                .inner_margin(egui::Margin::same(6))
-                                .show(ui, |ui| {
-                                    ui.label("Split series by DICOM tag value");
-                                    ui.horizontal(|ui| {
-                                        // Common tag presets
-                                        for preset in &["ImageType", "EchoNumbers", "DiffusionBValue", "TemporalPositionIdentifier", "TriggerTime"] {
-                                            if ui.small_button(*preset).clicked() {
-                                                self.split_tag_input = preset.to_string();
-                                            }
-                                        }
-                                    });
-                                    ui.horizontal(|ui| {
-                                        ui.label("Tag keyword:");
-                                        ui.text_edit_singleline(&mut self.split_tag_input);
-                                        let can_split = !self.split_tag_input.trim().is_empty() && series.files.len() > 1;
-                                        if ui.add_enabled(can_split, egui::Button::new("Split")).clicked() {
-                                            let tag_kw = self.split_tag_input.trim().to_string();
-                                            let paths: Vec<std::path::PathBuf> = series.files.iter().map(|f| f.path.clone()).collect();
-                                            let anon_dir = self.anon_dir();
-                                            let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
-                                            self.split_series_open = None;
-                                            thread::spawn(move || {
-                                                match upload::split_series_by_tag(&paths, &tag_kw) {
-                                                    Ok(n) => {
-                                                        let _ = tx.send(format!("Split: {} sub-series created by {}", n, tag_kw));
-                                                        let new_series = upload::snapshot_ready_series(&anon_dir);
-                                                        if let Ok(json2) = serde_json::to_string(&new_series) {
-                                                            upload::store_last_scan(new_series.clone());
-                                                            let _ = std::fs::write(".last_scan.json", &json2);
-                                                            let b64 = base64::encode(json2.as_bytes());
-                                                            let _ = tx.send(format!("SCAN:SET:{}", b64));
-                                                            let _ = tx.send("scan_written".to_string());
+                                                    if f.is_duplicate {
+                                                        ui.colored_label(egui::Color32::LIGHT_RED, "DUP");
+                                                    }
+                                                    ui.label(f.path.file_name().and_then(|s| s.to_str()).unwrap_or("file"));
+                                                    if ui.small_button("View meta").clicked() {
+                                                        match std::env::current_exe() {
+                                                            Ok(exe) => {
+                                                                match Command::new(exe).arg("--meta-view").arg(pstr.clone()).spawn() {
+                                                                    Ok(_) => { self.last_msg = format!("Opened metadata viewer for {}", f.path.display()); }
+                                                                    Err(e) => { self.last_msg = format!("Failed to spawn viewer: {}", e); }
+                                                                }
+                                                            }
+                                                            Err(e) => { self.last_msg = format!("Failed to locate executable: {}", e); }
                                                         }
                                                     }
-                                                    Err(e) => {
-                                                        let _ = tx.send(format!("Split failed: {}", e));
+                                                    ui.label(format!("hash: {}", f.hash));
+                                                });
+                                            }
+                                        });
+                                    ui.horizontal(|ui| {
+                                        let split_open = self.split_series_open == Some(si);
+                                        let split_label = if split_open { "Cancel split" } else { "Split…" };
+                                        if ui.small_button(split_label).clicked() {
+                                            if split_open {
+                                                self.split_series_open = None;
+                                            } else {
+                                                self.split_series_open = Some(si);
+                                                if self.split_tag_input.is_empty() {
+                                                    self.split_tag_input = "ImageType".to_string();
+                                                }
+                                            }
+                                        }
+                                        if ui.small_button("View series").clicked() {
+                                            let paths: Vec<String> = series.files.iter().map(|f| f.path.to_string_lossy().to_string()).collect();
+                                            self.launch_diviz(paths);
+                                        }
+
+                                        if ui.add(egui::Button::new("Delete series").fill(egui::Color32::from_rgb(170, 35, 35))).clicked() {
+                                            let to_delete: Vec<std::path::PathBuf> = series.files.iter().map(|f| f.path.clone()).collect();
+                                            let anon_dir = self.anon_dir();
+                                            let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
+                                            thread::spawn(move || {
+                                                let mut deleted = 0usize;
+                                                for p in &to_delete {
+                                                    if std::fs::remove_file(p).is_ok() {
+                                                        upload::remove_ready_file(p);
+                                                        deleted = deleted.saturating_add(1);
                                                     }
                                                 }
+                                                let new_series = upload::snapshot_ready_series(&anon_dir);
+                                                if let Ok(json2) = serde_json::to_string(&new_series) {
+                                                    upload::store_last_scan(new_series.clone());
+                                                    let _ = std::fs::write(".last_scan.json", &json2);
+                                                    let b64 = base64::encode(json2.as_bytes());
+                                                    let _ = tx.send(format!("SCAN:SET:{}", b64));
+                                                    let _ = tx.send("scan_written".to_string());
+                                                }
+                                                let _ = tx.send(format!("Deleted series files: {}", deleted));
                                                 let _ = tx.send("done".to_string());
                                             });
                                         }
                                     });
-                                });
-                        }
 
-                        ui.separator();
-                        } // end series loop
-                        }); // end .body
+                                    if self.split_series_open == Some(si) {
+                                        egui::Frame::none()
+                                            .fill(if self.theme_dark {
+                                                egui::Color32::from_rgb(40, 40, 55)
+                                            } else {
+                                                egui::Color32::from_rgb(225, 225, 240)
+                                            })
+                                            .inner_margin(egui::Margin::same(6))
+                                            .show(ui, |ui| {
+                                                ui.label("Split series by DICOM tag value");
+                                                ui.horizontal(|ui| {
+                                                    for preset in &["ImageType", "EchoNumbers", "DiffusionBValue", "TemporalPositionIdentifier", "TriggerTime"] {
+                                                        if ui.small_button(*preset).clicked() {
+                                                            self.split_tag_input = preset.to_string();
+                                                        }
+                                                    }
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Tag keyword:");
+                                                    ui.text_edit_singleline(&mut self.split_tag_input);
+                                                    let can_split = !self.split_tag_input.trim().is_empty() && series.files.len() > 1;
+                                                    if ui.add_enabled(can_split, egui::Button::new("Split")).clicked() {
+                                                        let tag_kw = self.split_tag_input.trim().to_string();
+                                                        let paths: Vec<std::path::PathBuf> = series.files.iter().map(|f| f.path.clone()).collect();
+                                                        let anon_dir = self.anon_dir();
+                                                        let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
+                                                        self.split_series_open = None;
+                                                        thread::spawn(move || {
+                                                            match upload::split_series_by_tag(&paths, &tag_kw) {
+                                                                Ok(n) => {
+                                                                    let _ = tx.send(format!("Split: {} sub-series created by {}", n, tag_kw));
+                                                                    let new_series = upload::snapshot_ready_series(&anon_dir);
+                                                                    if let Ok(json2) = serde_json::to_string(&new_series) {
+                                                                        upload::store_last_scan(new_series.clone());
+                                                                        let _ = std::fs::write(".last_scan.json", &json2);
+                                                                        let b64 = base64::encode(json2.as_bytes());
+                                                                        let _ = tx.send(format!("SCAN:SET:{}", b64));
+                                                                        let _ = tx.send("scan_written".to_string());
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    let _ = tx.send(format!("Split failed: {}", e));
+                                                                }
+                                                            }
+                                                            let _ = tx.send("done".to_string());
+                                                        });
+                                                    }
+                                                });
+                                            });
+                                    }
+
+                                    ui.separator();
+                                }
+                            });
                         ui.add_space(4.0);
-                    } // end study groups
-                    // Reset after one frame so individual collapse clicks aren't overridden
+                    }
                     self.studies_collapsed = None;
                 });
             });
