@@ -17,6 +17,7 @@ use tracing::Level;
 static SCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 static SCAN_PENDING: AtomicBool = AtomicBool::new(false);
 const DUPLICATE_LOOKUP_TIMEOUT_SECS: u64 = 60;
+const DUPLICATE_LOOKUP_BATCH_SIZE: usize = 50;
 
 #[derive(Debug, Clone, Default)]
 struct DuplicateLookupResult {
@@ -406,6 +407,7 @@ pub fn clear_duplicate_lookup_cache() {
 fn refresh_duplicate_lookup_cache(
     hashes: &[String],
     force_refresh: bool,
+    tx: Option<std::sync::mpsc::Sender<String>>,
 ) -> Result<bool, String> {
     if hashes.is_empty() {
         return Ok(true);
@@ -427,93 +429,173 @@ fn refresh_duplicate_lookup_cache(
         return Ok(true);
     }
 
+    // Avoid oversize payloads for large scans by splitting hash checks into batches.
+    let mut dedup_seen: HashSet<String> = HashSet::new();
+    let mut query_hashes_unique: Vec<String> = Vec::new();
+    for h in query_hashes {
+        if dedup_seen.insert(h.clone()) {
+            query_hashes_unique.push(h);
+        }
+    }
+
     let client = make_client(load_api_token().as_deref())?;
     let base = base_site_url();
     let hash_check_url = format!("{}{}", base, "/api/atlas/check_image_hashes/");
     log_rpc(&format!(
-        "POST {} with {} hashes",
+        "POST {} with {} hashes (batch size {})",
         hash_check_url,
-        query_hashes.len()
+        query_hashes_unique.len(),
+        DUPLICATE_LOOKUP_BATCH_SIZE
     ));
 
-    let r = match client
-        .post(&hash_check_url)
-        .timeout(Duration::from_secs(DUPLICATE_LOOKUP_TIMEOUT_SECS))
-        .json(&query_hashes)
-        .send()
+    let total = query_hashes_unique.len();
+    let total_batches = (total + DUPLICATE_LOOKUP_BATCH_SIZE - 1) / DUPLICATE_LOOKUP_BATCH_SIZE;
+    let mut looked_up = 0usize;
+    let mut all_batches_succeeded = true;
+
+    for (batch_i, batch) in query_hashes_unique
+        .chunks(DUPLICATE_LOOKUP_BATCH_SIZE)
+        .enumerate()
     {
-        Ok(r) => r,
-        Err(e) => {
-            log_rpc_warn(&format!(
-                "Duplicate lookup request failed: {}; preserving existing duplicate flags",
-                e
-            ));
-            return Ok(false);
-        }
-    };
-
-    let status = r.status();
-    let body = match r.text() {
-        Ok(b) => b,
-        Err(_) => {
-            log_rpc_warn("Duplicate lookup body read failed; preserving existing duplicate flags");
-            return Ok(false);
-        }
-    };
-
-    if let Some(pf) = save_body_to_file(&body) {
-        log_rpc_debug(&format!("Response {}: {} BODY_FILE:{}", hash_check_url, status, pf.display()));
-    }
-
-    if !status.is_success() {
-        log_rpc_warn(&format!(
-            "Duplicate lookup failed HTTP {}; preserving existing duplicate flags",
-            status
+        let batch_vec: Vec<String> = batch.to_vec();
+        log_rpc_debug(&format!(
+            "Duplicate lookup batch {}/{} ({} hashes)",
+            batch_i + 1,
+            total_batches,
+            batch_vec.len()
         ));
-        return Ok(false);
-    }
 
-    let map = match serde_json::from_str::<serde_json::Value>(&body) {
-        Ok(v) => v,
-        Err(_) => {
-            log_rpc_warn("Duplicate lookup response JSON parse failed; preserving existing duplicate flags");
-            return Ok(false);
+        let r = match client
+            .post(&hash_check_url)
+            .timeout(Duration::from_secs(DUPLICATE_LOOKUP_TIMEOUT_SECS))
+            .json(&batch_vec)
+            .send()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                all_batches_succeeded = false;
+                log_rpc_warn(&format!(
+                    "Duplicate lookup batch {}/{} failed: {}; continuing with remaining batches",
+                    batch_i + 1,
+                    total_batches,
+                    e
+                ));
+                looked_up = looked_up.saturating_add(batch_vec.len());
+                if let Some(ref s) = tx {
+                    let prog = (looked_up as f32 / total as f32).clamp(0.0, 1.0);
+                    let _ = s.send(format!("PROC:PROG:{}", prog));
+                }
+                continue;
+            }
+        };
+
+        let status = r.status();
+        let body = match r.text() {
+            Ok(b) => b,
+            Err(_) => {
+                all_batches_succeeded = false;
+                log_rpc_warn(&format!(
+                    "Duplicate lookup batch {}/{} body read failed; continuing",
+                    batch_i + 1,
+                    total_batches
+                ));
+                looked_up = looked_up.saturating_add(batch_vec.len());
+                if let Some(ref s) = tx {
+                    let prog = (looked_up as f32 / total as f32).clamp(0.0, 1.0);
+                    let _ = s.send(format!("PROC:PROG:{}", prog));
+                }
+                continue;
+            }
+        };
+
+        if let Some(pf) = save_body_to_file(&body) {
+            log_rpc_debug(&format!("Response {}: {} BODY_FILE:{}", hash_check_url, status, pf.display()));
         }
-    };
 
-    let obj = match map.as_object() {
-        Some(o) => o,
-        None => {
-            log_rpc_warn("Duplicate lookup response shape invalid; preserving existing duplicate flags");
-            return Ok(false);
+        if !status.is_success() {
+            all_batches_succeeded = false;
+            log_rpc_warn(&format!(
+                "Duplicate lookup batch {}/{} failed HTTP {}; continuing",
+                batch_i + 1,
+                total_batches,
+                status
+            ));
+            looked_up = looked_up.saturating_add(batch_vec.len());
+            if let Some(ref s) = tx {
+                let prog = (looked_up as f32 / total as f32).clamp(0.0, 1.0);
+                let _ = s.send(format!("PROC:PROG:{}", prog));
+            }
+            continue;
         }
-    };
 
-    if let Ok(mut cache) = DUPLICATE_LOOKUP_CACHE.lock() {
-        for h in &query_hashes {
-            let mut res = DuplicateLookupResult::default();
-            if let Some(info) = obj.get(h) {
-                if let Some(id) = info.get("id") {
-                    if json_value_truthy(id) {
-                        res.is_duplicate = true;
-                        if let Some(urls) = info.get("url").and_then(|v| v.as_str()) {
-                            let full = if urls.starts_with("http") {
-                                urls.to_string()
-                            } else if urls.starts_with('/') {
-                                format!("{}{}", base.trim_end_matches('/'), urls)
-                            } else {
-                                format!("{}/{}", base.trim_end_matches('/'), urls)
-                            };
-                            res.urls.push(full);
+        let map = match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(v) => v,
+            Err(_) => {
+                all_batches_succeeded = false;
+                log_rpc_warn(&format!(
+                    "Duplicate lookup batch {}/{} JSON parse failed; continuing",
+                    batch_i + 1,
+                    total_batches
+                ));
+                looked_up = looked_up.saturating_add(batch_vec.len());
+                if let Some(ref s) = tx {
+                    let prog = (looked_up as f32 / total as f32).clamp(0.0, 1.0);
+                    let _ = s.send(format!("PROC:PROG:{}", prog));
+                }
+                continue;
+            }
+        };
+
+        let obj = match map.as_object() {
+            Some(o) => o,
+            None => {
+                all_batches_succeeded = false;
+                log_rpc_warn(&format!(
+                    "Duplicate lookup batch {}/{} response shape invalid; continuing",
+                    batch_i + 1,
+                    total_batches
+                ));
+                looked_up = looked_up.saturating_add(batch_vec.len());
+                if let Some(ref s) = tx {
+                    let prog = (looked_up as f32 / total as f32).clamp(0.0, 1.0);
+                    let _ = s.send(format!("PROC:PROG:{}", prog));
+                }
+                continue;
+            }
+        };
+
+        if let Ok(mut cache) = DUPLICATE_LOOKUP_CACHE.lock() {
+            for h in &batch_vec {
+                let mut res = DuplicateLookupResult::default();
+                if let Some(info) = obj.get(h) {
+                    if let Some(id) = info.get("id") {
+                        if json_value_truthy(id) {
+                            res.is_duplicate = true;
+                            if let Some(urls) = info.get("url").and_then(|v| v.as_str()) {
+                                let full = if urls.starts_with("http") {
+                                    urls.to_string()
+                                } else if urls.starts_with('/') {
+                                    format!("{}{}", base.trim_end_matches('/'), urls)
+                                } else {
+                                    format!("{}/{}", base.trim_end_matches('/'), urls)
+                                };
+                                res.urls.push(full);
+                            }
                         }
                     }
                 }
+                cache.insert(h.clone(), res);
             }
-            cache.insert(h.clone(), res);
+        }
+
+        looked_up = looked_up.saturating_add(batch_vec.len());
+        if let Some(ref s) = tx {
+            let prog = (looked_up as f32 / total as f32).clamp(0.0, 1.0);
+            let _ = s.send(format!("PROC:PROG:{}", prog));
         }
     }
 
-    Ok(true)
+    Ok(all_batches_succeeded)
 }
 
 fn ensure_ready_cache(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>) -> Result<(), String> {
@@ -593,7 +675,7 @@ fn refresh_duplicates_for_ready_mode(
     }
 
     let hashes: Vec<String> = items.iter().map(|it| it.hash.clone()).filter(|h| !h.is_empty()).collect();
-    let duplicate_lookup_succeeded = refresh_duplicate_lookup_cache(&hashes, force_refresh)?;
+    let duplicate_lookup_succeeded = refresh_duplicate_lookup_cache(&hashes, force_refresh, tx.clone())?;
 
     if let Ok(mut g) = READY_FILES.lock() {
         let cache = DUPLICATE_LOOKUP_CACHE
