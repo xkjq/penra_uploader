@@ -18,6 +18,8 @@ static SCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 static SCAN_PENDING: AtomicBool = AtomicBool::new(false);
 const DUPLICATE_LOOKUP_TIMEOUT_SECS: u64 = 60;
 const DUPLICATE_LOOKUP_BATCH_SIZE: usize = 50;
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 10;
+const MIN_REQUEST_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Debug, Clone, Default)]
 struct DuplicateLookupResult {
@@ -49,6 +51,8 @@ pub struct ReadyFileInfo {
     pub series_description: Option<String>,
     pub series_number: Option<String>,
     pub file_size: u64,
+    #[serde(default)]
+    pub burned_in_annotation_detected: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +85,8 @@ pub struct SeriesInfo {
     pub series_number: Option<String>,
     pub file_count: usize,
     pub total_bytes: u64,
+    #[serde(default)]
+    pub burned_in_annotation_detected: bool,
 }
 
 
@@ -96,6 +102,25 @@ static NEXT_READY_ORDER: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
 
 fn read_dicom_string(obj: &dicom_object::DefaultDicomObject, tag: Tag) -> Option<String> {
     obj.element(tag).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string())
+}
+
+fn detect_burned_in_annotation(obj: &dicom_object::DefaultDicomObject) -> bool {
+    obj.element(Tag(0x0028, 0x0301))
+        .ok()
+        .and_then(|e| e.to_str().ok())
+        .map(|s| s.eq_ignore_ascii_case("YES"))
+        .unwrap_or(false)
+}
+
+fn is_timeout_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.to_string().to_ascii_lowercase().contains("timed out")
+}
+
+fn upload_timeout_user_message(timeout_secs: u64) -> String {
+    format!(
+        "Upload timed out after {}s. This can happen with large files. Increase 'Upload request timeout (seconds)' in Settings and retry.",
+        timeout_secs
+    )
 }
 
 fn sync_ready_order_counter(map: &HashMap<String, ReadyFileInfo>) {
@@ -268,6 +293,7 @@ fn build_series_from_ready_files(items: &[ReadyFileInfo]) -> Vec<SeriesInfo> {
         let mut series_description = None;
         let mut series_number = None;
         let mut study_uid = None;
+        let mut burned_in_annotation_detected = false;
 
         for rf in &files {
             entries.push(FileEntry {
@@ -308,6 +334,7 @@ fn build_series_from_ready_files(items: &[ReadyFileInfo]) -> Vec<SeriesInfo> {
             if study_uid.is_none() {
                 study_uid = rf.study_uid.clone();
             }
+            burned_in_annotation_detected |= rf.burned_in_annotation_detected;
         }
 
         out.push(SeriesInfo {
@@ -326,6 +353,7 @@ fn build_series_from_ready_files(items: &[ReadyFileInfo]) -> Vec<SeriesInfo> {
             series_number,
             file_count: files.len(),
             total_bytes,
+            burned_in_annotation_detected,
         });
     }
     out
@@ -379,6 +407,7 @@ fn upsert_ready_file_internal(
         series_description: read_dicom_string(&obj, Tag(0x0008, 0x103E)),
         series_number: read_dicom_string(&obj, Tag(0x0020, 0x0011)),
         file_size,
+        burned_in_annotation_detected: detect_burned_in_annotation(&obj),
     };
 
     if let Ok(mut g) = READY_FILES.lock() {
@@ -888,6 +917,41 @@ pub fn save_parallelism(n: usize) -> bool {
     std::fs::write(p, serde_json::Value::Object(map).to_string()).is_ok()
 }
 
+pub fn load_request_timeout_secs() -> u64 {
+    let p = config_file_path();
+    if p.exists() {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                if let Some(n) = v.get("request_timeout_secs").and_then(|x| x.as_u64()) {
+                    return n.max(MIN_REQUEST_TIMEOUT_SECS);
+                }
+            }
+        }
+    }
+    DEFAULT_REQUEST_TIMEOUT_SECS
+}
+
+pub fn save_request_timeout_secs(timeout_secs: u64) -> bool {
+    let p = config_file_path();
+    let mut map = serde_json::Map::new();
+    if p.exists() {
+        if let Ok(s) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                if let Some(o) = v.as_object() {
+                    for (k, val) in o {
+                        map.insert(k.clone(), val.clone());
+                    }
+                }
+            }
+        }
+    }
+    map.insert(
+        "request_timeout_secs".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(timeout_secs.max(MIN_REQUEST_TIMEOUT_SECS))),
+    );
+    std::fs::write(p, serde_json::Value::Object(map).to_string()).is_ok()
+}
+
 fn token_file_path() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let cfg = home.join(".uploader");
@@ -1050,8 +1114,7 @@ pub fn token_username() -> Option<String> {
 
 pub fn make_client(token: Option<&str>) -> Result<Client, String> {
     let mut b = reqwest::blocking::Client::builder();
-    // reasonable default timeout to fail fast on problematic networks
-    b = b.timeout(Duration::from_secs(10));
+    b = b.timeout(Duration::from_secs(load_request_timeout_secs()));
     // priority: env var -> saved config -> default
     let skip = if let Ok(env) = std::env::var("UPLOADER_SKIP_SSL_VERIFY") {
         if !env.is_empty() { env.to_lowercase() == "1" } else { load_skip_ssl() }
@@ -1147,6 +1210,7 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
     let mut duplicates = Vec::new();
     let mut failed = Vec::new();
     let mut duplicate_series = pre_duplicate_series.clone();
+    let mut saw_timeout = false;
     let mut series_handled_files: HashMap<String, usize> = HashMap::new();
     let mut study_completed_series: HashMap<String, usize> = HashMap::new();
     // Prepare HTTP client and base URL for upload requests
@@ -1270,7 +1334,15 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
                         log_rpc_warn(&format!("Response {}: {} (failed to read body)", endpoint, status));
                     }
                 }
-                Err(e) => { log_rpc_error(&format!("Request error {}: {}", endpoint, e)); }
+                Err(e) => {
+                    if is_timeout_error(&e) {
+                        saw_timeout = true;
+                        if let Some(ref s) = tx {
+                            let _ = s.send(upload_timeout_user_message(load_request_timeout_secs()));
+                        }
+                    }
+                    log_rpc_error(&format!("Request error {}: {}", endpoint, e));
+                }
             }
         }
 
@@ -1288,6 +1360,12 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
                     let _ = s.send(format!("PROC:PROG:{}", prog));
                 }
             }
+    }
+
+    if saw_timeout {
+        if let Some(ref s) = tx {
+            let _ = s.send("One or more uploads timed out. Increase the upload timeout in Settings and retry failed files.".to_string());
+        }
     }
 
     Ok(UploadResult { uploaded, duplicates, failed, duplicate_series })
@@ -1489,6 +1567,7 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
             series_number,
             file_count: items.len(),
             total_bytes,
+            burned_in_annotation_detected: false,
         });
     }
 
@@ -1575,6 +1654,7 @@ pub fn scan_for_upload_quick(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender
             series_number: None,
             file_count: items.len(),
             total_bytes,
+            burned_in_annotation_detected: false,
         });
     }
 

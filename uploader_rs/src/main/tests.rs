@@ -36,6 +36,9 @@ fn handle_scan_written_parses_last_scan() {
         series_uid: "S1".to_string(),
         files: vec![],
         duplicate_series_urls: vec![],
+        study_uid: None,
+        loaded_order: 0,
+        duplicate_checked_files: 0,
         patient_name: Some("P".to_string()),
         examination: None,
         patient_id: None,
@@ -45,6 +48,7 @@ fn handle_scan_written_parses_last_scan() {
         series_number: None,
         file_count: 0,
         total_bytes: 0,
+        burned_in_annotation_detected: false,
     }];
     let mut f = File::create(".last_scan.json").unwrap();
     let j = serde_json::to_string(&series).unwrap();

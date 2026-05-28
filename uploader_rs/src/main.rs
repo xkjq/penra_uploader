@@ -110,8 +110,33 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                                 }
                             }
                             Err(e) => {
-                                // Log non-DICOM / unrecognised files quietly; don't flood the UI.
-                                upload::log_rpc_debug(&format!("Anon skipped {}: {}", p.display(), e));
+                                if is_burned_in_annotation_error(&e) {
+                                    match anonymize_file(p, &anon_dir, true, false, true, seed.as_deref()) {
+                                        Ok(out) => {
+                                            let _ = tx.send(format!("Anonymized with burned-in flag: {}", out.display()));
+                                            let _ = tx.send("Detected Burned In Annotation=YES. This series will require confirmation before upload.".to_string());
+                                            let pixel_hash = upload::calculate_pixel_hash(&out);
+                                            if let Some(hash_hex) = &pixel_hash {
+                                                let _ = tx.send(format!("Hash {}: {}", out.display(), hash_hex));
+                                            } else {
+                                                let _ = tx.send(format!("Hash {}: <no PixelData>", out.display()));
+                                            }
+                                            if let Err(e) = upload::upsert_ready_file(&out, pixel_hash) {
+                                                let _ = tx.send(format!("Ready-manifest update skipped for {}: {}", out.display(), e));
+                                            }
+                                        }
+                                        Err(e2) => {
+                                            upload::log_rpc_debug(&format!(
+                                                "Anon skipped {} after burned-in retry: {}",
+                                                p.display(),
+                                                e2
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    // Log non-DICOM / unrecognised files quietly; don't flood the UI.
+                                    upload::log_rpc_debug(&format!("Anon skipped {}: {}", p.display(), e));
+                                }
                             }
                         }
                         let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
@@ -271,6 +296,10 @@ fn human_size(bytes: u64) -> String {
 
 fn is_duplicate_refresh_step(step: &str) -> bool {
     step.trim() == "Refreshing duplicate status"
+}
+
+fn is_burned_in_annotation_error(err: &str) -> bool {
+    err.to_ascii_lowercase().contains("burned in annotation")
 }
 
 fn duplicate_status_color() -> egui::Color32 {
@@ -435,6 +464,7 @@ struct AppState {
     skip_ssl: bool,
     // number of parallel threads used for file operations/anonymization
     anon_threads: usize,
+    request_timeout_secs: u64,
     // metadata viewer state
     metadata_window_open: bool,
     metadata_compare_open: bool,
@@ -470,6 +500,7 @@ struct AppState {
     uploaded_series: HashSet<String>,
     uploaded_studies: HashSet<String>,
     duplicate_refresh_in_progress: bool,
+    burned_in_series_confirmed: HashSet<String>,
     /// None = individual states; Some(true) = all expanded; Some(false) = all collapsed
     studies_collapsed: Option<bool>,
 }
@@ -541,6 +572,7 @@ impl Default for AppState {
             anon_threads: upload::load_parallelism().unwrap_or_else(|| {
                 let n = num_cpus::get(); if n > 1 { n.saturating_sub(1) } else { 1 }
             }),
+            request_timeout_secs: upload::load_request_timeout_secs(),
             metadata_window_open: false,
             metadata_compare_open: false,
             metadata_single: None,
@@ -568,6 +600,7 @@ impl Default for AppState {
             uploaded_series: HashSet::new(),
             uploaded_studies: HashSet::new(),
             duplicate_refresh_in_progress: false,
+            burned_in_series_confirmed: HashSet::new(),
             log_level: std::env::var("RUST_LOG").ok().or_else(|| upload::load_log_level()).unwrap_or_else(|| "info".to_string()),
             logo_tex: None,
         }
@@ -584,6 +617,35 @@ impl AppState {
             }
             series.duplicate_checked_files = series.files.iter().filter(|f| f.duplicate_checked).count();
         }
+    }
+
+    fn sync_burned_in_confirmations(&mut self) {
+        let flagged: HashSet<String> = self
+            .ready_series
+            .iter()
+            .filter(|s| s.burned_in_annotation_detected)
+            .map(|s| s.series_uid.clone())
+            .collect();
+        self.burned_in_series_confirmed
+            .retain(|series_uid| flagged.contains(series_uid));
+    }
+
+    fn unconfirmed_burned_in_series(&self) -> Vec<String> {
+        let mut blocked: Vec<String> = Vec::new();
+        for series in &self.ready_series {
+            if series.burned_in_annotation_detected
+                && !self.burned_in_series_confirmed.contains(&series.series_uid)
+            {
+                let label = series
+                    .series_description
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| series.series_uid.clone());
+                blocked.push(label);
+            }
+        }
+        blocked
     }
 
     fn add_toast(&mut self, msg: String, duration_ms: u64) {
@@ -800,6 +862,7 @@ impl AppState {
                         if let Ok(v) = serde_json::from_str::<Vec<SeriesInfo>>(&txt) {
                             self.ready_series = v;
                             self.selected_series = vec![true; self.ready_series.len()];
+                            self.sync_burned_in_confirmations();
                             self.last_msg = "Ready-to-upload refreshed".to_string();
                             return;
                         }
@@ -858,6 +921,7 @@ impl AppState {
             if let Some(v) = upload::get_last_scan() {
                 self.ready_series = v;
                 self.selected_series = vec![true; self.ready_series.len()];
+                self.sync_burned_in_confirmations();
                 self.last_msg = "Ready-to-upload refreshed".to_string();
                 upload::log_rpc_debug("Ready-to-upload refreshed (scan_written)");
             } else if let Ok(txt) = std::fs::read_to_string(".last_scan.json") {
@@ -865,6 +929,7 @@ impl AppState {
                 if let Ok(v) = serde_json::from_str::<Vec<SeriesInfo>>(&txt) {
                     self.ready_series = v;
                     self.selected_series = vec![true; self.ready_series.len()];
+                    self.sync_burned_in_confirmations();
                     self.last_msg = "Ready-to-upload refreshed".to_string();
                 }
             }
@@ -1203,6 +1268,18 @@ impl eframe::App for AppState {
                 ui.horizontal_wrapped(|ui| {
                     if !self.metadata_select_mode {
                         if ui.add(egui::Button::new("Upload anonymized files").fill(egui::Color32::from_rgb(0,150,60))).clicked() {
+                            let blocked = self.unconfirmed_burned_in_series();
+                            if !blocked.is_empty() {
+                                self.last_msg = format!(
+                                    "Upload blocked: {} series require Burned In Annotation confirmation",
+                                    blocked.len()
+                                );
+                                self.add_toast(
+                                    "Confirm burned-in patient details have been removed for flagged series before uploading.".to_string(),
+                                    5000,
+                                );
+                                return;
+                            }
                             let anon_dir = self.anon_dir();
                             let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
                                 self.uploaded_series.clear();
@@ -1543,6 +1620,12 @@ impl eframe::App for AppState {
                                         } else if !series.duplicate_series_urls.is_empty() {
                                             ui.colored_label(duplicate_status_color(), "Matched on server");
                                         }
+                                        if series.burned_in_annotation_detected {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(220, 140, 0),
+                                                "Burned-in flag",
+                                            );
+                                        }
                                         if !series.files.is_empty() {
                                             if series.duplicate_checked_files >= series.files.len() {
                                                 ui.colored_label(egui::Color32::from_rgb(46, 160, 67), "Checked");
@@ -1591,6 +1674,32 @@ impl eframe::App for AppState {
                                         if let Some(u) = series.duplicate_series_urls.get(0) {
                                             ui.label(u);
                                         }
+                                    }
+                                    if series.burned_in_annotation_detected {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(220, 140, 0),
+                                                "Warning: Burned In Annotation=YES detected in this series.",
+                                            );
+                                            let mut confirmed = self
+                                                .burned_in_series_confirmed
+                                                .contains(&series.series_uid);
+                                            if ui
+                                                .checkbox(
+                                                    &mut confirmed,
+                                                    "I confirm any burned-in patient details have been removed",
+                                                )
+                                                .changed()
+                                            {
+                                                if confirmed {
+                                                    self.burned_in_series_confirmed
+                                                        .insert(series.series_uid.clone());
+                                                } else {
+                                                    self.burned_in_series_confirmed
+                                                        .remove(&series.series_uid);
+                                                }
+                                            }
+                                        });
                                     }
                                     egui::CollapsingHeader::new(format!("Files ({})", series.files.len()))
                                         .default_open(false)
@@ -1760,6 +1869,18 @@ impl eframe::App for AppState {
                     }
                     ui.label("(will be saved when 'Save Settings' is clicked; restart required)");
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Upload request timeout (seconds):");
+                    let mut timeout_i = self.request_timeout_secs as i64;
+                    let resp = ui.add(
+                        egui::widgets::DragValue::new(&mut timeout_i)
+                            .clamp_range(5..=600)
+                            .speed(1.0),
+                    );
+                    if resp.changed() {
+                        self.request_timeout_secs = timeout_i.max(5) as u64;
+                    }
+                });
                 if ui.button("Save Settings").clicked() {
                     let url = match self.base_url_mode {
                         0 => "https://www.penracourses.org.uk".to_string(),
@@ -1769,8 +1890,15 @@ impl eframe::App for AppState {
                     let ok1 = upload::save_base_url(&url);
                     let ok2 = upload::save_skip_ssl(self.skip_ssl);
                     let ok3 = upload::save_parallelism(self.anon_threads);
-                    if ok1 && ok2 && ok3 {
-                        self.last_msg = format!("Saved settings: {} (skip_ssl={}, parallelism={})", url, self.skip_ssl, self.anon_threads);
+                    let ok4 = upload::save_request_timeout_secs(self.request_timeout_secs);
+                    if ok1 && ok2 && ok3 && ok4 {
+                        self.last_msg = format!(
+                            "Saved settings: {} (skip_ssl={}, parallelism={}, timeout={}s)",
+                            url,
+                            self.skip_ssl,
+                            self.anon_threads,
+                            self.request_timeout_secs
+                        );
                     } else {
                         self.last_msg = "Failed to save settings".to_string();
                     }
@@ -2358,6 +2486,7 @@ fn main() {
         let initial_series = upload::snapshot_ready_series(&anon_dir);
         app.ready_series = initial_series.clone();
         app.selected_series = vec![true; app.ready_series.len()];
+        app.sync_burned_in_confirmations();
         if let Ok(json) = serde_json::to_string(&initial_series) {
             upload::store_last_scan(initial_series);
             let _ = std::fs::write(".last_scan.json", json);
