@@ -86,7 +86,7 @@ fn nonidentifying_uis_are_left_alone() {
 
     // capture original values
     let orig = open_file(&in_path).expect("open orig");
-    let orig_media_class = orig.element(Tag(0x0002, 0x0002)).ok().and_then(|e| e.to_str().ok()).map(|s| s.into_owned());
+    let orig_media_class = orig.meta().media_storage_sop_class_uid.clone();
     let orig_sop_class = orig.element(Tag(0x0008, 0x0016)).ok().and_then(|e| e.to_str().ok()).map(|s| s.into_owned());
 
     let res = anonymize_file(&in_path, &out_dir, false, false, false, None).expect("anonymize");
@@ -97,6 +97,8 @@ fn nonidentifying_uis_are_left_alone() {
 
     // ensure media storage SOP Class UID in file meta is preserved
     assert_eq!(orig.meta().media_storage_sop_class_uid.clone(), new_media_class);
+    assert_eq!(orig_media_class, new_media_class);
+    assert_eq!(orig_sop_class, new_sop_class);
 }
 
 #[test]

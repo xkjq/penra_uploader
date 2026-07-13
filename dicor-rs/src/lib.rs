@@ -204,6 +204,9 @@ fn process_inmem_top<D: dicom_core::DataDictionary + Clone>(
         }
 
         if el.vr() == VR::UI {
+            if t == Tag(0x0008, 0x0016) || t == Tag(0x0008, 0x1150) {
+                continue;
+            }
             if let Ok(s) = el.to_str() {
                 let hb = hash_bytes(s.as_ref());
                 let new_uid = uid_from_hash_bytes(&hb);
@@ -437,6 +440,9 @@ fn process_file<D: dicom_core::DataDictionary + Clone>(
             continue;
         }
         if el.vr() == VR::UI {
+            if t == Tag(0x0008, 0x0016) || t == Tag(0x0008, 0x1150) {
+                continue;
+            }
             if let Ok(s) = el.to_str() {
                 let hb = hash_bytes(s.as_ref());
                 let new_uid = uid_from_hash_bytes(&hb);

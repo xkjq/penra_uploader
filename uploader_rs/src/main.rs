@@ -447,6 +447,7 @@ struct AppState {
     tx: Option<mpsc::Sender<String>>,
     processed: Vec<String>,
     seed: Option<String>,
+    shared_seed: Option<Arc<std::sync::Mutex<Option<String>>>>,
     username: String,
     password: String,
     logged_in_user: Option<String>,
@@ -543,6 +544,7 @@ impl Default for AppState {
                 let raw = t.wrapping_add(pid.wrapping_mul(0x9e3779b97f4a7c15u128));
                 Some(format!("{:016x}", raw & 0xFFFF_FFFF_FFFF_FFFFu128))
             },
+            shared_seed: None,
             username: String::new(),
             password: String::new(),
             logged_in_user: upload::token_username(),
@@ -608,6 +610,29 @@ impl Default for AppState {
 }
 
 impl AppState {
+    fn update_seed(&mut self, new_seed: Option<String>) {
+        self.seed = new_seed.clone();
+        if let Some(ref shared) = self.shared_seed {
+            if let Ok(mut lock) = shared.lock() {
+                *lock = new_seed;
+            }
+        }
+    }
+
+    fn generate_new_seed(&mut self) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id() as u128;
+        let raw = t.wrapping_add(pid.wrapping_mul(0x9e3779b97f4a7c15u128));
+        let new_seed = Some(format!("{:016x}", raw & 0xFFFF_FFFF_FFFF_FFFFu128));
+        self.update_seed(new_seed);
+        self.last_msg = "Started new patient (generated new anonymization seed)".to_string();
+        self.add_toast("Started new patient (anonymization seed updated)".to_string(), 4000);
+    }
+
     fn mark_duplicate_check_pending(&mut self) {
         for series in &mut self.ready_series {
             for f in &mut series.files {
@@ -1303,6 +1328,10 @@ impl eframe::App for AppState {
                             });
                         }
                         ui.add_space(8.0);
+                        if ui.button("Start New Patient").clicked() {
+                            self.generate_new_seed();
+                        }
+                        ui.add_space(8.0);
                         if ui.button("Refresh ready-to-upload").clicked() {
                             let anon_dir = self.anon_dir();
                             let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
@@ -1908,7 +1937,8 @@ impl eframe::App for AppState {
                     ui.label("Seed:");
                     let mut s = self.seed.clone().unwrap_or_default();
                     if ui.text_edit_singleline(&mut s).changed() {
-                        self.seed = if s.is_empty() { None } else { Some(s.clone()) };
+                        let new_s = if s.is_empty() { None } else { Some(s.clone()) };
+                        self.update_seed(new_s);
                     }
                 });
                 ui.horizontal(|ui| {
@@ -2372,13 +2402,14 @@ fn main() {
         app.rx = Some(rx);
         app.tx = Some(tx.clone());
 
-        
+        let shared_seed = Arc::new(std::sync::Mutex::new(app.seed.clone()));
+        app.shared_seed = Some(shared_seed.clone());
 
         // Spawn IPC listener thread to accept notifications from exporter app.
         // Binds to a per-user local socket and forwards received messages to the GUI via `tx`.
         let tx_clone = tx.clone();
         let export_dir_for_ipc = app.export_dir.clone();
-        let seed_for_ipc = app.seed.clone();
+        let shared_seed_for_ipc = shared_seed.clone();
         let ipc_name_clone = ipc_name.clone();
         thread::spawn(move || {
             use std::io::ErrorKind;
@@ -2393,7 +2424,7 @@ fn main() {
                             Ok(mut conn) => {
                                 let tx_conn = tx_clone.clone();
                                 let export_conn = export_dir_for_ipc.clone();
-                                let seed_conn = seed_for_ipc.clone();
+                                let shared_seed_conn = shared_seed_for_ipc.clone();
                                 thread::spawn(move || {
                                     let _ = conn.write_all(b"ok");
                                     let mut buf = [0u8; 512];
@@ -2402,7 +2433,8 @@ fn main() {
                                         _ => String::new(),
                                     };
                                     if text == "loaded" {
-                                        enqueue_export_processing(export_conn, tx_conn.clone(), false, seed_conn);
+                                        let current_seed = shared_seed_conn.lock().ok().and_then(|g| g.clone());
+                                        enqueue_export_processing(export_conn, tx_conn.clone(), false, current_seed);
                                         let _ = tx_conn.send("IPC:RECV:loaded (enqueued)".to_string());
                                     } else if !text.is_empty() {
                                         let _ = tx_conn.send(format!("IPC:RECV:{}", text));
@@ -2442,7 +2474,7 @@ fn main() {
                                                 Ok(mut conn) => {
                                                     let tx_conn = tx_clone.clone();
                                                     let export_conn = export_dir_for_ipc.clone();
-                                                    let seed_conn = seed_for_ipc.clone();
+                                                    let shared_seed_conn = shared_seed_for_ipc.clone();
                                                     thread::spawn(move || {
                                                         let _ = conn.write_all(b"ok");
                                                         let mut buf = [0u8; 512];
@@ -2451,7 +2483,8 @@ fn main() {
                                                             _ => String::new(),
                                                         };
                                                         if text == "loaded" {
-                                                            enqueue_export_processing(export_conn, tx_conn.clone(), false, seed_conn);
+                                                            let current_seed = shared_seed_conn.lock().ok().and_then(|g| g.clone());
+                                                            enqueue_export_processing(export_conn, tx_conn.clone(), false, current_seed);
                                                             let _ = tx_conn.send("IPC:RECV:loaded (enqueued)".to_string());
                                                         } else if !text.is_empty() {
                                                             let _ = tx_conn.send(format!("IPC:RECV:{}", text));
@@ -2478,26 +2511,19 @@ fn main() {
             }
         });
 
-        // Load previously extracted ready metadata from disk and avoid a full
-        // startup re-scan of DICOM files.
-        upload::load_ready_manifest();
-        upload::evict_missing_ready_files();
         let anon_dir = app.anon_dir();
-        let initial_series = upload::snapshot_ready_series(&anon_dir);
-        app.ready_series = initial_series.clone();
-        app.selected_series = vec![true; app.ready_series.len()];
-        app.sync_burned_in_confirmations();
-        if let Ok(json) = serde_json::to_string(&initial_series) {
-            upload::store_last_scan(initial_series);
-            let _ = std::fs::write(".last_scan.json", json);
-        }
-        app.last_msg = format!("Loaded ready manifest: {}", anon_dir.display());
+        app.ready_series = Vec::new();
+        app.selected_series = Vec::new();
+        app.last_msg = format!("Ready to scan: {}", anon_dir.display());
 
         // Lightweight startup refresh: only checks duplicate status from cached hashes.
         let tx_scan = tx.clone();
         if let Err(e) = request_scan(&anon_dir, Some(tx_scan.clone())) {
             let _ = tx_scan.send(format!("Initial ready refresh request failed: {}", e));
         }
+
+        // Trigger process export at startup to check for exported files that need anonymising
+        app.trigger_process_export();
 
         Ok(Box::new(app))
     }));

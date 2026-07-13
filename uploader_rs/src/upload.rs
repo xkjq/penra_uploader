@@ -18,7 +18,7 @@ static SCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 static SCAN_PENDING: AtomicBool = AtomicBool::new(false);
 const DUPLICATE_LOOKUP_TIMEOUT_SECS: u64 = 60;
 const DUPLICATE_LOOKUP_BATCH_SIZE: usize = 50;
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 10;
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 200;
 const MIN_REQUEST_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Debug, Clone, Default)]
@@ -123,11 +123,13 @@ fn upload_timeout_user_message(timeout_secs: u64) -> String {
     )
 }
 
+#[allow(dead_code)]
 fn sync_ready_order_counter(map: &HashMap<String, ReadyFileInfo>) {
     let max_order = map.values().map(|rf| rf.load_order).max().unwrap_or(0);
     NEXT_READY_ORDER.store(max_order.saturating_add(1), Ordering::SeqCst);
 }
 
+#[allow(dead_code)]
 fn normalize_ready_manifest_load_order(map: &mut HashMap<String, ReadyFileInfo>) {
     if map.values().any(|rf| rf.load_order == 0) {
         let mut keys: Vec<String> = map.keys().cloned().collect();
@@ -214,6 +216,7 @@ fn record_uploaded_file(
     }
 }
 
+#[allow(dead_code)]
 fn ready_manifest_path() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let cfg = home.join(".uploader");
@@ -225,10 +228,8 @@ fn path_key(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 
-fn persist_ready_manifest_locked(map: &HashMap<String, ReadyFileInfo>) {
-    if let Ok(json) = serde_json::to_string(map) {
-        let _ = std::fs::write(ready_manifest_path(), json);
-    }
+fn persist_ready_manifest_locked(_map: &HashMap<String, ReadyFileInfo>) {
+    // No-op: we do not store a history of what we have uploaded locally on the machine
 }
 
 fn collect_ready_for_dir(anon_dir: &Path) -> Vec<ReadyFileInfo> {
@@ -242,19 +243,9 @@ fn collect_ready_for_dir(anon_dir: &Path) -> Vec<ReadyFileInfo> {
     Vec::new()
 }
 
+#[allow(dead_code)]
 pub fn load_ready_manifest() {
-    let p = ready_manifest_path();
-    if !p.exists() {
-        return;
-    }
-    if let Ok(s) = std::fs::read_to_string(&p) {
-        if let Ok(v) = serde_json::from_str::<HashMap<String, ReadyFileInfo>>(&s) {
-            if let Ok(mut g) = READY_FILES.lock() {
-                *g = v;
-                normalize_ready_manifest_load_order(&mut g);
-            }
-        }
-    }
+    // No-op: we do not store a history of what we have uploaded locally on the machine
 }
 
 pub fn evict_missing_ready_files() {
@@ -628,9 +619,8 @@ fn refresh_duplicate_lookup_cache(
 }
 
 fn ensure_ready_cache(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>) -> Result<(), String> {
-    let existing = collect_ready_for_dir(anon_dir);
-    if !existing.is_empty() {
-        return Ok(());
+    if let Ok(mut g) = READY_FILES.lock() {
+        g.clear();
     }
 
     let files = collect_files_recursive(anon_dir);
@@ -645,17 +635,14 @@ fn ensure_ready_cache(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String
     }
 
     if let Some(ref s) = tx {
-        let _ = s.send("PROC:STEP:Bootstrapping ready manifest".to_string());
+        let _ = s.send("PROC:STEP:Scanning files".to_string());
         let _ = s.send(format!("PROC:PROG:{}", 0.0));
     }
 
     let total = dcm_like.len();
-    let mut changed = false;
     for (i, p) in dcm_like.iter().enumerate() {
         if upsert_ready_file_internal(p, None, false).is_err() {
-            log_rpc_debug(&format!("Bootstrap skipped non-DICOM file: {}", p.display()));
-        } else {
-            changed = true;
+            log_rpc_debug(&format!("Scan skipped non-DICOM file: {}", p.display()));
         }
         if let Some(ref s) = tx {
             let report_interval = std::cmp::max(1, total / 20);
@@ -663,11 +650,6 @@ fn ensure_ready_cache(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String
                 let prog = ((i + 1) as f32 / total as f32).clamp(0.0, 1.0);
                 let _ = s.send(format!("PROC:PROG:{}", prog));
             }
-        }
-    }
-    if changed {
-        if let Ok(g) = READY_FILES.lock() {
-            persist_ready_manifest_locked(&g);
         }
     }
     Ok(())
@@ -828,11 +810,11 @@ pub fn load_skip_ssl() -> bool {
     if p.exists() {
         if let Ok(s) = std::fs::read_to_string(&p) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
-                return v.get("skip_ssl").and_then(|b| b.as_bool()).unwrap_or(false);
+                return v.get("skip_ssl").and_then(|b| b.as_bool()).unwrap_or(true);
             }
         }
     }
-    false
+    true
 }
 
 pub fn save_skip_ssl(skip: bool) -> bool {
@@ -1371,6 +1353,7 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
     Ok(UploadResult { uploaded, duplicates, failed, duplicate_series })
 }
 
+#[allow(dead_code)]
 /// Scan an anonymised directory for files ready to upload, grouped by DICOM SeriesInstanceUID.
 pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>) -> Result<Vec<SeriesInfo>, String> {
     // Collect files recursively under anon_dir
