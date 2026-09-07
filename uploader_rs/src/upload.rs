@@ -1176,16 +1176,42 @@ fn calculate_pixel_hash_from_obj(obj: &dicom_object::DefaultDicomObject) -> Opti
         return Some(blake3::hash(bytes).to_hex().to_string());
     }
 
-    // Prefer the PixelData element bytes when present. Decoding helpers
-    // vary across `dicom-object` versions; use direct element access
-    // as a reliable fallback that works with the current dependency.
+    // If JPEG-LS Lossless (1.2.840.10008.1.2.4.80), decode fragments using CharLS
+    let ts = obj
+        .element(Tag(0x0002, 0x0010))
+        .ok()
+        .and_then(|e| e.to_str().ok())
+        .map(|s| s.trim_end_matches(|c: char| c.is_whitespace() || c == '\0').to_string())
+        .unwrap_or_else(|| {
+            obj.meta()
+                .transfer_syntax()
+                .trim_end_matches(|c: char| c.is_whitespace() || c == '\0')
+                .to_string()
+        });
+
+    if ts == "1.2.840.10008.1.2.4.80" {
+        if let Ok(elem) = obj.element(Tag(0x7FE0, 0x0010)) {
+            if let Some(fragments) = elem.value().fragments() {
+                let mut charls = charls::CharLS::default();
+                let mut hasher = blake3::Hasher::new();
+                for frag in fragments {
+                    if !frag.is_empty() {
+                        if let Ok(decoded) = charls.decode(frag) {
+                            hasher.update(&decoded);
+                        } else {
+                            return None;
+                        }
+                    }
+                }
+                return Some(hasher.finalize().to_hex().to_string());
+            }
+        }
+    }
+
+    // Prefer the PixelData element bytes when present for uncompressed data.
     if let Ok(elem) = obj.element(Tag(0x7FE0, 0x0010)) {
         if let Ok(bytes) = elem.to_bytes() {
             return Some(blake3::hash(&bytes).to_hex().to_string());
-        }
-        if let Ok(s) = elem.to_str() {
-            let b = s.as_bytes();
-            return Some(blake3::hash(b).to_hex().to_string());
         }
     }
     None
@@ -1443,17 +1469,7 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
                 if let Ok(sv) = elem.to_str() { series_uid = sv.to_string(); }
             }
 
-            // Preferred: hash decoded pixel bytes.
-            if let Ok(pixel_data) = obj.decode_pixel_data() {
-                let bytes = pixel_data.data();
-                h_opt = Some(blake3::hash(bytes).to_hex().to_string());
-            } else if let Ok(elem) = obj.element(Tag(0x7FE0, 0x0010)) {
-                if let Ok(bytes) = elem.to_bytes() {
-                    h_opt = Some(blake3::hash(&bytes).to_hex().to_string());
-                } else if let Ok(s) = elem.to_str() {
-                    h_opt = Some(blake3::hash(s.as_bytes()).to_hex().to_string());
-                }
-            }
+            h_opt = calculate_pixel_hash_from_obj(&obj);
         }
 
         let h = h_opt.clone().unwrap_or_else(|| "".to_string());
@@ -1859,7 +1875,7 @@ pub fn split_series_by_tag(paths: &[PathBuf], tag_keyword: &str) -> Result<usize
 
     // Rewrite files that belong to groups 1+ (group 0 keeps the existing UID).
     use dicom_core::header::VR;
-    let mut rewritten = 0usize;
+    let mut _rewritten = 0usize;
     for (path, val) in &file_groups {
         let group_index = seen_vals.iter().position(|v| v == val).unwrap_or(0);
         if group_index == 0 {
@@ -1879,7 +1895,7 @@ pub fn split_series_by_tag(paths: &[PathBuf], tag_keyword: &str) -> Result<usize
                         rfi.series_uid = new_uid.clone();
                     }
                 }
-                rewritten += 1;
+                _rewritten += 1;
             }
             Err(e) => return Err(format!("Failed to open {}: {}", path.display(), e)),
         }

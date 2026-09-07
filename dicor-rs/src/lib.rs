@@ -1,12 +1,17 @@
-use dicom_object::{open_file, FileDicomObject, Tag};
+use dicom_object::{open_file, FileDicomObject, DefaultDicomObject, Tag};
+use dicom_object::mem::InMemElement;
 use blake3;
 use chrono::{NaiveDate, Duration, NaiveTime, Timelike};
 use dicom_core::header::{VR, Header};
+use dicom_core::value::{Value, PixelFragmentSequence, InMemFragment};
+use dicom_core::value::fragments::Fragments;
+use dicom_core::DataElement;
 use num_bigint::BigUint;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::fs::File;
+use charls::{CharLS, FrameInfo};
 
 fn hash_bytes(input: &str) -> [u8; 16] {
     let mut out = [0u8; 16];
@@ -785,6 +790,14 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, pr
         }
     }
 
+    // Indicate that the dataset has been de-identified and that re-identification is
+    // not supported (irreversible anonymization).
+    let _ = obj.put_str(Tag(0x0012, 0x0062), VR::CS, "YES");
+    let _ = obj.put_str(Tag(0x0012, 0x0063), VR::LO, "dicor-rs: irreversible; re-identification not supported");
+
+    // Compress pixel data to JPEG-LS lossless
+    let _ = compress_to_jpegls(&mut obj);
+
     fs::create_dir_all(output_dir).map_err(|e| format!("mkdir failed: {}", e))?;
     let fname = input.file_name().ok_or_else(|| "invalid filename".to_string())?;
     let out_path = output_dir.join(fname);
@@ -807,10 +820,77 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, pr
         let _ = fs::remove_file(input);
     }
 
-    // Indicate that the dataset has been de-identified and that re-identification is
-    // not supported (irreversible anonymization).
-    let _ = obj.put_str(Tag(0x0012, 0x0062), VR::CS, "YES");
-    let _ = obj.put_str(Tag(0x0012, 0x0063), VR::LO, "dicor-rs: irreversible; re-identification not supported");
-
     Ok(out_path)
+}
+
+fn get_u32_tag(obj: &DefaultDicomObject, tag: Tag) -> Option<u32> {
+    obj.element(tag).ok().and_then(|e| {
+        e.to_int::<u32>().ok().or_else(|| {
+            e.to_str().ok().and_then(|s| s.trim().parse::<u32>().ok())
+        })
+    })
+}
+
+/// Compress an uncompressed DICOM dataset to JPEG-LS Lossless in-place.
+/// Returns Ok(true) if compression occurred, or Ok(false) if skipped.
+pub fn compress_to_jpegls(obj: &mut DefaultDicomObject) -> Result<bool, String> {
+    let elem = match obj.element(Tag(0x7FE0, 0x0010)) {
+        Ok(e) => e,
+        Err(_) => return Ok(false), // No pixel data (e.g. SR or non-image)
+    };
+
+    // If already encapsulated or compressed, skip
+    if matches!(elem.value(), Value::PixelSequence(_)) {
+        return Ok(false);
+    }
+    let ts_current = obj.meta().transfer_syntax().trim_end_matches(|c: char| c.is_whitespace() || c == '\0');
+    if ts_current == "1.2.840.10008.1.2.4.80" || ts_current.starts_with("1.2.840.10008.1.2.4.") {
+        return Ok(false);
+    }
+
+    let rows = get_u32_tag(obj, Tag(0x0028, 0x0010)).unwrap_or(0);
+    let cols = get_u32_tag(obj, Tag(0x0028, 0x0011)).unwrap_or(0);
+    if rows == 0 || cols == 0 {
+        return Ok(false);
+    }
+
+    let bits_allocated = get_u32_tag(obj, Tag(0x0028, 0x0100)).unwrap_or(16) as i32;
+    let bits_stored = get_u32_tag(obj, Tag(0x0028, 0x0101)).unwrap_or(bits_allocated as u32) as i32;
+    let samples_per_pixel = get_u32_tag(obj, Tag(0x0028, 0x0002)).unwrap_or(1) as i32;
+
+    let raw_bytes = elem.to_bytes().map_err(|e| format!("failed to read pixel bytes: {}", e))?;
+    let bytes_per_sample = ((bits_allocated + 7) / 8) as usize;
+    let frame_size = (rows as usize) * (cols as usize) * (samples_per_pixel as usize) * bytes_per_sample;
+    if frame_size == 0 || raw_bytes.len() < frame_size {
+        return Ok(false);
+    }
+
+    let frame_info = FrameInfo {
+        width: cols,
+        height: rows,
+        bits_per_sample: bits_stored,
+        component_count: samples_per_pixel,
+    };
+
+    let mut charls = CharLS::default();
+    let mut fragments = Vec::new();
+
+    for chunk in raw_bytes.chunks_exact(frame_size) {
+        let encoded = charls.encode(frame_info.clone(), 0, chunk)
+            .map_err(|e| format!("JPEG-LS encode failed: {:?}", e))?;
+        fragments.push(Fragments::new(encoded, 0));
+    }
+
+    if fragments.is_empty() {
+        return Ok(false);
+    }
+
+    let seq: PixelFragmentSequence<InMemFragment> = fragments.into();
+    let pixel_elem: InMemElement = DataElement::new(Tag(0x7FE0, 0x0010), VR::OB, Value::PixelSequence(seq));
+    obj.put(pixel_elem);
+
+    obj.meta_mut().transfer_syntax = "1.2.840.10008.1.2.4.80".to_string();
+    let _ = obj.put_str(Tag(0x0002, 0x0010), VR::UI, "1.2.840.10008.1.2.4.80");
+
+    Ok(true)
 }

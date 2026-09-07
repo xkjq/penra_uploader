@@ -113,7 +113,38 @@ fn calc(path: &Path) -> HashReport {
                 }
             }
             Err(e) => {
-                tracing::error!("decode_pixel_data failed: {}", e);
+                tracing::warn!("decode_pixel_data failed: {}", e);
+                // Try CharLS JPEG-LS decoding if transfer syntax is 1.2.840.10008.1.2.4.80
+                let ts = obj
+                    .element(Tag(0x0002, 0x0010))
+                    .ok()
+                    .and_then(|el| el.to_str().ok())
+                    .map(|s| s.trim_end_matches(|c: char| c.is_whitespace() || c == '\0').to_string())
+                    .unwrap_or_else(|| {
+                        obj.meta()
+                            .transfer_syntax()
+                            .trim_end_matches(|c: char| c.is_whitespace() || c == '\0')
+                            .to_string()
+                    });
+                if ts == "1.2.840.10008.1.2.4.80" {
+                    if let Ok(elem) = obj.element(Tag(0x7FE0, 0x0010)) {
+                        if let Some(fragments) = elem.value().fragments() {
+                            let mut charls = charls::CharLS::default();
+                            let mut all_bytes = Vec::new();
+                            for frag in fragments {
+                                if !frag.is_empty() {
+                                    if let Ok(decoded) = charls.decode(frag) {
+                                        all_bytes.extend_from_slice(&decoded);
+                                    }
+                                }
+                            }
+                            if !all_bytes.is_empty() {
+                                tracing::info!("Decoded JPEG-LS bytes len: {}", all_bytes.len());
+                                out.decoded_pixel_hash = Some(hash_hex(&all_bytes));
+                            }
+                        }
+                    }
+                }
             }
         }
 

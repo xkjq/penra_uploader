@@ -70,3 +70,35 @@ fn test_scan_and_upload_with_mock_server() {
     // file should be deleted after successful upload
     assert!(!file_path.exists());
 }
+
+#[test]
+fn test_calculate_pixel_hash_jpegls_matches_uncompressed() {
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let src = manifest.join("../test_dicoms/head/IMG_000.dcm");
+    if !src.exists() {
+        eprintln!("Sample DICOM not found at {:?}, skipping test", src);
+        return;
+    }
+
+    let td = tempdir().unwrap();
+    let anon_path = dicor_rs::anonymize_file(&src, td.path(), false, false, false, None)
+        .expect("anonymize and compress to jpegls");
+
+    // Check that anonymized file has JPEG-LS transfer syntax
+    let anon_obj = open_file(&anon_path).expect("open anon");
+    let ts = anon_obj.meta().transfer_syntax();
+    assert_eq!(ts, "1.2.840.10008.1.2.4.80", "Transfer syntax should be JPEG-LS Lossless");
+
+    // Check compression ratio: compressed file should be significantly smaller
+    let orig_size = std::fs::metadata(&src).unwrap().len();
+    let anon_size = std::fs::metadata(&anon_path).unwrap().len();
+    assert!(anon_size < orig_size, "Compressed size ({}) should be < original size ({})", anon_size, orig_size);
+
+    // Calculate pixel hash on original uncompressed vs compressed
+    let raw_hash = calculate_pixel_hash(&src).expect("raw pixel hash");
+    let jpegls_hash = calculate_pixel_hash(&anon_path).expect("jpegls pixel hash");
+
+    assert_eq!(raw_hash, jpegls_hash, "Pixel hash of uncompressed and JPEG-LS compressed must match");
+}
+
+
