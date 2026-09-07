@@ -20,6 +20,9 @@ const DUPLICATE_LOOKUP_TIMEOUT_SECS: u64 = 60;
 const DUPLICATE_LOOKUP_BATCH_SIZE: usize = 50;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 200;
 const MIN_REQUEST_TIMEOUT_SECS: u64 = 5;
+// Short, bounded timeout for startup-time server checks (e.g. token validation)
+// so a slow/unreachable server cannot stall application launch.
+const STARTUP_TOKEN_CHECK_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, Clone, Default)]
 struct DuplicateLookupResult {
@@ -99,6 +102,11 @@ pub struct UploadResult {
 
 static READY_FILES: Lazy<Mutex<HashMap<String, ReadyFileInfo>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static NEXT_READY_ORDER: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
+// Serializes destructive mutations of READY_FILES (the scan's full clear/rebuild)
+// against incremental inserts (the anonymizer's upsert_ready_file). This prevents
+// a concurrent startup scan from wiping entries added by an in-flight anonymization
+// pass, which would otherwise cause outstanding DICOMs to be missed.
+static READY_FILES_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 fn read_dicom_string(obj: &dicom_object::DefaultDicomObject, tag: Tag) -> Option<String> {
     obj.element(tag).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string())
@@ -401,19 +409,23 @@ fn upsert_ready_file_internal(
         burned_in_annotation_detected: detect_burned_in_annotation(&obj),
     };
 
-    if let Ok(mut g) = READY_FILES.lock() {
-        g.insert(path_key(path), info);
-        if persist_manifest {
-            persist_ready_manifest_locked(&g);
+    if let Ok(_guard) = READY_FILES_LOCK.lock() {
+        if let Ok(mut g) = READY_FILES.lock() {
+            g.insert(path_key(path), info);
+            if persist_manifest {
+                persist_ready_manifest_locked(&g);
+            }
         }
     }
     Ok(())
 }
 
 pub fn remove_ready_file(path: &Path) {
-    if let Ok(mut g) = READY_FILES.lock() {
-        if g.remove(&path_key(path)).is_some() {
-            persist_ready_manifest_locked(&g);
+    if let Ok(_guard) = READY_FILES_LOCK.lock() {
+        if let Ok(mut g) = READY_FILES.lock() {
+            if g.remove(&path_key(path)).is_some() {
+                persist_ready_manifest_locked(&g);
+            }
         }
     }
 }
@@ -619,8 +631,15 @@ fn refresh_duplicate_lookup_cache(
 }
 
 fn ensure_ready_cache(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>) -> Result<(), String> {
-    if let Ok(mut g) = READY_FILES.lock() {
-        g.clear();
+    // Hold READY_FILES_LOCK only around the destructive clear so an in-flight
+    // anonymization upsert cannot be wiped out. The per-file rebuild below uses
+    // upsert_ready_file_internal which acquires the lock itself per insert, so
+    // we must not hold it across the loop (std::sync::Mutex is not reentrant).
+    {
+        let _guard = READY_FILES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if let Ok(mut g) = READY_FILES.lock() {
+            g.clear();
+        }
     }
 
     let files = collect_files_recursive(anon_dir);
@@ -1050,11 +1069,28 @@ fn json_value_truthy(v: &serde_json::Value) -> bool {
     }
 }
 
+/// Cheap local check: does a saved API token file exist? No network involved.
+pub fn has_api_token() -> bool {
+    token_file_path().exists()
+}
+
+/// Fast, bounded token check for startup. Uses a short timeout so a slow or
+/// unreachable server cannot block application launch for the full configured
+/// request timeout. Callers that need a longer window should use
+/// `token_username()` instead.
+pub fn token_username_quick() -> Option<String> {
+    token_username_with_timeout(Some(STARTUP_TOKEN_CHECK_TIMEOUT_SECS))
+}
+
 pub fn token_username() -> Option<String> {
+    token_username_with_timeout(None)
+}
+
+fn token_username_with_timeout(timeout_secs: Option<u64>) -> Option<String> {
     if let Some(t) = load_api_token() {
         let base = base_site_url();
         let token_check = format!("{}{}", base, "/api/atlas/token_check");
-        let client = match make_client(Some(&t)) {
+        let client = match make_client_with_timeout(Some(&t), timeout_secs) {
             Ok(c) => c,
             Err(e) => {
                 log_rpc_error(&format!("make_client failed: {}", e));
@@ -1095,8 +1131,13 @@ pub fn token_username() -> Option<String> {
 }
 
 pub fn make_client(token: Option<&str>) -> Result<Client, String> {
+    make_client_with_timeout(token, None)
+}
+
+fn make_client_with_timeout(token: Option<&str>, timeout_secs: Option<u64>) -> Result<Client, String> {
     let mut b = reqwest::blocking::Client::builder();
-    b = b.timeout(Duration::from_secs(load_request_timeout_secs()));
+    let timeout = timeout_secs.unwrap_or_else(load_request_timeout_secs).max(MIN_REQUEST_TIMEOUT_SECS);
+    b = b.timeout(Duration::from_secs(timeout));
     // priority: env var -> saved config -> default
     let skip = if let Ok(env) = std::env::var("UPLOADER_SKIP_SSL_VERIFY") {
         if !env.is_empty() { env.to_lowercase() == "1" } else { load_skip_ssl() }

@@ -284,6 +284,26 @@ fn enqueue_export_processing(
     });
 }
 
+/// Returns true if the export directory contains any files (recursively).
+/// Used at startup to decide whether there is outstanding work to anonymize
+/// before running an immediate scan.
+fn export_has_files(export: &std::path::Path) -> bool {
+    let mut stack: Vec<PathBuf> = vec![export.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_file() {
+                    return true;
+                } else if p.is_dir() {
+                    stack.push(p);
+                }
+            }
+        }
+    }
+    false
+}
+
 fn human_size(bytes: u64) -> String {
     if bytes >= 1_000_000 {
         format!("{:.1} MB", bytes as f64 / 1_000_000.0)
@@ -547,7 +567,7 @@ impl Default for AppState {
             shared_seed: None,
             username: String::new(),
             password: String::new(),
-            logged_in_user: upload::token_username(),
+            logged_in_user: None,
             move_files: false,
             recurse_depth: -1,
             ext_filter: "".to_string(),
@@ -585,7 +605,10 @@ impl Default for AppState {
             about_open: false,
             import_dialog_open: false,
             import_src: None,
-            login_open: upload::token_username().is_none(),
+            // Cheap local check only; the actual (network) token validation is
+            // deferred to a background thread after the window is created so a
+            // slow server cannot block application startup.
+            login_open: !upload::has_api_token(),
             confirm_remove_all: false,
             exit_requested: None,
             exit_at: None,
@@ -970,6 +993,13 @@ impl AppState {
                 self.login_open = false;
                 self.last_msg = format!("Logged in as {}", name);
             }
+        } else if m == "TOKEN_VALIDATION_FAILED" {
+            // Saved token could not be validated against the server (or the
+            // server was unreachable within the startup timeout). Keep the
+            // login panel open so the user can re-enter credentials.
+            self.logged_in_user = None;
+            self.login_open = true;
+            self.last_msg = "Saved token could not be validated; please log in again.".to_string();
         } else if m.starts_with("PROC:STEP:") {
             if let Some(step) = m.strip_prefix("PROC:STEP:") {
                 if is_duplicate_refresh_step(step) {
@@ -2375,6 +2405,11 @@ fn main() {
             };
     tracing::info!("Uploader (Rust) starting");
     let mut native_options = NativeOptions::default();
+    // Use the wgpu renderer backend instead of the default glow/glutin one. The
+    // glow backend fails to create a GLX context on some displays (glutin
+    // "BadValue"), while wgpu can fall back to a working backend (e.g. Vulkan),
+    // so the window opens reliably across environments.
+    native_options.renderer = eframe::Renderer::Wgpu;
     // Load window icon from embedded generated assets (if available)
     // Prefer a larger icon for taskbar/titlebar where supported.
     let icon_bytes: &[u8] = include_bytes!("../assets/generated/uploade-rs_icon_256.png");
@@ -2404,6 +2439,25 @@ fn main() {
 
         let shared_seed = Arc::new(std::sync::Mutex::new(app.seed.clone()));
         app.shared_seed = Some(shared_seed.clone());
+
+        // Deferred token validation: run off the main thread with a short,
+        // bounded timeout so a slow/unreachable server cannot block startup.
+        // If a saved token exists, validate it and update the login UI state.
+        if upload::has_api_token() {
+            let tx_token = tx.clone();
+            thread::spawn(move || {
+                match upload::token_username_quick() {
+                    Some(name) => {
+                        let _ = tx_token.send(format!("LOGIN_USER:{}", name));
+                    }
+                    None => {
+                        // Token file exists but validation failed / server unreachable.
+                        // Leave the user logged out so they can (re)enter credentials.
+                        let _ = tx_token.send("TOKEN_VALIDATION_FAILED".to_string());
+                    }
+                }
+            });
+        }
 
         // Spawn IPC listener thread to accept notifications from exporter app.
         // Binds to a per-user local socket and forwards received messages to the GUI via `tx`.
@@ -2516,14 +2570,20 @@ fn main() {
         app.selected_series = Vec::new();
         app.last_msg = format!("Ready to scan: {}", anon_dir.display());
 
-        // Lightweight startup refresh: only checks duplicate status from cached hashes.
+        // Process any outstanding exported DICOMs. The processing worker performs a
+        // fresh scan at the end of each run (and READY_FILES mutations are serialized
+        // against the scan's cache rebuild), so the ready list is populated correctly
+        // after anonymization completes.
+        //
+        // When there is nothing outstanding to anonymize, skip the export move and
+        // scan immediately instead, keeping startup responsive and avoiding needless
+        // directory churn on every launch.
         let tx_scan = tx.clone();
-        if let Err(e) = request_scan(&anon_dir, Some(tx_scan.clone())) {
+        if export_has_files(&app.export_dir) {
+            app.trigger_process_export();
+        } else if let Err(e) = request_scan(&anon_dir, Some(tx_scan.clone())) {
             let _ = tx_scan.send(format!("Initial ready refresh request failed: {}", e));
         }
-
-        // Trigger process export at startup to check for exported files that need anonymising
-        app.trigger_process_export();
 
         Ok(Box::new(app))
     }));
