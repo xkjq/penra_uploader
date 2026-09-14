@@ -24,6 +24,15 @@ const METADATA_TAGS: &[(Tag, &str)] = &[
     (Tag(0x0020, 0x0013), "Instance Number"),
 ];
 
+/// Standard CT window/level presets, in Hounsfield units (center, width).
+const CT_WL_PRESETS: &[(&str, f32, f32)] = &[
+    ("Brain", 40.0, 80.0),
+    ("Bone", 300.0, 1500.0),
+    ("Lung", -600.0, 1500.0),
+    ("Abdomen", 40.0, 400.0),
+    ("Mediastinum", 50.0, 350.0),
+];
+
 /// In-memory decoded pixels before rendering (allows efficient W/L re-renders).
 struct Gray16 {
     data: Vec<f32>, // rescaled (HU for CT, raw*slope+intercept for others)
@@ -1364,6 +1373,24 @@ impl DicomViewApp {
         }
     }
 
+    /// Default (DICOM or data-range) window/level for the active viewport.
+    fn active_default_wc_ww(&self) -> Option<(f32, f32)> {
+        match self.vp().view_mode {
+            ViewMode::Stack => self.active_image().and_then(|img| img.default_wc_ww),
+            ViewMode::Mpr => self.mpr_volume.as_ref().map(|volume| volume.default_wc_ww),
+        }
+    }
+
+    /// DICOM Modality of the active series, upper-cased (e.g. "CT", "MR").
+    fn active_modality(&self) -> Option<String> {
+        self.active_image().and_then(|img| {
+            img.metadata
+                .iter()
+                .find(|(label, _)| label == "Modality")
+                .map(|(_, value)| value.trim().to_uppercase())
+        })
+    }
+
     fn rebuild_series_groups(&mut self) {
         let mut grouped: HashMap<String, SeriesGroup> = HashMap::new();
 
@@ -1860,33 +1887,59 @@ impl eframe::App for DicomViewApp {
                     if wc_resp.changed() || ww_resp.changed() {
                         self.vp_mut().wl_dirty = true;
                     }
-                }
 
-                // Slice navigation
-                let active_len = self.current_view_slice_len();
-                if active_len > 1 {
-                    ui.separator();
-                    let current_index = match self.vp().view_mode {
-                        ViewMode::Stack => self.vp().current_stack_slice,
-                        ViewMode::Mpr => self.current_mpr_slice(),
+                    // Window/level presets for the active viewport's modality.
+                    // CT uses standard Hounsfield values; MR intensities are not
+                    // standardized, so MR presets are relative to its DICOM/auto
+                    // window. Both the preset set and label are derived from the
+                    // active viewport every frame.
+                    let presets_label = match self.active_modality().as_deref() {
+                        Some(m) if !m.is_empty() => format!("Presets ({})", m),
+                        _ => "Presets".to_string(),
                     };
-                    let label = match self.vp().view_mode {
-                        ViewMode::Stack => "Slice".to_string(),
-                        ViewMode::Mpr => format!("{}", self.vp().mpr_plane.label()),
-                    };
-                    ui.label(format!("{}: {}/{}", label, current_index + 1, active_len));
-                    let mut slice_val = current_index as i32;
-                    let slider = ui.add(
-                        egui::Slider::new(&mut slice_val, 0..=(active_len - 1) as i32)
-                            .show_value(false)
-                    );
-                    if slider.changed() {
-                        match self.vp().view_mode {
-                            ViewMode::Stack => self.vp_mut().current_stack_slice = slice_val as usize,
-                            ViewMode::Mpr => self.set_current_mpr_slice(slice_val as usize),
+                    ui.menu_button(presets_label, |ui| {
+                        let modality = self.active_modality();
+                        let is_ct = modality.as_deref() == Some("CT");
+                        let default_wl = self.active_default_wc_ww();
+                        if is_ct {
+                            ui.label("CT (HU)");
+                            for (name, wc, ww) in CT_WL_PRESETS {
+                                if ui.button(*name).clicked() {
+                                    self.vp_mut().window_center = *wc;
+                                    self.vp_mut().window_width = (*ww).max(1.0);
+                                    self.vp_mut().wl_dirty = true;
+                                    ui.close();
+                                }
+                            }
+                            ui.separator();
+                        } else {
+                            let label = modality
+                                .clone()
+                                .filter(|m| !m.is_empty())
+                                .unwrap_or_else(|| "General".to_string());
+                            ui.label(label);
                         }
-                        self.vp_mut().wl_dirty = true;
-                    }
+                        if let Some((wc, ww)) = default_wl {
+                            if ui.button("Auto (full range)").clicked() {
+                                self.vp_mut().window_center = wc;
+                                self.vp_mut().window_width = ww.max(1.0);
+                                self.vp_mut().wl_dirty = true;
+                                ui.close();
+                            }
+                            if ui.button("Narrow").clicked() {
+                                self.vp_mut().window_center = wc;
+                                self.vp_mut().window_width = (ww * 0.5).max(1.0);
+                                self.vp_mut().wl_dirty = true;
+                                ui.close();
+                            }
+                            if ui.button("Wide").clicked() {
+                                self.vp_mut().window_center = wc;
+                                self.vp_mut().window_width = (ww * 2.0).max(1.0);
+                                self.vp_mut().wl_dirty = true;
+                                ui.close();
+                            }
+                        }
+                    });
                 }
             });
         });
@@ -2221,7 +2274,12 @@ impl eframe::App for DicomViewApp {
                         }
 
                             if response.clicked() {
-                                self.active_viewport = idx;
+                                if self.active_viewport != idx {
+                                    self.active_viewport = idx;
+                                    // Refresh the toolbar (window/level presets etc.)
+                                    // immediately so it reflects the new active viewport.
+                                    ctx.request_repaint();
+                                }
                             }
 
                             // record slice anchor point for cross-references (position along the displayed image)
@@ -3076,6 +3134,7 @@ mod tests {
             instance_number: Some(instance_number),
             default_wc_ww: Some((0.0, 1.0)),
             study_uid: None,
+            thumbnail: None,
             pixel_spacing: Some(pixel_spacing),
             slice_thickness: Some(2.0),
             spacing_between_slices: Some(2.0),
@@ -3167,6 +3226,8 @@ mod tests {
             series_label: "Series 1".to_string(),
             instance_number: Some(1),
             default_wc_ww: None,
+            study_uid: None,
+            thumbnail: None,
             pixel_spacing: Some([1.0, 1.0]),
             slice_thickness: Some(1.0),
             spacing_between_slices: Some(1.0),
@@ -3176,6 +3237,28 @@ mod tests {
 
         let err = MprVolume::from_images(&images, &[0]).expect_err("rgb series should fail");
         assert!(err.contains("at least 2 slices") || err.contains("grayscale"));
+    }
+
+    #[test]
+    fn presets_follow_active_viewport_modality() {
+        let mut ct = gray16_image("ct", 1, [0.0, 0.0, 0.0], [1.0, 1.0], 2, 2, &[0.0, 1.0, 2.0, 3.0]);
+        ct.metadata = vec![("Modality".to_string(), "CT".to_string())];
+        let mut mr = gray16_image("mr", 1, [0.0, 0.0, 0.0], [1.0, 1.0], 2, 2, &[0.0, 1.0, 2.0, 3.0]);
+        mr.metadata = vec![("Modality".to_string(), "MR".to_string())];
+        mr.series_uid = "series-2".to_string();
+        mr.series_label = "Series 2".to_string();
+
+        let mut app = DicomViewApp::new(None);
+        app.images = vec![ct, mr];
+        app.rebuild_series_groups();
+        app.viewports = vec![ViewportState::default(), ViewportState::default()];
+        app.viewports[0].current_series = 0;
+        app.viewports[1].current_series = 1;
+
+        app.active_viewport = 0;
+        assert_eq!(app.active_modality().as_deref(), Some("CT"));
+        app.active_viewport = 1;
+        assert_eq!(app.active_modality().as_deref(), Some("MR"));
     }
 }
 
