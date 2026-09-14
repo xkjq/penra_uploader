@@ -707,6 +707,15 @@ struct ViewportState {
     zoom: f32,
     rotation_degrees: f32,
     rotation_drag_last_pos: Option<egui::Pos2>,
+    /// Screen position of the cursor when a both-buttons zoom drag started.
+    /// Held fixed for the duration of the drag so the image point under the
+    /// cursor stays locked while the pointer moves.
+    zoom_drag_anchor: Option<egui::Pos2>,
+    /// Zoom level when the both-buttons zoom drag started. The current zoom is
+    /// derived from the total pointer displacement from `zoom_drag_anchor`
+    /// (rather than compounding per-frame deltas) so the zoom is stable and
+    /// independent of frame timing.
+    zoom_drag_start_zoom: f32,
     pan: Vec2,
 }
 
@@ -728,6 +737,8 @@ impl Default for ViewportState {
             zoom: 1.0,
             rotation_degrees: 0.0,
             rotation_drag_last_pos: None,
+            zoom_drag_anchor: None,
+            zoom_drag_start_zoom: 1.0,
             pan: Vec2::ZERO,
         }
     }
@@ -1172,6 +1183,28 @@ impl DicomViewApp {
         }
     }
 
+    /// Change the active viewport's zoom while keeping `anchor` (a screen
+    /// position, e.g. the mouse cursor) over the same image point. `center` is
+    /// the centre of the viewport rect the image is drawn in. Because the image
+    /// is rotated about `center`, adjusting the pan this way keeps the anchored
+    /// point fixed for any rotation angle.
+    fn zoom_towards(&mut self, new_zoom: f32, anchor: egui::Pos2, center: egui::Pos2) {
+        let new_zoom = new_zoom.clamp(0.05, 20.0);
+        let old_zoom = self.vp().zoom;
+        if (new_zoom - old_zoom).abs() < f32::EPSILON {
+            return;
+        }
+        let k = new_zoom / old_zoom;
+        let pan = self.vp().pan;
+        let pan_new = egui::vec2(
+            (1.0 - k) * (anchor.x - center.x) + k * pan.x,
+            (1.0 - k) * (anchor.y - center.y) + k * pan.y,
+        );
+        let vp = self.vp_mut();
+        vp.zoom = new_zoom;
+        vp.pan = pan_new;
+    }
+
     // Return plane geometry for a viewport: origin (patient), normal, column_dir, row_dir, col_spacing, row_spacing, width, height
     fn viewport_plane(&self, idx: usize) -> Option<([f32; 3], [f32; 3], [f32; 3], [f32; 3], f32, f32, usize, usize)> {
         let vp = self.viewports.get(idx)?;
@@ -1542,6 +1575,27 @@ impl eframe::App for DicomViewApp {
             self.load_files(dropped, ctx);
         }
 
+        // Clear the locked zoom anchor once the zoom-drag gesture ends.
+        let zoom_dragging = ctx.input(|i| {
+            i.pointer.button_down(egui::PointerButton::Primary)
+                && i.pointer.button_down(egui::PointerButton::Secondary)
+        });
+        if !zoom_dragging {
+            for vp in &mut self.viewports {
+                vp.zoom_drag_anchor = None;
+            }
+        }
+
+        // Clear the rotation anchor as soon as the rotate button is released, so
+        // that a new rotate gesture starts from the current pointer position and
+        // does not jump to the angle of the previous gesture.
+        let rotate_held = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Extra1));
+        if !rotate_held {
+            for vp in &mut self.viewports {
+                vp.rotation_drag_last_pos = None;
+            }
+        }
+
         // Keyboard navigation: arrow keys (operates on active viewport)
         ctx.input(|i| {
             if i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowLeft) {
@@ -1838,7 +1892,7 @@ impl eframe::App for DicomViewApp {
         });
 
         // ── Metadata side panel ───────────────────────────────────────────────
-        if self.show_metadata && self.active_series_len() > 0 {
+        if self.active_series_len() > 0 {
             let Some(active_image) = self.metadata_image() else {
                 return;
             };
@@ -1876,8 +1930,24 @@ impl eframe::App for DicomViewApp {
                 egui::SidePanel::right("metadata_panel")
                     .min_width(180.0)
                     .max_width(300.0)
-                    .show(ctx, |ui| {
-                        ui.heading("Metadata");
+                    .default_width(220.0)
+                    .resizable(true)
+                    .show_animated(ctx, self.show_metadata, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading("Metadata");
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .small_button("»")
+                                        .on_hover_text("Collapse metadata panel")
+                                        .clicked()
+                                    {
+                                        self.show_metadata = false;
+                                    }
+                                },
+                            );
+                        });
                         ui.separator();
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             egui::Grid::new("meta_grid")
@@ -2258,8 +2328,12 @@ impl eframe::App for DicomViewApp {
                                         }
                                     }
                                 } else {
-                                    let new_zoom = (self.vp().zoom * (1.0 + scroll_delta * 0.004)).clamp(0.05, 20.0);
-                                    self.vp_mut().zoom = new_zoom;
+                                    let new_zoom = (self.vp().zoom * (scroll_delta * 0.004).exp()).clamp(0.05, 20.0);
+                                    if let Some(anchor) = response.hover_pos() {
+                                        self.zoom_towards(new_zoom, anchor, cell_rect.center());
+                                    } else {
+                                        self.vp_mut().zoom = new_zoom;
+                                    }
                                 }
                                 self.active_viewport = prev_active;
                             }
@@ -2292,12 +2366,25 @@ impl eframe::App for DicomViewApp {
                                 let prev_active = self.active_viewport;
                                 self.active_viewport = idx;
 
-                                // Both left and right -> zoom
+                                // Both left and right -> zoom (anchor locked at gesture start)
                                 if left_down && right_down {
-                                    let delta = response.drag_delta();
-                                    if delta.y != 0.0 {
-                                        let new_zoom = (self.vp().zoom * (1.0 + delta.y * 0.01)).clamp(0.05, 20.0);
-                                        self.vp_mut().zoom = new_zoom;
+                                    let center = cell_rect.center();
+                                    let anchor = match self.vp().zoom_drag_anchor {
+                                        Some(a) => a,
+                                        None => {
+                                            let a = response.hover_pos().unwrap_or(center);
+                                            let z = self.vp().zoom;
+                                            self.vp_mut().zoom_drag_anchor = Some(a);
+                                            self.vp_mut().zoom_drag_start_zoom = z;
+                                            a
+                                        }
+                                    };
+                                    // Zoom from total vertical displacement (frame-rate independent).
+                                    if let Some(pointer) = response.interact_pointer_pos() {
+                                        let factor = ((pointer.y - anchor.y) * 0.007).exp();
+                                        let new_zoom = (self.vp().zoom_drag_start_zoom * factor)
+                                            .clamp(0.05, 20.0);
+                                        self.zoom_towards(new_zoom, anchor, center);
                                     }
                                 }
                                 // Middle drag -> slice navigation when multiple
@@ -2594,17 +2681,6 @@ impl eframe::App for DicomViewApp {
                 let img_h = tex_size[1] as f32;
                     let physical_size = self.vp().displayed_physical_size.unwrap_or_else(|| egui::vec2(img_w, img_h));
 
-                    // Scale to fit the panel at current zoom level (per-viewport zoom).
-                    let display = if self.vp().view_mode == ViewMode::Mpr && !self.vp().scale_by_physical {
-                        // Pixel-based scaling
-                        let fit = (rect.width() / img_w).min(rect.height() / img_h);
-                        egui::vec2(img_w * fit * self.vp().zoom, img_h * fit * self.vp().zoom)
-                    } else {
-                        // Physical-size based scaling (preserves real-world proportions)
-                        let fit = (rect.width() / physical_size.x).min(rect.height() / physical_size.y);
-                        egui::vec2(physical_size.x * fit * self.vp().zoom, physical_size.y * fit * self.vp().zoom)
-                    };
-
                 let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
                 // Check button states for multi-button combinations
@@ -2667,19 +2743,36 @@ impl eframe::App for DicomViewApp {
                             }
                         }
                     } else {
-                        // Scroll to zoom (per-viewport)
-                        let new_zoom = (self.vp().zoom * (1.0 + scroll_delta * 0.004)).clamp(0.05, 20.0);
-                        self.vp_mut().zoom = new_zoom;
+                        // Scroll to zoom (per-viewport), anchored at the cursor
+                        let new_zoom = (self.vp().zoom * (scroll_delta * 0.004).exp()).clamp(0.05, 20.0);
+                        if let Some(anchor) = response.hover_pos() {
+                            self.zoom_towards(new_zoom, anchor, rect.center());
+                        } else {
+                            self.vp_mut().zoom = new_zoom;
+                        }
                     }
                 }
 
-                // Both left and right buttons → zoom
+                // Both left and right buttons → zoom (anchor locked at gesture start)
                     if response.hovered() && left_down && right_down {
-                    let delta = response.drag_delta();
-                    // Downward drag zooms in, upward zooms out
-                    if delta.y != 0.0 {
-                        let new_zoom = (self.vp().zoom * (1.0 + delta.y * 0.01)).clamp(0.05, 20.0);
-                        self.vp_mut().zoom = new_zoom;
+                    let center = rect.center();
+                    let anchor = match self.vp().zoom_drag_anchor {
+                        Some(a) => a,
+                        None => {
+                            let a = response.hover_pos().unwrap_or(center);
+                            let z = self.vp().zoom;
+                            self.vp_mut().zoom_drag_anchor = Some(a);
+                            self.vp_mut().zoom_drag_start_zoom = z;
+                            a
+                        }
+                    };
+                    // Zoom based on total vertical displacement from the anchor
+                    // (downward drag zooms in, upward zooms out).
+                    if let Some(pointer) = response.interact_pointer_pos() {
+                        let factor = ((pointer.y - anchor.y) * 0.007).exp();
+                        let new_zoom =
+                            (self.vp().zoom_drag_start_zoom * factor).clamp(0.05, 20.0);
+                        self.zoom_towards(new_zoom, anchor, center);
                     }
                 }
                 // Middle mouse button → scroll through slices (if multiple images)
@@ -2773,6 +2866,18 @@ impl eframe::App for DicomViewApp {
                 }
 
                 let center = rect.center() + self.vp().pan;
+                // Recompute the display size from the current zoom: the zoom/pan
+                // interactions above run after `rect`/`physical_size` are known, and
+                // must be reflected in the same frame as the pan change. Otherwise
+                // the image renders at the old zoom with the new pan for one frame,
+                // which makes zooming jitter.
+                let display = if self.vp().view_mode == ViewMode::Mpr && !self.vp().scale_by_physical {
+                    let fit = (rect.width() / img_w).min(rect.height() / img_h);
+                    egui::vec2(img_w * fit * self.vp().zoom, img_h * fit * self.vp().zoom)
+                } else {
+                    let fit = (rect.width() / physical_size.x).min(rect.height() / physical_size.y);
+                    egui::vec2(physical_size.x * fit * self.vp().zoom, physical_size.y * fit * self.vp().zoom)
+                };
                 let angle_rad = self.vp().rotation_degrees.to_radians();
                 let painter = ui.painter();
                 let clipped = painter.with_clip_rect(rect);
