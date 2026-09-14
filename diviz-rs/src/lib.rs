@@ -2056,6 +2056,68 @@ impl eframe::App for DicomViewApp {
                                             egui::Color32::from_rgba_unmultiplied(0, 0, 0, 80),
                                         );
 
+                                        // Click / drag anywhere on the track to navigate slices.
+                                        let scroll_resp = ui.interact(
+                                            track_rect,
+                                            egui::Id::new(("slice_scroll_track", idx)),
+                                            egui::Sense::click_and_drag(),
+                                        );
+                                        if scroll_resp.hovered() {
+                                            ctx.set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                                        }
+                                        if scroll_resp.dragged() || scroll_resp.clicked() {
+                                            if let Some(pointer) = scroll_resp.interact_pointer_pos() {
+                                                let t = ((pointer.y - track_rect.top())
+                                                    / track_rect.height())
+                                                    .clamp(0.0, 1.0);
+                                                let new_idx =
+                                                    (t * (total_slices - 1) as f32).round() as usize;
+                                                let plane = self.viewports[idx].mpr_plane;
+                                                let changed =
+                                                    match self.viewports[idx].view_mode {
+                                                        ViewMode::Stack => {
+                                                            if self.viewports[idx].current_stack_slice
+                                                                != new_idx
+                                                            {
+                                                                self.viewports[idx]
+                                                                    .current_stack_slice = new_idx;
+                                                                true
+                                                            } else {
+                                                                false
+                                                            }
+                                                        }
+                                                        ViewMode::Mpr => {
+                                                            let current = match plane {
+                                                                MprPlane::Axial => self.viewports[idx]
+                                                                    .current_axial_slice,
+                                                                MprPlane::Coronal => self.viewports[idx]
+                                                                    .current_coronal_slice,
+                                                                MprPlane::Sagittal => self.viewports[idx]
+                                                                    .current_sagittal_slice,
+                                                            };
+                                                            if current != new_idx {
+                                                                match plane {
+                                                                    MprPlane::Axial => self.viewports[idx]
+                                                                        .current_axial_slice = new_idx,
+                                                                    MprPlane::Coronal => self.viewports[idx]
+                                                                        .current_coronal_slice = new_idx,
+                                                                    MprPlane::Sagittal => self.viewports[idx]
+                                                                        .current_sagittal_slice = new_idx,
+                                                                }
+                                                                true
+                                                            } else {
+                                                                false
+                                                            }
+                                                        }
+                                                    };
+                                                if changed {
+                                                    self.active_viewport = idx;
+                                                    self.viewports[idx].wl_dirty = true;
+                                                    self.update_current_slice_view(ctx);
+                                                }
+                                            }
+                                        }
+
                                         // Draw slice count small label (clipped)
                                         let label = format!("{}/{}", current_idx + 1, total_slices);
                                         let text_pos = egui::pos2(track_rect.left() - 6.0, thumb_rect.center().y - 8.0);
@@ -2781,6 +2843,44 @@ impl eframe::App for DicomViewApp {
                         6.0,
                         egui::Color32::from_rgba_unmultiplied(0, 0, 0, 80),
                     );
+
+                    // Click / drag anywhere on the track to navigate slices.
+                    let scroll_resp = ui.interact(
+                        track_rect,
+                        egui::Id::new("slice_scroll_track_single"),
+                        egui::Sense::click_and_drag(),
+                    );
+                    if scroll_resp.hovered() {
+                        ctx.set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                    }
+                    if scroll_resp.dragged() || scroll_resp.clicked() {
+                        if let Some(pointer) = scroll_resp.interact_pointer_pos() {
+                            let t = ((pointer.y - track_rect.top()) / track_rect.height())
+                                .clamp(0.0, 1.0);
+                            let new_idx = (t * (total_slices - 1) as f32).round() as usize;
+                            let changed = match self.vp().view_mode {
+                                ViewMode::Stack => {
+                                    if self.vp().current_stack_slice != new_idx {
+                                        self.vp_mut().current_stack_slice = new_idx;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                                ViewMode::Mpr => {
+                                    if self.current_mpr_slice() != new_idx {
+                                        self.set_current_mpr_slice(new_idx);
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                            };
+                            if changed {
+                                self.vp_mut().wl_dirty = true;
+                            }
+                        }
+                    }
 
                     // Draw slice count text above the thumb
                     let label = format!("{}/{}", current_idx + 1, total_slices);
