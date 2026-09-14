@@ -2979,6 +2979,11 @@ pub fn run_viewer() {
         viewport: egui::ViewportBuilder::default()
             .with_title("DICOM Viewer")
             .with_inner_size([1024.0, 768.0]),
+        // Use the wgpu renderer instead of the default glow/glutin one. The glow
+        // backend fails to create a GLX context on some displays (glutin
+        // "BadValue"), while wgpu can fall back to a working backend (e.g.
+        // Vulkan), so the window opens reliably across environments.
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
     eframe::run_native(
@@ -2994,6 +2999,11 @@ pub fn run_viewer_with_files(paths: Vec<String>) {
         viewport: egui::ViewportBuilder::default()
             .with_title("DICOM Viewer")
             .with_inner_size([1024.0, 768.0]),
+        // Use the wgpu renderer instead of the default glow/glutin one. The glow
+        // backend fails to create a GLX context on some displays (glutin
+        // "BadValue"), while wgpu can fall back to a working backend (e.g.
+        // Vulkan), so the window opens reliably across environments.
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
     let path_bufs = paths.into_iter().map(PathBuf::from).collect::<Vec<_>>();
