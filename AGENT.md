@@ -29,7 +29,7 @@ High-level design (Rust anonymiser)
 - UID remapping:
   - Remap to decimal-format UIDs `2.25.<decimal>` using blake3 -> BigUint
   - Applied to top-level UIDs and recursively to UI VRs within sequences
-  - Audit map JSON written next to outputs (`<file>.anon_map.json`)
+  - Remapping is deterministic and irreversible; no audit map file is written
 - Date/time shifting:
   - Study-level deterministic shift derived from StudyInstanceUID (optional seed)
   - Shift `DA` (YYYYMMDD), `DT` (leading YYYYMMDD), `TM` (rotate by offset modulo 24h)
@@ -67,10 +67,10 @@ Build & run
 - Run Rust tests: `cd uploader/uploader_rs && cargo test`
 
 Next recommended work
-- CLI options: `--seed`, `--anon-map <path>`, `--clear-text-vr` (configurable behaviour)
+- CLI options: `--seed`, `--clear-text-vr` (configurable behaviour)
 - Add more unit tests: SR content checks, nested UID remap, date/time shift correctness
 - Template-aware SR handling (if clinical SR utility must be preserved)
-- Documentation (README) describing anonymisation policy and audit map format
+- Documentation (README) describing anonymisation policy
 - Commit changes and package for Linux
 
 Recorded: 2026-03-16

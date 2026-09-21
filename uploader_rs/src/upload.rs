@@ -7,11 +7,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use dicom_object::open_file;
 use dicom_object::Tag;
 use dicom_pixeldata::PixelDecoder;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use std::time::Duration;
 use serde::{Serialize, Deserialize};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
+use rayon::prelude::*;
 use tracing::Level;
 
 static SCAN_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -23,6 +24,9 @@ const MIN_REQUEST_TIMEOUT_SECS: u64 = 5;
 // Short, bounded timeout for startup-time server checks (e.g. token validation)
 // so a slow/unreachable server cannot stall application launch.
 const STARTUP_TOKEN_CHECK_TIMEOUT_SECS: u64 = 10;
+// Maximum number of concurrent HTTP requests (upload chunks / duplicate-lookup
+// batches). Bounds load on the server while still overlapping network latency.
+const MAX_CONCURRENT_REQUESTS: usize = 4;
 
 #[derive(Debug, Clone, Default)]
 struct DuplicateLookupResult {
@@ -107,6 +111,141 @@ static NEXT_READY_ORDER: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
 // a concurrent startup scan from wiping entries added by an in-flight anonymization
 // pass, which would otherwise cause outstanding DICOMs to be missed.
 static READY_FILES_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+// PixelData hashes keyed by path, validated against the file's (size, mtime).
+// Anonymized files are immutable once written, so repeated scans/uploads can
+// reuse the digest instead of re-opening and re-decoding every file. This is
+// what makes duplicate refreshes and uploads cheap after the first pass.
+static PIXEL_HASH_CACHE: Lazy<Mutex<HashMap<String, (u64, u64, String)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn file_mtime_secs(md: &std::fs::Metadata) -> u64 {
+    md.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn get_cached_pixel_hash(path: &Path, size: u64, mtime: u64) -> Option<String> {
+    let g = PIXEL_HASH_CACHE.lock().ok()?;
+    g.get(&path_key(path)).and_then(|(s, m, h)| {
+        if *s == size && *m == mtime {
+            Some(h.clone())
+        } else {
+            None
+        }
+    })
+}
+
+/// Record a known PixelData hash for `path`, validated by the file's size and
+/// modification time. Callers use this to avoid re-decoding an output they just
+/// hashed from its (lossless) input.
+pub fn cache_pixel_hash(path: &Path, hash: &str) {
+    if hash.is_empty() {
+        return;
+    }
+    if let Ok(md) = std::fs::metadata(path) {
+        let size = md.len();
+        let mtime = file_mtime_secs(&md);
+        if let Ok(mut g) = PIXEL_HASH_CACHE.lock() {
+            g.insert(path_key(path), (size, mtime, hash.to_string()));
+        }
+    }
+}
+
+fn evict_cached_pixel_hash(path: &Path) {
+    if let Ok(mut g) = PIXEL_HASH_CACHE.lock() {
+        g.remove(&path_key(path));
+    }
+}
+
+// Full ready-file metadata keyed by path, validated by (size, mtime). Lets a
+// repeated scan rebuild the ready list without re-opening any file: after the
+// first pass, scanning is pure in-memory bookkeeping.
+static READY_META_CACHE: Lazy<Mutex<HashMap<String, (u64, u64, ReadyFileInfo)>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn get_cached_ready_meta(path: &Path, size: u64, mtime: u64) -> Option<ReadyFileInfo> {
+    let g = READY_META_CACHE.lock().ok()?;
+    g.get(&path_key(path)).and_then(|(s, m, info)| {
+        if *s == size && *m == mtime {
+            Some(info.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn store_ready_meta(path: &Path, size: u64, mtime: u64, info: &ReadyFileInfo) {
+    if let Ok(mut g) = READY_META_CACHE.lock() {
+        g.insert(path_key(path), (size, mtime, info.clone()));
+    }
+}
+
+fn evict_ready_meta(path: &Path) {
+    if let Ok(mut g) = READY_META_CACHE.lock() {
+        g.remove(&path_key(path));
+    }
+}
+
+fn build_ready_info(
+    path: &Path,
+    obj: &dicom_object::DefaultDicomObject,
+    hash: String,
+    file_size: u64,
+) -> ReadyFileInfo {
+    let series_uid = obj
+        .element(Tag(0x0020, 0x000E))
+        .ok()
+        .and_then(|e| e.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "NO_SERIES".to_string());
+    ReadyFileInfo {
+        path: path.to_path_buf(),
+        hash,
+        series_uid,
+        study_uid: read_dicom_string(obj, Tag(0x0020, 0x000D)),
+        load_order: NEXT_READY_ORDER.fetch_add(1, Ordering::SeqCst),
+        duplicate_checked: false,
+        is_duplicate: false,
+        duplicate_series_urls: Vec::new(),
+        patient_name: read_dicom_string(obj, Tag(0x0010, 0x0010)),
+        examination: read_dicom_string(obj, Tag(0x0008, 0x1030)),
+        patient_id: read_dicom_string(obj, Tag(0x0010, 0x0020)),
+        study_date: read_dicom_string(obj, Tag(0x0008, 0x0020)),
+        modality: read_dicom_string(obj, Tag(0x0008, 0x0060)),
+        series_description: read_dicom_string(obj, Tag(0x0008, 0x103E)),
+        series_number: read_dicom_string(obj, Tag(0x0020, 0x0011)),
+        file_size,
+        burned_in_annotation_detected: detect_burned_in_annotation(obj),
+    }
+}
+
+fn insert_ready_info(path: &Path, info: ReadyFileInfo) {
+    if let Ok(_guard) = READY_FILES_LOCK.lock() {
+        if let Ok(mut g) = READY_FILES.lock() {
+            g.insert(path_key(path), info);
+        }
+    }
+}
+
+/// Register ready-file metadata for `path`, computed from an already-open
+/// (anonymized) object, so the following scan does not re-open or re-read it.
+pub fn cache_ready_file_from_obj(
+    path: &Path,
+    obj: &dicom_object::DefaultDicomObject,
+    known_hash: Option<String>,
+) {
+    let md = std::fs::metadata(path).ok();
+    let file_size = md.as_ref().map(|m| m.len()).unwrap_or(0);
+    let mtime = md.as_ref().map(file_mtime_secs).unwrap_or(0);
+    let hash = known_hash.unwrap_or_default();
+    if !hash.is_empty() {
+        cache_pixel_hash(path, &hash);
+    }
+    let info = build_ready_info(path, obj, hash, file_size);
+    store_ready_meta(path, file_size, mtime, &info);
+    insert_ready_info(path, info);
+}
 
 fn read_dicom_string(obj: &dicom_object::DefaultDicomObject, tag: Tag) -> Option<String> {
     obj.element(tag).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string())
@@ -241,10 +380,13 @@ fn persist_ready_manifest_locked(_map: &HashMap<String, ReadyFileInfo>) {
 }
 
 fn collect_ready_for_dir(anon_dir: &Path) -> Vec<ReadyFileInfo> {
-    if let Ok(g) = READY_FILES.lock() {
+    if let Ok(mut g) = READY_FILES.lock() {
+        // Evict entries whose files have disappeared and collect the ones for
+        // this directory in a single stat pass.
+        g.retain(|_, rf| rf.path.exists());
         return g
             .values()
-            .filter(|rf| rf.path.starts_with(anon_dir) && rf.path.exists())
+            .filter(|rf| rf.path.starts_with(anon_dir))
             .cloned()
             .collect();
     }
@@ -254,16 +396,6 @@ fn collect_ready_for_dir(anon_dir: &Path) -> Vec<ReadyFileInfo> {
 #[allow(dead_code)]
 pub fn load_ready_manifest() {
     // No-op: we do not store a history of what we have uploaded locally on the machine
-}
-
-pub fn evict_missing_ready_files() {
-    if let Ok(mut g) = READY_FILES.lock() {
-        let before = g.len();
-        g.retain(|_, rf| rf.path.exists());
-        if g.len() != before {
-            persist_ready_manifest_locked(&g);
-        }
-    }
 }
 
 fn build_series_from_ready_files(items: &[ReadyFileInfo]) -> Vec<SeriesInfo> {
@@ -363,64 +495,40 @@ pub fn snapshot_ready_series(anon_dir: &Path) -> Vec<SeriesInfo> {
     build_series_from_ready_files(&items)
 }
 
-pub fn upsert_ready_file(path: &Path, known_hash: Option<String>) -> Result<(), String> {
-    upsert_ready_file_internal(path, known_hash, true)
-}
+fn upsert_ready_file_internal(path: &Path) -> Result<(), String> {
+    // Stat first so cached metadata can be validated without opening the file.
+    let md = std::fs::metadata(path).ok();
+    let file_size = md.as_ref().map(|m| m.len()).unwrap_or(0);
+    let mtime = md.as_ref().map(file_mtime_secs).unwrap_or(0);
 
-fn upsert_ready_file_internal(
-    path: &Path,
-    known_hash: Option<String>,
-    persist_manifest: bool,
-) -> Result<(), String> {
+    // Fast path: the file is unchanged since we last read it, so reuse the
+    // cached metadata (and hash) without re-opening or re-decoding.
+    if let Some(info) = get_cached_ready_meta(path, file_size, mtime) {
+        insert_ready_info(path, info);
+        return Ok(());
+    }
+
     let obj = open_file(path).map_err(|e| format!("open_file {}: {}", path.display(), e))?;
     // Empty hash means no PixelData was available; file remains uploadable
     // but is skipped by duplicate precheck (which only accepts pixel hashes).
-    let hash = known_hash
+    let hash = get_cached_pixel_hash(path, file_size, mtime)
         .or_else(|| calculate_pixel_hash_from_obj(&obj))
         .unwrap_or_default();
 
-    let series_uid = obj
-        .element(Tag(0x0020, 0x000E))
-        .ok()
-        .and_then(|e| e.to_str().ok())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "NO_SERIES".to_string());
-    let study_uid = read_dicom_string(&obj, Tag(0x0020, 0x000D));
-    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let load_order = NEXT_READY_ORDER.fetch_add(1, Ordering::SeqCst);
-
-    let info = ReadyFileInfo {
-        path: path.to_path_buf(),
-        hash,
-        series_uid,
-        study_uid,
-        load_order,
-        duplicate_checked: false,
-        is_duplicate: false,
-        duplicate_series_urls: Vec::new(),
-        patient_name: read_dicom_string(&obj, Tag(0x0010, 0x0010)),
-        examination: read_dicom_string(&obj, Tag(0x0008, 0x1030)),
-        patient_id: read_dicom_string(&obj, Tag(0x0010, 0x0020)),
-        study_date: read_dicom_string(&obj, Tag(0x0008, 0x0020)),
-        modality: read_dicom_string(&obj, Tag(0x0008, 0x0060)),
-        series_description: read_dicom_string(&obj, Tag(0x0008, 0x103E)),
-        series_number: read_dicom_string(&obj, Tag(0x0020, 0x0011)),
-        file_size,
-        burned_in_annotation_detected: detect_burned_in_annotation(&obj),
-    };
-
-    if let Ok(_guard) = READY_FILES_LOCK.lock() {
-        if let Ok(mut g) = READY_FILES.lock() {
-            g.insert(path_key(path), info);
-            if persist_manifest {
-                persist_ready_manifest_locked(&g);
-            }
+    let info = build_ready_info(path, &obj, hash, file_size);
+    if !info.hash.is_empty() {
+        if let Ok(mut g) = PIXEL_HASH_CACHE.lock() {
+            g.insert(path_key(path), (file_size, mtime, info.hash.clone()));
         }
     }
+    store_ready_meta(path, file_size, mtime, &info);
+    insert_ready_info(path, info);
     Ok(())
 }
 
 pub fn remove_ready_file(path: &Path) {
+    evict_cached_pixel_hash(path);
+    evict_ready_meta(path);
     if let Ok(_guard) = READY_FILES_LOCK.lock() {
         if let Ok(mut g) = READY_FILES.lock() {
             if g.remove(&path_key(path)).is_some() {
@@ -434,6 +542,86 @@ pub fn clear_duplicate_lookup_cache() {
     if let Ok(mut g) = DUPLICATE_LOOKUP_CACHE.lock() {
         g.clear();
     }
+}
+
+/// Perform one duplicate-lookup batch. Returns true if the request succeeded
+/// (regardless of how many hashes came back as duplicates).
+fn lookup_hash_batch(
+    client: &Client,
+    hash_check_url: &str,
+    base: &str,
+    batch: &[String],
+) -> bool {
+    log_rpc_debug(&format!("Duplicate lookup batch ({} hashes)", batch.len()));
+
+    let r = match client
+        .post(hash_check_url)
+        .timeout(Duration::from_secs(DUPLICATE_LOOKUP_TIMEOUT_SECS))
+        .json(batch)
+        .send()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            log_rpc_warn(&format!("Duplicate lookup batch failed: {}; continuing", e));
+            return false;
+        }
+    };
+
+    let status = r.status();
+    let body = match r.text() {
+        Ok(b) => b,
+        Err(_) => {
+            log_rpc_warn("Duplicate lookup batch body read failed; continuing");
+            return false;
+        }
+    };
+
+    log_rpc_debug(&format!("Response {}: {} ({} bytes)", hash_check_url, status, body.len()));
+
+    if !status.is_success() {
+        log_rpc_warn(&format!("Duplicate lookup batch failed HTTP {}; continuing", status));
+        return false;
+    }
+
+    let map = match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            log_rpc_warn("Duplicate lookup batch JSON parse failed; continuing");
+            return false;
+        }
+    };
+    let obj = match map.as_object() {
+        Some(o) => o,
+        None => {
+            log_rpc_warn("Duplicate lookup batch response shape invalid; continuing");
+            return false;
+        }
+    };
+
+    if let Ok(mut cache) = DUPLICATE_LOOKUP_CACHE.lock() {
+        for h in batch {
+            let mut res = DuplicateLookupResult::default();
+            if let Some(info) = obj.get(h) {
+                if let Some(id) = info.get("id") {
+                    if json_value_truthy(id) {
+                        res.is_duplicate = true;
+                        if let Some(urls) = info.get("url").and_then(|v| v.as_str()) {
+                            let full = if urls.starts_with("http") {
+                                urls.to_string()
+                            } else if urls.starts_with('/') {
+                                format!("{}{}", base.trim_end_matches('/'), urls)
+                            } else {
+                                format!("{}/{}", base.trim_end_matches('/'), urls)
+                            };
+                            res.urls.push(full);
+                        }
+                    }
+                }
+            }
+            cache.insert(h.clone(), res);
+        }
+    }
+    true
 }
 
 fn refresh_duplicate_lookup_cache(
@@ -473,161 +661,37 @@ fn refresh_duplicate_lookup_cache(
     let client = make_client(load_api_token().as_deref())?;
     let base = base_site_url();
     let hash_check_url = format!("{}{}", base, "/api/atlas/check_image_hashes/");
+    let total = query_hashes_unique.len();
     log_rpc(&format!(
-        "POST {} with {} hashes (batch size {})",
-        hash_check_url,
-        query_hashes_unique.len(),
-        DUPLICATE_LOOKUP_BATCH_SIZE
+        "POST {} with {} hashes (batch size {}, up to {} concurrent)",
+        hash_check_url, total, DUPLICATE_LOOKUP_BATCH_SIZE, MAX_CONCURRENT_REQUESTS
     ));
 
-    let total = query_hashes_unique.len();
-    let total_batches = (total + DUPLICATE_LOOKUP_BATCH_SIZE - 1) / DUPLICATE_LOOKUP_BATCH_SIZE;
-    let mut looked_up = 0usize;
-    let mut all_batches_succeeded = true;
-
-    for (batch_i, batch) in query_hashes_unique
+    let batches: Vec<Vec<String>> = query_hashes_unique
         .chunks(DUPLICATE_LOOKUP_BATCH_SIZE)
-        .enumerate()
-    {
-        let batch_vec: Vec<String> = batch.to_vec();
-        log_rpc_debug(&format!(
-            "Duplicate lookup batch {}/{} ({} hashes)",
-            batch_i + 1,
-            total_batches,
-            batch_vec.len()
-        ));
+        .map(|c| c.to_vec())
+        .collect();
+    let looked_up = AtomicUsize::new(0);
+    let failures = AtomicUsize::new(0);
+    // Wrap the sender so the parallel loop can report progress.
+    let tx = tx.map(Mutex::new);
 
-        let r = match client
-            .post(&hash_check_url)
-            .timeout(Duration::from_secs(DUPLICATE_LOOKUP_TIMEOUT_SECS))
-            .json(&batch_vec)
-            .send()
-        {
-            Ok(r) => r,
-            Err(e) => {
-                all_batches_succeeded = false;
-                log_rpc_warn(&format!(
-                    "Duplicate lookup batch {}/{} failed: {}; continuing with remaining batches",
-                    batch_i + 1,
-                    total_batches,
-                    e
-                ));
-                looked_up = looked_up.saturating_add(batch_vec.len());
-                if let Some(ref s) = tx {
-                    let prog = (looked_up as f32 / total as f32).clamp(0.0, 1.0);
-                    let _ = s.send(format!("PROC:PROG:{}", prog));
+    for group in batches.chunks(MAX_CONCURRENT_REQUESTS) {
+        group.par_iter().for_each(|batch| {
+            if !lookup_hash_batch(&client, &hash_check_url, &base, batch) {
+                failures.fetch_add(1, Ordering::SeqCst);
+            }
+            let n = looked_up.fetch_add(batch.len(), Ordering::SeqCst) + batch.len();
+            if let Some(ref t) = tx {
+                if let Ok(t) = t.lock() {
+                    let prog = (n as f32 / total as f32).clamp(0.0, 1.0);
+                    let _ = t.send(format!("PROC:PROG:{}", prog));
                 }
-                continue;
             }
-        };
-
-        let status = r.status();
-        let body = match r.text() {
-            Ok(b) => b,
-            Err(_) => {
-                all_batches_succeeded = false;
-                log_rpc_warn(&format!(
-                    "Duplicate lookup batch {}/{} body read failed; continuing",
-                    batch_i + 1,
-                    total_batches
-                ));
-                looked_up = looked_up.saturating_add(batch_vec.len());
-                if let Some(ref s) = tx {
-                    let prog = (looked_up as f32 / total as f32).clamp(0.0, 1.0);
-                    let _ = s.send(format!("PROC:PROG:{}", prog));
-                }
-                continue;
-            }
-        };
-
-        if let Some(pf) = save_body_to_file(&body) {
-            log_rpc_debug(&format!("Response {}: {} BODY_FILE:{}", hash_check_url, status, pf.display()));
-        }
-
-        if !status.is_success() {
-            all_batches_succeeded = false;
-            log_rpc_warn(&format!(
-                "Duplicate lookup batch {}/{} failed HTTP {}; continuing",
-                batch_i + 1,
-                total_batches,
-                status
-            ));
-            looked_up = looked_up.saturating_add(batch_vec.len());
-            if let Some(ref s) = tx {
-                let prog = (looked_up as f32 / total as f32).clamp(0.0, 1.0);
-                let _ = s.send(format!("PROC:PROG:{}", prog));
-            }
-            continue;
-        }
-
-        let map = match serde_json::from_str::<serde_json::Value>(&body) {
-            Ok(v) => v,
-            Err(_) => {
-                all_batches_succeeded = false;
-                log_rpc_warn(&format!(
-                    "Duplicate lookup batch {}/{} JSON parse failed; continuing",
-                    batch_i + 1,
-                    total_batches
-                ));
-                looked_up = looked_up.saturating_add(batch_vec.len());
-                if let Some(ref s) = tx {
-                    let prog = (looked_up as f32 / total as f32).clamp(0.0, 1.0);
-                    let _ = s.send(format!("PROC:PROG:{}", prog));
-                }
-                continue;
-            }
-        };
-
-        let obj = match map.as_object() {
-            Some(o) => o,
-            None => {
-                all_batches_succeeded = false;
-                log_rpc_warn(&format!(
-                    "Duplicate lookup batch {}/{} response shape invalid; continuing",
-                    batch_i + 1,
-                    total_batches
-                ));
-                looked_up = looked_up.saturating_add(batch_vec.len());
-                if let Some(ref s) = tx {
-                    let prog = (looked_up as f32 / total as f32).clamp(0.0, 1.0);
-                    let _ = s.send(format!("PROC:PROG:{}", prog));
-                }
-                continue;
-            }
-        };
-
-        if let Ok(mut cache) = DUPLICATE_LOOKUP_CACHE.lock() {
-            for h in &batch_vec {
-                let mut res = DuplicateLookupResult::default();
-                if let Some(info) = obj.get(h) {
-                    if let Some(id) = info.get("id") {
-                        if json_value_truthy(id) {
-                            res.is_duplicate = true;
-                            if let Some(urls) = info.get("url").and_then(|v| v.as_str()) {
-                                let full = if urls.starts_with("http") {
-                                    urls.to_string()
-                                } else if urls.starts_with('/') {
-                                    format!("{}{}", base.trim_end_matches('/'), urls)
-                                } else {
-                                    format!("{}/{}", base.trim_end_matches('/'), urls)
-                                };
-                                res.urls.push(full);
-                            }
-                        }
-                    }
-                }
-                cache.insert(h.clone(), res);
-            }
-        }
-
-        looked_up = looked_up.saturating_add(batch_vec.len());
-        if let Some(ref s) = tx {
-            let prog = (looked_up as f32 / total as f32).clamp(0.0, 1.0);
-            let _ = s.send(format!("PROC:PROG:{}", prog));
-        }
+        });
     }
 
-    Ok(all_batches_succeeded)
+    Ok(failures.load(Ordering::SeqCst) == 0)
 }
 
 fn ensure_ready_cache(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>) -> Result<(), String> {
@@ -659,18 +723,25 @@ fn ensure_ready_cache(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String
     }
 
     let total = dcm_like.len();
-    for (i, p) in dcm_like.iter().enumerate() {
-        if upsert_ready_file_internal(p, None, false).is_err() {
+    let report_interval = std::cmp::max(1, total / 20);
+    let done = AtomicUsize::new(0);
+    // Wrap the sender so the parallel scan can report progress (mpsc::Sender is
+    // Send but not Sync).
+    let tx = tx.map(Mutex::new);
+    dcm_like.par_iter().for_each(|p| {
+        if upsert_ready_file_internal(p).is_err() {
             log_rpc_debug(&format!("Scan skipped non-DICOM file: {}", p.display()));
         }
-        if let Some(ref s) = tx {
-            let report_interval = std::cmp::max(1, total / 20);
-            if (i % report_interval == 0) || (i + 1 == total) {
-                let prog = ((i + 1) as f32 / total as f32).clamp(0.0, 1.0);
-                let _ = s.send(format!("PROC:PROG:{}", prog));
+        let n = done.fetch_add(1, Ordering::SeqCst) + 1;
+        if (n % report_interval == 0) || (n == total) {
+            if let Some(ref t) = tx {
+                if let Ok(t) = t.lock() {
+                    let prog = (n as f32 / total as f32).clamp(0.0, 1.0);
+                    let _ = t.send(format!("PROC:PROG:{}", prog));
+                }
             }
         }
-    }
+        });
     Ok(())
 }
 
@@ -693,7 +764,6 @@ fn refresh_duplicates_for_ready_mode(
     tx: Option<std::sync::mpsc::Sender<String>>,
     force_refresh: bool,
 ) -> Result<Vec<SeriesInfo>, String> {
-    evict_missing_ready_files();
     let items = collect_ready_for_dir(anon_dir);
     if items.is_empty() {
         return Ok(Vec::new());
@@ -1040,23 +1110,6 @@ pub fn log_rpc_debug(msg: &str) { log_rpc_level(Level::DEBUG, msg); }
 pub fn log_rpc_warn(msg: &str)  { log_rpc_level(Level::WARN, msg); }
 pub fn log_rpc_error(msg: &str) { log_rpc_level(Level::ERROR, msg); }
 
-fn bodies_dir() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let dir = home.join(".uploader").join("bodies");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
-
-fn save_body_to_file(body: &str) -> Option<PathBuf> {
-    let dir = bodies_dir();
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let p = dir.join(format!("resp_{}.txt", ts));
-    match std::fs::write(&p, body) {
-        Ok(_) => Some(p),
-        Err(_) => None,
-    }
-}
-
 fn json_value_truthy(v: &serde_json::Value) -> bool {
     if v.is_boolean() {
         v.as_bool().unwrap_or(false)
@@ -1110,11 +1163,7 @@ fn token_username_with_timeout(timeout_secs: Option<u64>) -> Option<String> {
         if let Ok(r) = resp {
             let status = r.status();
             if let Ok(body) = r.text() {
-                if let Some(pf) = save_body_to_file(&body) {
-                    log_rpc_debug(&format!("Response {}: {} BODY_FILE:{}", token_check, status, pf.display()));
-                } else {
-                    log_rpc_warn(&format!("Response {}: {} body: (failed to save body)", token_check, status));
-                }
+                log_rpc_debug(&format!("Response {}: {} ({} bytes)", token_check, status, body.len()));
                 if status.is_success() {
                     if let Ok(j) = serde_json::from_str::<serde_json::Value>(&body) {
                         if j.get("valid").and_then(|b| b.as_bool()).unwrap_or(false) {
@@ -1159,6 +1208,12 @@ fn make_client_with_timeout(token: Option<&str>, timeout_secs: Option<u64>) -> R
     Ok(client)
 }
 
+/// Canonical PixelData hash primitive: BLAKE3 over decoded pixel bytes.
+pub fn hash_pixel_bytes(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+#[allow(dead_code)]
 pub fn calculate_pixel_hash(path: &Path) -> Option<String> {
     // Duplicate detection must hash pixel data only.
     // Full-file hashing is intentionally disallowed because metadata changes
@@ -1169,11 +1224,11 @@ pub fn calculate_pixel_hash(path: &Path) -> Option<String> {
     None
 }
 
-fn calculate_pixel_hash_from_obj(obj: &dicom_object::DefaultDicomObject) -> Option<String> {
+pub fn calculate_pixel_hash_from_obj(obj: &dicom_object::DefaultDicomObject) -> Option<String> {
     // Preferred: hash decoded pixel bytes.
     if let Ok(pixel_data) = obj.decode_pixel_data() {
         let bytes = pixel_data.data();
-        return Some(blake3::hash(bytes).to_hex().to_string());
+        return Some(hash_pixel_bytes(bytes));
     }
 
     // If JPEG-LS Lossless (1.2.840.10008.1.2.4.80), decode fragments using CharLS
@@ -1211,10 +1266,94 @@ fn calculate_pixel_hash_from_obj(obj: &dicom_object::DefaultDicomObject) -> Opti
     // Prefer the PixelData element bytes when present for uncompressed data.
     if let Ok(elem) = obj.element(Tag(0x7FE0, 0x0010)) {
         if let Ok(bytes) = elem.to_bytes() {
-            return Some(blake3::hash(&bytes).to_hex().to_string());
+            return Some(hash_pixel_bytes(&bytes));
         }
     }
     None
+}
+
+#[derive(Default)]
+struct ChunkOutcome {
+    uploaded: Vec<(String, String)>,
+    duplicates: Vec<(String, String)>,
+    failed: Vec<String>,
+    duplicate_series: Vec<String>,
+    saw_timeout: bool,
+    succeeded: bool,
+}
+
+/// Upload one chunk of files, retrying up to 3 times. This is pure network +
+/// parsing; all bookkeeping is applied by the caller afterwards so that chunks
+/// can be uploaded concurrently.
+fn upload_chunk(
+    client: &Client,
+    endpoint: &str,
+    chunk_pairs: &[(PathBuf, String)],
+) -> ChunkOutcome {
+    let mut out = ChunkOutcome::default();
+    for _attempt in 0..3 {
+        // Rebuild the multipart form for each attempt (Form is not Clone)
+        let mut form = Form::new();
+        for (p, fname) in chunk_pairs {
+            if let Ok(f) = File::open(p) {
+                let part = Part::reader(f).file_name(fname.clone());
+                form = form.part("files", part);
+            }
+        }
+
+        log_rpc(&format!("POST {} upload {} files", endpoint, chunk_pairs.len()));
+        match client.post(endpoint).multipart(form).send() {
+            Ok(resp) => {
+                let status = resp.status();
+                if let Ok(body) = resp.text() {
+                    log_rpc_debug(&format!("Response {}: {} ({} bytes)", endpoint, status, body.len()));
+                    if status.is_success() {
+                        if let Ok(jsonv) = serde_json::from_str::<serde_json::Value>(&body) {
+                            if let Some(upl) = jsonv.get("uploaded").and_then(|v| v.as_array()) {
+                                for it in upl {
+                                    if let Some(arr) = it.as_array() {
+                                        if arr.len() >= 2 {
+                                            if let (Some(fname), Some(hash)) = (arr[0].as_str(), arr[1].as_str()) {
+                                                out.uploaded.push((fname.to_string(), hash.to_string()));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(dups) = jsonv.get("duplicates").and_then(|v| v.as_array()) {
+                                for it in dups {
+                                    if let Some(arr) = it.as_array() {
+                                        if arr.len() >= 2 {
+                                            if let (Some(fname), Some(hash)) = (arr[0].as_str(), arr[1].as_str()) {
+                                                out.duplicates.push((fname.to_string(), hash.to_string()));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(failedv) = jsonv.get("failed").and_then(|v| v.as_array()) {
+                                for it in failedv { if let Some(s) = it.as_str() { out.failed.push(s.to_string()); } }
+                            }
+                            if let Some(ds) = jsonv.get("duplicate_series").and_then(|v| v.as_array()) {
+                                for it in ds { if let Some(s) = it.as_str() { out.duplicate_series.push(s.to_string()); } }
+                            }
+                        }
+                        out.succeeded = true;
+                        return out;
+                    }
+                } else {
+                    log_rpc_warn(&format!("Response {}: {} (failed to read body)", endpoint, status));
+                }
+            }
+            Err(e) => {
+                if is_timeout_error(&e) {
+                    out.saw_timeout = true;
+                }
+                log_rpc_error(&format!("Request error {}: {}", endpoint, e));
+            }
+        }
+    }
+    out
 }
 
 pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::sync::mpsc::Sender<String>>) -> Result<UploadResult, String> {
@@ -1276,132 +1415,83 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
         if total_files > 0 { let _ = s.send(format!("PROC:PROG:{}", 0.0)); }
     }
 
-    for (_i, chunk) in files_to_upload.chunks(chunk_size).enumerate() {
-        let chunk_pairs: Vec<(PathBuf, String)> = chunk.iter().map(|(p, f)| (p.clone(), f.clone())).collect();
+    let chunks: Vec<Vec<(PathBuf, String)>> = files_to_upload
+        .chunks(chunk_size)
+        .map(|c| c.to_vec())
+        .collect();
 
-        let endpoint = if let Some(cid) = case_id { format!("{}/api/atlas/upload_dicom_case/{}", base, cid) } else { format!("{}/api/atlas/upload_dicom", base) };
+    for group in chunks.chunks(MAX_CONCURRENT_REQUESTS) {
+        // Upload the chunks in this group concurrently (network-bound), then
+        // apply the bookkeeping sequentially.
+        let outcomes: Vec<ChunkOutcome> = group
+            .par_iter()
+            .map(|chunk_pairs| {
+                let endpoint = if let Some(cid) = case_id {
+                    format!("{}/api/atlas/upload_dicom_case/{}", base, cid)
+                } else {
+                    format!("{}/api/atlas/upload_dicom", base)
+                };
+                upload_chunk(&client, &endpoint, chunk_pairs)
+            })
+            .collect();
 
-        let mut success = false;
-        for _attempt in 0..3 {
-            // Rebuild the multipart form for each attempt (Form is not Clone)
-            let mut form = Form::new();
-            for (p, fname) in &chunk_pairs {
-                if let Ok(f) = File::open(p) {
-                    let part = Part::reader(f).file_name(fname.clone());
-                    form = form.part("files", part);
+        for (chunk_pairs, outcome) in group.iter().zip(outcomes.into_iter()) {
+            if outcome.saw_timeout {
+                saw_timeout = true;
+                if let Some(ref s) = tx {
+                    let _ = s.send(upload_timeout_user_message(load_request_timeout_secs()));
                 }
             }
 
-            log_rpc(&format!("POST {} upload {} files", endpoint, chunk_pairs.len()));
-            match client.post(&endpoint).multipart(form).send() {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if let Ok(body) = resp.text() {
-                        if let Some(pf) = save_body_to_file(&body) {
-                            log_rpc_debug(&format!("Response {}: {} BODY_FILE:{}", endpoint, status, pf.display()));
-                        } else {
-                            log_rpc_warn(&format!("Response {}: {} body: (failed to save body)", endpoint, status));
-                        }
-                        if status.is_success() {
-                            if let Ok(jsonv) = serde_json::from_str::<serde_json::Value>(&body) {
-                                if let Some(upl) = jsonv.get("uploaded").and_then(|v| v.as_array()) {
-                                    for it in upl {
-                                        if let Some(arr) = it.as_array() {
-                                            if arr.len() >= 2 {
-                                                if let (Some(fname), Some(hash)) = (arr[0].as_str(), arr[1].as_str()) {
-                                                    // record uploaded and remove local file to avoid re-upload
-                                                    uploaded.push((fname.to_string(), hash.to_string()));
-                                                    // find matching path in this chunk and delete
-                                                    for (p, f) in &chunk_pairs {
-                                                        if f == fname {
-                                                            if std::fs::remove_file(p).is_ok() {
-                                                                log_rpc_debug(&format!("Deleted uploaded file: {}", p.display()));
-                                                                remove_ready_file(p);
-                                                                record_uploaded_file(
-                                                                    fname,
-                                                                    &file_owner,
-                                                                    &series_total_files,
-                                                                    &mut series_handled_files,
-                                                                    &study_total_series,
-                                                                    &mut study_completed_series,
-                                                                    &tx,
-                                                                );
-                                                            } else {
-                                                                log_rpc_warn(&format!("Failed to delete uploaded file: {}", p.display()));
-                                                            }
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                if let Some(dups) = jsonv.get("duplicates").and_then(|v| v.as_array()) {
-                                    for it in dups {
-                                        if let Some(arr) = it.as_array() {
-                                            if arr.len() >= 2 {
-                                                if let (Some(fname), Some(hash)) = (arr[0].as_str(), arr[1].as_str()) {
-                                                    // record duplicate and delete local copy to keep anon dir clean
-                                                    duplicates.push((fname.to_string(), hash.to_string()));
-                                                    for (p, f) in &chunk_pairs {
-                                                        if f == fname {
-                                                            if std::fs::remove_file(p).is_ok() {
-                                                                log_rpc_debug(&format!("Deleted duplicate local file: {}", p.display()));
-                                                                remove_ready_file(p);
-                                                                record_uploaded_file(
-                                                                    fname,
-                                                                    &file_owner,
-                                                                    &series_total_files,
-                                                                    &mut series_handled_files,
-                                                                    &study_total_series,
-                                                                    &mut study_completed_series,
-                                                                    &tx,
-                                                                );
-                                                            } else {
-                                                                log_rpc_warn(&format!("Failed to delete duplicate local file: {}", p.display()));
-                                                            }
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                if let Some(failedv) = jsonv.get("failed").and_then(|v| v.as_array()) {
-                                    for it in failedv { if let Some(s) = it.as_str() { failed.push(s.to_string()); } }
-                                }
-                                if let Some(ds) = jsonv.get("duplicate_series").and_then(|v| v.as_array()) {
-                                    for it in ds { if let Some(s) = it.as_str() { duplicate_series.insert(s.to_string()); } }
-                                }
-                            }
-                            success = true;
-                            break;
-                        }
+            for (fname, hash) in &outcome.uploaded {
+                uploaded.push((fname.clone(), hash.clone()));
+                if let Some((p, _)) = chunk_pairs.iter().find(|(_, f)| f == fname) {
+                    if std::fs::remove_file(p).is_ok() {
+                        log_rpc_debug(&format!("Deleted uploaded file: {}", p.display()));
+                        remove_ready_file(p);
+                        record_uploaded_file(
+                            fname,
+                            &file_owner,
+                            &series_total_files,
+                            &mut series_handled_files,
+                            &study_total_series,
+                            &mut study_completed_series,
+                            &tx,
+                        );
                     } else {
-                        log_rpc_warn(&format!("Response {}: {} (failed to read body)", endpoint, status));
+                        log_rpc_warn(&format!("Failed to delete uploaded file: {}", p.display()));
                     }
-                }
-                Err(e) => {
-                    if is_timeout_error(&e) {
-                        saw_timeout = true;
-                        if let Some(ref s) = tx {
-                            let _ = s.send(upload_timeout_user_message(load_request_timeout_secs()));
-                        }
-                    }
-                    log_rpc_error(&format!("Request error {}: {}", endpoint, e));
                 }
             }
-        }
 
-        if !success {
-            // mark chunk files as failed
-            for (_p, fname) in &chunk_pairs {
-                failed.push(fname.clone());
+            for (fname, hash) in &outcome.duplicates {
+                duplicates.push((fname.clone(), hash.clone()));
+                if let Some((p, _)) = chunk_pairs.iter().find(|(_, f)| f == fname) {
+                    if std::fs::remove_file(p).is_ok() {
+                        log_rpc_debug(&format!("Deleted duplicate local file: {}", p.display()));
+                        remove_ready_file(p);
+                        record_uploaded_file(
+                            fname,
+                            &file_owner,
+                            &series_total_files,
+                            &mut series_handled_files,
+                            &study_total_series,
+                            &mut study_completed_series,
+                            &tx,
+                        );
+                    } else {
+                        log_rpc_warn(&format!("Failed to delete duplicate local file: {}", p.display()));
+                    }
+                }
             }
-        }
-            // update processed count and notify progress
+
+            for f in outcome.failed { failed.push(f); }
+            for s in outcome.duplicate_series { duplicate_series.insert(s); }
+
+            if !outcome.succeeded {
+                for (_, fname) in chunk_pairs { failed.push(fname.clone()); }
+            }
+
             files_processed = files_processed.saturating_add(chunk_pairs.len());
             if let Some(ref s) = tx {
                 if total_files > 0 {
@@ -1409,6 +1499,7 @@ pub fn upload_anon_dir(anon_dir: &Path, case_id: Option<&str>, tx: Option<std::s
                     let _ = s.send(format!("PROC:PROG:{}", prog));
                 }
             }
+        }
     }
 
     if saw_timeout {
@@ -1504,11 +1595,7 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
         {
             let status = r.status();
             if let Ok(body) = r.text() {
-                if let Some(pf) = save_body_to_file(&body) {
-                    log_rpc_debug(&format!("Response {}: {} BODY_FILE:{}", hash_check_url, status, pf.display()));
-                } else {
-                    log_rpc_warn(&format!("Response {}: {} body: (failed to save body)", hash_check_url, status));
-                }
+                log_rpc_debug(&format!("Response {}: {} ({} bytes)", hash_check_url, status, body.len()));
                 if status.is_success() {
                     if let Ok(map) = serde_json::from_str::<serde_json::Value>(&body) {
                         if let Some(obj) = map.as_object() {
@@ -1769,9 +1856,12 @@ pub fn store_last_scan(series: Vec<SeriesInfo>) {
     }
 }
 
-pub fn get_last_scan() -> Option<Vec<SeriesInfo>> {
-    if let Ok(g) = LAST_SCAN.lock() {
-        return g.clone();
+/// Take the last scan result, transferring ownership to the caller. This avoids
+/// deep-cloning the (potentially large) series list on the UI thread; a fresh
+/// result is stored before each `scan_written` notification.
+pub fn take_last_scan() -> Option<Vec<SeriesInfo>> {
+    if let Ok(mut g) = LAST_SCAN.lock() {
+        return g.take();
     }
     None
 }

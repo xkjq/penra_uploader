@@ -54,11 +54,9 @@ fn test_export_processing_enqueues_and_anonymizes() {
         }
     }
 
-    // Verify anonymized file and anon map exist in anon dir
+    // Verify anonymized file exists in anon dir
     let anon_file = anon.join("test1.dcm");
-    let anon_map = anon.join("test1.dcm.anon_map.json");
     assert!(anon_file.exists(), "anonymized file missing: {}", anon_file.display());
-    assert!(anon_map.exists(), "anon map missing: {}", anon_map.display());
 
     // Ensure processing directory was cleaned up
     let processing_parent = tmp.path().join("processing");
@@ -117,9 +115,7 @@ fn test_multiple_files_and_repeated_exports() {
     // Verify all four anonymized files present
     for name in &["a1.dcm", "a2.dcm", "b1.dcm", "b2.dcm"] {
         let f = anon.join(name);
-        let map = anon.join(format!("{}.anon_map.json", name));
         assert!(f.exists(), "missing anonymized file {}", f.display());
-        assert!(map.exists(), "missing anon map for {}", name);
     }
 
     // Ensure processing directory was cleaned up

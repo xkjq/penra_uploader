@@ -1,4 +1,4 @@
-use dicom_object::{open_file, FileDicomObject, DefaultDicomObject, Tag};
+use dicom_object::{open_file, DefaultDicomObject, Tag};
 use dicom_object::mem::InMemElement;
 use blake3;
 use chrono::{NaiveDate, Duration, NaiveTime, Timelike};
@@ -10,7 +10,6 @@ use num_bigint::BigUint;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::fs;
-use std::fs::File;
 use charls::{CharLS, FrameInfo};
 
 fn hash_bytes(input: &str) -> [u8; 16] {
@@ -539,8 +538,25 @@ fn process_file<D: dicom_core::DataDictionary + Clone>(
 }
 
 pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, preserve_private: bool, permit_burned_in: bool, seed: Option<&str>) -> Result<PathBuf, String> {
-    let mut obj: FileDicomObject<_> = open_file(input).map_err(|e| format!("Failed to open DICOM: {}", e))?;
+    let obj: DefaultDicomObject = open_file(input).map_err(|e| format!("Failed to open DICOM: {}", e))?;
+    let (out_path, _obj) = anonymize_object(obj, input, output_dir, remove_original, preserve_private, permit_burned_in, seed)?;
+    Ok(out_path)
+}
 
+/// Anonymize an already-opened DICOM object and write it to `output_dir`.
+///
+/// Returns the output path together with the anonymized object (pixel data
+/// compressed to JPEG-LS), so callers can read the resulting metadata without
+/// re-opening the file.
+pub fn anonymize_object(
+    mut obj: DefaultDicomObject,
+    input: &Path,
+    output_dir: &Path,
+    remove_original: bool,
+    preserve_private: bool,
+    permit_burned_in: bool,
+    seed: Option<&str>,
+) -> Result<(PathBuf, DefaultDicomObject), String> {
     // Detect Burned In Annotation (0028,0301) and fail unless permitted.
     if let Ok(elem) = obj.element(Tag(0x0028, 0x0301)) {
         if let Ok(s) = elem.to_str() {
@@ -804,23 +820,11 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, pr
 
     obj.write_to_file(&out_path).map_err(|e| format!("write failed: {}", e))?;
 
-    let fname = fname.to_string_lossy();
-    let map_fname = format!("{}.anon_map.json", fname);
-    let map_path = output_dir.join(map_fname);
-    match File::create(&map_path) {
-        Ok(f) => {
-            if let Err(e) = serde_json::to_writer_pretty(f, &map) {
-                eprintln!("Failed to write anon map: {}", e);
-            }
-        }
-        Err(e) => eprintln!("Failed to create anon map file: {}", e),
-    }
-
     if remove_original {
         let _ = fs::remove_file(input);
     }
 
-    Ok(out_path)
+    Ok((out_path, obj))
 }
 
 fn get_u32_tag(obj: &DefaultDicomObject, tag: Tag) -> Option<u32> {

@@ -132,29 +132,36 @@ fn identifying_uis_are_updated() {
 fn repeated_identifying_uis_get_same_values() {
     let tmp = tempdir().expect("tempdir");
     let in_path = tmp.path().join("in.dcm");
-    let out_dir = tmp.path().join("out");
-    std::fs::create_dir_all(&out_dir).unwrap();
+    let out_dir_a = tmp.path().join("out_a");
+    let out_dir_b = tmp.path().join("out_b");
+    std::fs::create_dir_all(&out_dir_a).unwrap();
+    std::fs::create_dir_all(&out_dir_b).unwrap();
 
     copy_fixture("p01_s01_s01_i01.dcm", &in_path);
 
-    let orig = open_file(&in_path).expect("open orig");
-    let orig_uid = orig.element(Tag(0x0008, 0x0018)).ok().and_then(|e| e.to_str().ok()).map(|s| s.into_owned()).expect("orig uid");
+    let res_a = anonymize_file(&in_path, &out_dir_a, false, false, false, None).expect("anonymize a");
+    let res_b = anonymize_file(&in_path, &out_dir_b, false, false, false, None).expect("anonymize b");
 
-    let res = anonymize_file(&in_path, &out_dir, false, false, false, None).expect("anonymize");
-    assert!(res.exists());
-    let map_path = out_dir.join(format!("{}.anon_map.json", in_path.file_name().unwrap().to_string_lossy()));
-    let map_contents = std::fs::read_to_string(&map_path).expect("read map");
-    assert!(map_contents.contains(&format!("UID:{}", orig_uid)), "map did not contain expected UID mapping");
+    let out_a = open_file(&res_a).expect("open a");
+    let out_b = open_file(&res_b).expect("open b");
+
+    // Deterministic pseudonymization: the same identifying UIDs must map to the
+    // same anonymized values across repeated runs.
+    for tag in [Tag(0x0008, 0x0018), Tag(0x0020, 0x000D), Tag(0x0020, 0x000E)] {
+        let a = out_a.element(tag).ok().and_then(|e| e.to_str().ok()).map(|s| s.into_owned());
+        let b = out_b.element(tag).ok().and_then(|e| e.to_str().ok()).map(|s| s.into_owned());
+        assert!(a.is_some(), "missing UID {:?} in first output", tag);
+        assert_eq!(a, b, "UID {:?} not deterministic across runs", tag);
+    }
 }
 
 #[test]
 fn issuer_of_patient_id_changed_if_not_empty_and_not_added_if_empty() {
     let tmp = tempdir().expect("tempdir");
-    let in_path = tmp.path().join("in.dcm");
     let out_dir = tmp.path().join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
 
-    // Case: not empty -> ensure anonymizer ran and wrote anon map
+    // Case: not empty -> ensure issuer is cleared
     let obj_path = tmp.path().join("case1.dcm");
     {
         let mut obj = InMemDicomObject::new_empty();
@@ -166,10 +173,11 @@ fn issuer_of_patient_id_changed_if_not_empty_and_not_added_if_empty() {
     }
     let res = anonymize_file(&obj_path, &out_dir, false, false, false, None).expect("anonymize case1");
     assert!(res.exists());
-    let map_path = out_dir.join(format!("{}.anon_map.json", obj_path.file_name().unwrap().to_string_lossy()));
-    assert!(map_path.exists());
+    let out1 = open_file(&res).expect("open case1 output");
+    let issuer = out1.element(Tag(0x0010,0x0021)).ok().and_then(|e| e.to_str().ok()).map(|s| s.into_owned());
+    assert!(issuer.as_deref().map(|s| s != "ISSUER").unwrap_or(true), "issuer was not cleared: {:?}", issuer);
 
-    // Case: empty -> ensure anonymizer ran and wrote anon map
+    // Case: empty -> ensure issuer is not added
     let in_path2 = tmp.path().join("case2.dcm");
     {
         let mut obj = InMemDicomObject::new_empty();
@@ -182,8 +190,8 @@ fn issuer_of_patient_id_changed_if_not_empty_and_not_added_if_empty() {
     std::fs::create_dir_all(&out_dir2).unwrap();
     let res2 = anonymize_file(&in_path2, &out_dir2, false, false, false, None).expect("anonymize case2");
     assert!(res2.exists());
-    let map_path2 = out_dir2.join(format!("{}.anon_map.json", in_path2.file_name().unwrap().to_string_lossy()));
-    assert!(map_path2.exists());
+    let out2 = open_file(&res2).expect("open case2 output");
+    assert!(out2.element(Tag(0x0010,0x0021)).is_err(), "issuer should not be added when absent");
 }
 
 #[test]

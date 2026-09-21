@@ -220,8 +220,8 @@ impl Default for AppState {
 }
 
 impl eframe::App for AppState {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("Template Editor");
             ui.horizontal(|ui| {
                 if ui.button("New").clicked() {
@@ -343,7 +343,7 @@ impl eframe::App for AppState {
             });
 
             if self.show_editor {
-                egui::Window::new("Edit Template").show(ctx, |ui| {
+                egui::Window::new("Edit Template").show(ui.ctx(), |ui| {
                     if let Some(mut t) = self.editing.clone() {
                         ui.horizontal(|ui| { ui.label("ID:"); let mut idv = t.id.clone().unwrap_or_default(); ui.text_edit_singleline(&mut idv); if idv.is_empty() { t.id = None } else { t.id = Some(idv) } });
                         ui.horizontal(|ui| { ui.label("Title:"); let mut tv = t.title.clone().unwrap_or_default(); ui.text_edit_singleline(&mut tv); if tv.is_empty() { t.title = None } else { t.title = Some(tv) } });

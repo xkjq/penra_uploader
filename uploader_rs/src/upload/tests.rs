@@ -101,4 +101,88 @@ fn test_calculate_pixel_hash_jpegls_matches_uncompressed() {
     assert_eq!(raw_hash, jpegls_hash, "Pixel hash of uncompressed and JPEG-LS compressed must match");
 }
 
+#[test]
+fn test_pixel_hash_cache_validates_size_and_mtime() {
+    let td = tempdir().unwrap();
+    let f = td.path().join("cache_probe.bin");
+    fs::write(&f, b"hello").unwrap();
+
+    let md = std::fs::metadata(&f).unwrap();
+    let size = md.len();
+    let mtime = file_mtime_secs(&md);
+
+    assert!(get_cached_pixel_hash(&f, size, mtime).is_none());
+
+    cache_pixel_hash(&f, "abc123");
+    assert_eq!(get_cached_pixel_hash(&f, size, mtime).as_deref(), Some("abc123"));
+
+    // Any change to size or mtime must invalidate the entry.
+    assert!(get_cached_pixel_hash(&f, size + 1, mtime).is_none());
+    assert!(get_cached_pixel_hash(&f, size, mtime + 1).is_none());
+
+    evict_cached_pixel_hash(&f);
+    assert!(get_cached_pixel_hash(&f, size, mtime).is_none());
+}
+
+#[test]
+fn test_ready_meta_cache_fast_path() {
+    let td = tempdir().unwrap();
+    let f = td.path().join("meta_cache.dcm");
+    make_minimal_dcm(&f, "2.25.9999", "Doe^John");
+
+    // Populate the metadata cache from an already-open object.
+    let obj = open_file(&f).expect("open");
+    cache_ready_file_from_obj(&f, &obj, Some("deadbeef".to_string()));
+
+    let md = std::fs::metadata(&f).unwrap();
+    let size = md.len();
+    let mtime = file_mtime_secs(&md);
+
+    let cached = get_cached_ready_meta(&f, size, mtime).expect("cached meta");
+    assert_eq!(cached.hash, "deadbeef");
+    assert_eq!(cached.series_uid, "NO_SERIES");
+    // A different size/mtime must invalidate the cached entry.
+    assert!(get_cached_ready_meta(&f, size + 1, mtime).is_none());
+
+    // The scan's upsert should take the fast path and still succeed.
+    upsert_ready_file_internal(&f).expect("upsert from cache");
+
+    // Eviction clears the entry.
+    evict_ready_meta(&f);
+    assert!(get_cached_ready_meta(&f, size, mtime).is_none());
+}
+
+#[test]
+fn test_upload_chunk_parses_response() {
+    let td = tempdir().unwrap();
+    let f1 = td.path().join("a.dcm");
+    let f2 = td.path().join("b.dcm");
+    fs::write(&f1, b"x").unwrap();
+    fs::write(&f2, b"y").unwrap();
+
+    let server = MockServer::start();
+    let _m = server.mock(|when, then| {
+        when.method(POST).path("/api/atlas/upload_dicom");
+        then.status(200).json_body_obj(&serde_json::json!({
+            "uploaded": [["a.dcm", "h1"], ["b.dcm", "h2"]],
+            "duplicates": [],
+            "failed": [],
+            "duplicate_series": []
+        }));
+    });
+
+    let client = make_client(None).expect("client");
+    let endpoint = format!("{}/api/atlas/upload_dicom", server.url(""));
+    let pairs = vec![
+        (f1, "a.dcm".to_string()),
+        (f2, "b.dcm".to_string()),
+    ];
+
+    let out = upload_chunk(&client, &endpoint, &pairs);
+    assert!(out.succeeded, "chunk should succeed");
+    assert_eq!(out.uploaded.len(), 2);
+    assert!(out.duplicates.is_empty());
+    assert!(!out.saw_timeout);
+}
+
 

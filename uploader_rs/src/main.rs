@@ -1,6 +1,8 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use eframe::{egui, NativeOptions};
 use egui::CentralPanel;
-use dicor_rs::anonymize_file;
+use dicor_rs::{anonymize_file, anonymize_object};
 mod upload;
 mod assets;
 mod install;
@@ -16,7 +18,7 @@ use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use rayon::prelude::*;
 use std::fs;
 use rfd::FileDialog;
-use interprocess::local_socket::{LocalSocketListener, LocalSocketStream};
+use interprocess::local_socket::{prelude::*, ConnectOptions, GenericFilePath, ListenerOptions};
 use std::io::{Read, Write};
 use fs2::FileExt;
 use chrono::Utc;
@@ -27,6 +29,17 @@ use once_cell::sync::OnceCell;
 use tracing_subscriber::prelude::*;
 
 static FILTER_RELOADER: OnceCell<Box<dyn Fn(EnvFilter) -> Result<(), String> + Send + Sync>> = OnceCell::new();
+
+// Local-socket IPC helpers (interprocess 2.x requires converting the name first).
+fn connect_ipc(name: &str) -> std::io::Result<LocalSocketStream> {
+    name.to_fs_name::<GenericFilePath>()
+        .and_then(|n| ConnectOptions::new().name(n).connect_sync())
+}
+
+fn bind_ipc(name: &str) -> std::io::Result<LocalSocketListener> {
+    name.to_fs_name::<GenericFilePath>()
+        .and_then(|n| ListenerOptions::new().name(n).create_sync())
+}
 
 const MAX_UI_MESSAGES_PER_FRAME: usize = 256;
 const MAX_PROCESSED_MESSAGES: usize = 5_000;
@@ -96,34 +109,53 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                         let tx = tx.clone();
                         let processed_count = processed_count.clone();
                         let seed = seed_clone.clone();
-                        match anonymize_file(p, &anon_dir, true, false, false, seed.as_deref()) {
-                            Ok(out) => {
-                                let _ = tx.send(format!("Anonymized: {}", out.display()));
-                                let pixel_hash = upload::calculate_pixel_hash(&out);
-                                if let Some(hash_hex) = &pixel_hash {
+                        // Open each input once, hash its pixels, then anonymize the
+                        // same in-memory object. Compression is lossless, so the
+                        // input digest equals the output's, and the anonymized
+                        // object lets us register ready-file metadata without
+                        // re-opening the output.
+                        let obj = match dicom_object::open_file(p) {
+                            Ok(o) => o,
+                            Err(e) => {
+                                upload::log_rpc_debug(&format!("Anon skipped {}: {}", p.display(), e));
+                                let done = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
+                                let report_interval = std::cmp::max(1, total_copy / 50);
+                                if (done % report_interval == 0) || (done == total_copy) {
+                                    let _ = tx.send(format!("PROC:PROG:{}", done as f32 / (total_copy as f32)));
+                                }
+                                return;
+                            }
+                        };
+                        let pixel_hash = upload::calculate_pixel_hash_from_obj(&obj);
+                        let handle_ok = |out: &std::path::Path,
+                                             anon_obj: &dicom_object::DefaultDicomObject,
+                                             tx: &std_mpsc::Sender<String>| {
+                            upload::cache_ready_file_from_obj(out, anon_obj, pixel_hash.clone());
+                            match &pixel_hash {
+                                Some(hash_hex) => {
                                     let _ = tx.send(format!("Hash {}: {}", out.display(), hash_hex));
-                                } else {
+                                }
+                                None => {
                                     let _ = tx.send(format!("Hash {}: <no PixelData>", out.display()));
                                 }
-                                if let Err(e) = upload::upsert_ready_file(&out, pixel_hash) {
-                                    let _ = tx.send(format!("Ready-manifest update skipped for {}: {}", out.display(), e));
-                                }
+                            }
+                        };
+                        match anonymize_object(obj, p, &anon_dir, true, false, false, seed.as_deref()) {
+                            Ok((out, anon_obj)) => {
+                                let _ = tx.send(format!("Anonymized: {}", out.display()));
+                                handle_ok(&out, &anon_obj, &tx);
                             }
                             Err(e) => {
                                 if is_burned_in_annotation_error(&e) {
-                                    match anonymize_file(p, &anon_dir, true, false, true, seed.as_deref()) {
-                                        Ok(out) => {
+                                    // Retry: the object was consumed, so re-open.
+                                    match dicom_object::open_file(p)
+                                        .map_err(|e2| format!("reopen failed: {}", e2))
+                                        .and_then(|obj2| anonymize_object(obj2, p, &anon_dir, true, false, true, seed.as_deref()))
+                                    {
+                                        Ok((out, anon_obj)) => {
                                             let _ = tx.send(format!("Anonymized with burned-in flag: {}", out.display()));
                                             let _ = tx.send("Detected Burned In Annotation=YES. This series will require confirmation before upload.".to_string());
-                                            let pixel_hash = upload::calculate_pixel_hash(&out);
-                                            if let Some(hash_hex) = &pixel_hash {
-                                                let _ = tx.send(format!("Hash {}: {}", out.display(), hash_hex));
-                                            } else {
-                                                let _ = tx.send(format!("Hash {}: <no PixelData>", out.display()));
-                                            }
-                                            if let Err(e) = upload::upsert_ready_file(&out, pixel_hash) {
-                                                let _ = tx.send(format!("Ready-manifest update skipped for {}: {}", out.display(), e));
-                                            }
+                                            handle_ok(&out, &anon_obj, &tx);
                                         }
                                         Err(e2) => {
                                             upload::log_rpc_debug(&format!(
@@ -152,7 +184,7 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                     // notify any running instance via local socket
                     let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| format!("pid{}", std::process::id()));
                     let ipc_name = format!("uploader_rs_{}", user);
-                    if let Ok(mut s) = LocalSocketStream::connect(ipc_name.as_str()) {
+                    if let Ok(mut s) = connect_ipc(ipc_name.as_str()) {
                         if s.write_all(b"loaded").is_ok() {
                             let _ = tx.send("Sent IPC 'loaded'".to_string());
                         } else {
@@ -776,28 +808,8 @@ impl AppState {
 
         let p = upload::log_file_path();
         let contents = std::fs::read_to_string(&p).unwrap_or_else(|_| "(no logs)".to_string());
-        let mut display = String::new();
-        for line in contents.lines() {
-            display.push_str(line);
-            display.push('\n');
-            if let Some(idx) = line.find("BODY_FILE:") {
-                let path = line[idx + "BODY_FILE:".len()..].trim();
-                if !path.is_empty() {
-                    if let Ok(body) = std::fs::read_to_string(path) {
-                        display.push_str("---- BODY START ----\n");
-                        display.push_str(&body);
-                        if !body.ends_with('\n') {
-                            display.push('\n');
-                        }
-                        display.push_str("---- BODY END ----\n");
-                    } else {
-                        display.push_str("(failed to read body file)\n");
-                    }
-                }
-            }
-        }
 
-        self.log_cache = display;
+        self.log_cache = contents;
         self.log_cache_last_refresh = Some(now);
     }
 
@@ -903,21 +915,6 @@ impl AppState {
                 return;
             }
         }
-        if m.starts_with("SCAN:SET:") {
-            if let Some(b64) = m.strip_prefix("SCAN:SET:") {
-                if let Ok(json) = base64::decode(b64) {
-                    if let Ok(txt) = String::from_utf8(json) {
-                        if let Ok(v) = serde_json::from_str::<Vec<SeriesInfo>>(&txt) {
-                            self.ready_series = v;
-                            self.selected_series = vec![true; self.ready_series.len()];
-                            self.sync_burned_in_confirmations();
-                            self.last_msg = "Ready-to-upload refreshed".to_string();
-                            return;
-                        }
-                    }
-                }
-            }
-        }
         if m.starts_with("IPC:RECV:") {
             if let Some(text) = m.strip_prefix("IPC:RECV:") {
                 let txt = text.trim().to_string();
@@ -966,7 +963,7 @@ impl AppState {
         } else if m == "scan_written" {
             self.duplicate_refresh_in_progress = false;
             // retrieve the parsed scan result stored by the background thread
-            if let Some(v) = upload::get_last_scan() {
+            if let Some(v) = upload::take_last_scan() {
                 self.ready_series = v;
                 self.selected_series = vec![true; self.ready_series.len()];
                 self.sync_burned_in_confirmations();
@@ -1028,19 +1025,19 @@ impl AppState {
 }
 
 impl eframe::App for AppState {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if self.log_window_open || self.about_open {
             self.refresh_log_cache(false);
         }
 
         // apply visuals based on saved theme
         if self.theme_dark {
-            ctx.set_visuals(egui::Visuals::dark());
+            ui.set_visuals(egui::Visuals::dark());
         } else {
-            ctx.set_visuals(egui::Visuals::light());
+            ui.set_visuals(egui::Visuals::light());
         }
 
-        CentralPanel::default().show(ctx, |ui| {
+        CentralPanel::default().show(ui, |ui| {
             // Sticky header: stays fixed while the central content scrolls
             ui.horizontal(|ui| {
                 ui.heading("Uploader (Rust)");
@@ -1145,7 +1142,7 @@ impl eframe::App for AppState {
 
                 // Import dialog (modal)
                 if self.import_dialog_open {
-                    egui::Window::new("Import from folder").collapsible(false).resizable(false).show(ctx, |ui| {
+                    egui::Window::new("Import from folder").collapsible(false).resizable(false).show(ui.ctx(), |ui| {
                         ui.horizontal(|ui| {
                             ui.label("Source folder:");
                             if let Some(p) = &self.import_src {
@@ -1163,7 +1160,7 @@ impl eframe::App for AppState {
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut self.move_files, "Move files (don't keep originals)");
                             let mut depth = self.recurse_depth;
-                            let resp = ui.add(egui::widgets::DragValue::new(&mut depth).clamp_range(-1..=100).speed(1.0));
+                            let resp = ui.add(egui::widgets::DragValue::new(&mut depth).range(-1..=100).speed(1.0));
                             if resp.changed() { self.recurse_depth = depth; }
                             ui.label("Recursion depth (-1 = infinite)");
                         });
@@ -1305,7 +1302,7 @@ impl eframe::App for AppState {
                 }
                 if drained == MAX_UI_MESSAGES_PER_FRAME {
                     // Keep pumping quickly if there is a backlog without stalling a frame.
-                    ctx.request_repaint();
+                    ui.ctx().request_repaint();
                 }
                 self.rx = Some(rx);
             }
@@ -1385,8 +1382,6 @@ impl eframe::App for AppState {
                                         if let Ok(json2) = serde_json::to_string(&new_series) {
                                             upload::store_last_scan(new_series.clone());
                                             let _ = std::fs::write(".last_scan.json", &json2);
-                                            let b64 = base64::encode(json2.as_bytes());
-                                            let _ = tx.send(format!("SCAN:SET:{}", b64));
                                             let _ = tx.send("scan_written".to_string());
                                         }
                                     }
@@ -1448,8 +1443,6 @@ impl eframe::App for AppState {
                                         if let Ok(json2) = serde_json::to_string(&new_series) {
                                             upload::store_last_scan(new_series.clone());
                                             let _ = std::fs::write(".last_scan.json", &json2);
-                                            let b64 = base64::encode(json2.as_bytes());
-                                            let _ = tx.send(format!("SCAN:SET:{}", b64));
                                             let _ = tx.send("scan_written".to_string());
                                         }
                                         let _ = tx.send(format!("duplicates_cleared:{}", deleted));
@@ -1521,7 +1514,7 @@ impl eframe::App for AppState {
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Study order:");
-                    egui::ComboBox::from_id_source("study-sort-mode")
+                    egui::ComboBox::from_id_salt("study-sort-mode")
                         .selected_text(self.study_sort_mode.label())
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.study_sort_mode, StudySortMode::LoadedOrder, StudySortMode::LoadedOrder.label());
@@ -1538,7 +1531,7 @@ impl eframe::App for AppState {
                     }
                     ui.add_space(12.0);
                     ui.label("Series order:");
-                    egui::ComboBox::from_id_source("series-sort-mode")
+                    egui::ComboBox::from_id_salt("series-sort-mode")
                         .selected_text(self.series_sort_mode.label())
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.series_sort_mode, SeriesSortMode::LoadedOrder, SeriesSortMode::LoadedOrder.label());
@@ -1762,7 +1755,7 @@ impl eframe::App for AppState {
                                     }
                                     egui::CollapsingHeader::new(format!("Files ({})", series.files.len()))
                                         .default_open(false)
-                                        .id_source(format!("files-{}", si))
+                                        .id_salt(format!("files-{}", si))
                                         .show(ui, |ui| {
                                             for f in &series.files {
                                                 ui.horizontal(|ui| {
@@ -1828,8 +1821,6 @@ impl eframe::App for AppState {
                                                 if let Ok(json2) = serde_json::to_string(&new_series) {
                                                     upload::store_last_scan(new_series.clone());
                                                     let _ = std::fs::write(".last_scan.json", &json2);
-                                                    let b64 = base64::encode(json2.as_bytes());
-                                                    let _ = tx.send(format!("SCAN:SET:{}", b64));
                                                     let _ = tx.send("scan_written".to_string());
                                                 }
                                                 let _ = tx.send(format!("Deleted series files: {}", deleted));
@@ -1839,7 +1830,7 @@ impl eframe::App for AppState {
                                     });
 
                                     if self.split_series_open == Some(si) {
-                                        egui::Frame::none()
+                                        egui::Frame::NONE
                                             .fill(if self.theme_dark {
                                                 egui::Color32::from_rgb(40, 40, 55)
                                             } else {
@@ -1873,8 +1864,6 @@ impl eframe::App for AppState {
                                                                     if let Ok(json2) = serde_json::to_string(&new_series) {
                                                                         upload::store_last_scan(new_series.clone());
                                                                         let _ = std::fs::write(".last_scan.json", &json2);
-                                                                        let b64 = base64::encode(json2.as_bytes());
-                                                                        let _ = tx.send(format!("SCAN:SET:{}", b64));
                                                                         let _ = tx.send("scan_written".to_string());
                                                                     }
                                                                 }
@@ -1922,7 +1911,7 @@ impl eframe::App for AppState {
                 ui.horizontal(|ui| {
                     ui.label("Parallel file operations:");
                     let mut anon_i = self.anon_threads as i32;
-                    let resp = ui.add(egui::widgets::DragValue::new(&mut anon_i).clamp_range(1..= (num_cpus::get() as i32 * 2)).speed(1.0));
+                    let resp = ui.add(egui::widgets::DragValue::new(&mut anon_i).range(1..= (num_cpus::get() as i32 * 2)).speed(1.0));
                     if resp.changed() {
                         self.anon_threads = anon_i.max(1) as usize;
                     }
@@ -1933,7 +1922,7 @@ impl eframe::App for AppState {
                     let mut timeout_i = self.request_timeout_secs as i64;
                     let resp = ui.add(
                         egui::widgets::DragValue::new(&mut timeout_i)
-                            .clamp_range(5..=600)
+                            .range(5..=600)
                             .speed(1.0),
                     );
                     if resp.changed() {
@@ -1982,7 +1971,7 @@ impl eframe::App for AppState {
                 ui.horizontal(|ui| {
                     ui.label("Log level:");
                     let mut current = self.log_level.clone();
-                    egui::ComboBox::from_id_source("log_level_combo").selected_text(&current).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("log_level_combo").selected_text(&current).show_ui(ui, |ui| {
                         for &lvl in &["trace", "debug", "info", "warn", "error"] {
                             if ui.selectable_value(&mut current, lvl.to_string(), lvl).clicked() {
                                 // selection handled below
@@ -2049,7 +2038,7 @@ impl eframe::App for AppState {
 
             // Confirmation modal for Remove all
             if self.confirm_remove_all {
-                egui::Window::new("Confirm remove all").collapsible(false).resizable(false).show(ctx, |ui| {
+                egui::Window::new("Confirm remove all").collapsible(false).resizable(false).show(ui.ctx(), |ui| {
                     ui.label("This will permanently delete all anonymised files in the anon directory. This cannot be undone.");
                     ui.horizontal(|ui| {
                         if ui.add(egui::Button::new("Yes, remove all").fill(egui::Color32::from_rgb(180,20,20))).clicked() {
@@ -2092,8 +2081,6 @@ impl eframe::App for AppState {
                                         upload::store_last_scan(empty.clone());
                                         if let Ok(json2) = serde_json::to_string(&empty) {
                                             let _ = std::fs::write(".last_scan.json", &json2);
-                                            let b64 = base64::encode(json2.as_bytes());
-                                            let _ = tx.send(format!("SCAN:SET:{}", b64));
                                             let _ = tx.send("scan_written".to_string());
                                         }
                                         let _ = tx.send(format!("removed_all:{}", removed));
@@ -2115,7 +2102,7 @@ impl eframe::App for AppState {
             // Metadata single-view window
             if self.metadata_window_open {
                 if let Some((title, map)) = &self.metadata_single {
-                    egui::Window::new(format!("Metadata: {}", title)).open(&mut self.metadata_window_open).show(ctx, |ui| {
+                    egui::Window::new(format!("Metadata: {}", title)).open(&mut self.metadata_window_open).show(ui.ctx(), |ui| {
                         egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
                             for (k, v) in map {
                                 ui.horizontal(|ui| { ui.label(format!("{}:", k)); ui.label(v); });
@@ -2130,7 +2117,7 @@ impl eframe::App for AppState {
                 let mut log_open = self.log_window_open;
                 let mut do_refresh_logs = false;
                 let mut do_clear_logs = false;
-                egui::Window::new("Request/Response Logs").open(&mut log_open).show(ctx, |ui| {
+                egui::Window::new("Request/Response Logs").open(&mut log_open).show(ui.ctx(), |ui| {
                     let mut txt = self.log_cache.clone();
                     egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
                         ui.add(egui::TextEdit::multiline(&mut txt).desired_rows(20).desired_width(ui.available_width()));
@@ -2158,7 +2145,7 @@ impl eframe::App for AppState {
             // Metadata compare window (side-by-side)
             if self.metadata_compare_open {
                 let mut compare_open = self.metadata_compare_open;
-                egui::Window::new("Compare metadata").open(&mut compare_open).show(ctx, |ui| {
+                egui::Window::new("Compare metadata").open(&mut compare_open).show(ui.ctx(), |ui| {
                     if self.metadata_compare.is_empty() {
                         ui.label("No files to compare");
                         return;
@@ -2231,7 +2218,7 @@ impl eframe::App for AppState {
                         raw.push(c.r()); raw.push(c.g()); raw.push(c.b()); raw.push(c.a());
                     }
                     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &raw);
-                    let handle = ctx.load_texture("about_logo", color_image, egui::TextureOptions::default());
+                    let handle = ui.ctx().load_texture("about_logo", color_image, egui::TextureOptions::default());
                     self.logo_tex = Some(handle);
                 } else {
                     tracing::warn!("Failed to load about logo image");
@@ -2246,7 +2233,7 @@ impl eframe::App for AppState {
                 .anchor(egui::Align2::RIGHT_TOP, egui::Vec2::new(-10.0, 40.0))
                 .default_size(egui::vec2(600.0, 400.0))
                 .resizable(true)
-                .show(ctx, |ui| {
+                .show(ui.ctx(), |ui| {
                     ui.horizontal(|ui| {
                         if let Some(tex) = &self.logo_tex {
                             let sz = egui::vec2(96.0, 96.0);
@@ -2289,7 +2276,7 @@ impl eframe::App for AppState {
         let now = Instant::now();
         self.toasts.retain(|(_m, exp)| *exp > now);
         if !self.toasts.is_empty() {
-            egui::Area::new("toasts_area".into()).anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0)).show(ctx, |ui| {
+            egui::Area::new("toasts_area".into()).anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0)).show(ui.ctx(), |ui| {
                 ui.vertical(|ui| {
                     for (msg, exp) in &self.toasts {
                         let remaining = exp.saturating_duration_since(now);
@@ -2298,7 +2285,7 @@ impl eframe::App for AppState {
                         // Draw a rounded colored frame with white text to make toasts stand out
                         egui::Frame::default()
                             .fill(egui::Color32::from_rgb(30, 144, 255)) // DodgerBlue background
-                            .rounding(egui::Rounding::same(6))
+                            .corner_radius(egui::CornerRadius::same(6))
                             .show(ui, |ui| {
                                 ui.colored_label(egui::Color32::WHITE, label);
                             });
@@ -2313,7 +2300,38 @@ impl eframe::App for AppState {
 #[cfg(test)]
 mod processing_workflow_tests;
 
+// When built as a GUI-subsystem binary, a process launched from a terminal is
+// not attached to that terminal's console, so its stdout/stderr vanish. Try to
+// attach to the parent console so log output is visible when the user runs the
+// program from a shell, while staying headless when launched by double-click.
+#[cfg(windows)]
+fn attach_parent_console() -> bool {
+    use std::ffi::c_void;
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(dw_process_id: u32) -> i32;
+        fn GetConsoleWindow() -> *mut c_void;
+    }
+    unsafe {
+        // Already have a console (e.g. a debug build launched from a shell).
+        if !GetConsoleWindow().is_null() {
+            return true;
+        }
+        AttachConsole(ATTACH_PARENT_PROCESS) != 0
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() -> bool {
+    true
+}
+
 fn main() {
+    // Attach to the invoking terminal (if any) before logging is configured so
+    // that console output can be enabled below.
+    use std::io::IsTerminal;
+    let console_attached = attach_parent_console() && std::io::stderr().is_terminal();
     // Initialize structured logging (writes to ~/.uploader/request_log.txt).
     // Uses `RUST_LOG` env var for filter (defaults to info).
     let log_path = upload::log_file_path();
@@ -2336,7 +2354,17 @@ fn main() {
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
         .with_target(false);
-    tracing_subscriber::registry().with(filter_layer).with(fmt_layer).init();
+    // Mirror logs to the terminal when the program was launched from one.
+    let console_layer = if console_attached {
+        Some(tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_target(false))
+    } else {
+        None
+    };
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(fmt_layer)
+        .with(console_layer)
+        .init();
     let reloader = Box::new(move |f: EnvFilter| -> Result<(), String> {
         handle.reload(f).map_err(|e| format!("{:?}", e))
     });
@@ -2394,7 +2422,7 @@ fn main() {
                 Ok(f) => {
                     if let Err(_) = f.try_lock_exclusive() {
                         // lock failed -> another instance likely running; notify it and exit
-                        if let Ok(mut stream) = LocalSocketStream::connect(ipc_name.as_str()) {
+                        if let Ok(mut stream) = connect_ipc(ipc_name.as_str()) {
                             let _ = stream.write_all(b"loaded");
                         }
                         std::process::exit(0);
@@ -2470,7 +2498,7 @@ fn main() {
             // Attempt to bind; if address is in use, try to connect to see if another
             // process owns it. If connection fails, on Unix try removing a stale
             // socket file and retry bind once.
-            match LocalSocketListener::bind(ipc_name_clone.as_str()) {
+            match bind_ipc(ipc_name_clone.as_str()) {
                 Ok(listener) => {
                     let _ = tx_clone.send(format!("IPC listener bound: {}", ipc_name_clone));
                     loop {
@@ -2507,7 +2535,7 @@ fn main() {
                         // Someone is bound to this name. Try connecting — if connect
                         // succeeds, another live process owns it; otherwise, we may
                         // have a stale socket file to clean up (Unix).
-                        match LocalSocketStream::connect(ipc_name_clone.as_str()) {
+                        match connect_ipc(ipc_name_clone.as_str()) {
                             Ok(_) => {
                                 let _ = tx_clone.send(format!("IPC listener already running: {}", ipc_name_clone));
                             }
@@ -2520,7 +2548,7 @@ fn main() {
                                         let _ = std::fs::remove_file(path);
                                     }
                                 }
-                                match LocalSocketListener::bind(ipc_name_clone.as_str()) {
+                                match bind_ipc(ipc_name_clone.as_str()) {
                                     Ok(listener) => {
                                         let _ = tx_clone.send(format!("IPC listener rebound after cleanup: {}", ipc_name_clone));
                                         loop {

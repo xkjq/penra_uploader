@@ -1536,10 +1536,10 @@ impl DicomViewApp {
 }
 
 impl eframe::App for DicomViewApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Process any pending file load (first frame, or after Open dialog)
         if let Some(paths) = self.pending_load.take() {
-            self.load_files(paths, ctx);
+            self.load_files(paths, ui.ctx());
         }
 
         // ── Poll background loading thread ─────────────────────────────────
@@ -1555,7 +1555,7 @@ impl eframe::App for DicomViewApp {
                                 let color_image = egui::ColorImage::from_rgba_unmultiplied([tw, th], rgba);
                                 // Use filename as cache key
                                 let key = image.filename.clone();
-                                let tex = ctx.load_texture(format!("thumb_{}", key), color_image, egui::TextureOptions::LINEAR);
+                                let tex = ui.ctx().load_texture(format!("thumb_{}", key), color_image, egui::TextureOptions::LINEAR);
                                 self.thumbnail_textures.insert(key.clone(), tex);
                             }
                             self.images.push(image);
@@ -1581,29 +1581,29 @@ impl eframe::App for DicomViewApp {
             self.loading = None;
             self.rebuild_series_groups();
             self.apply_default_window_for_current_series();
-            self.update_current_slice_view(ctx);
+            self.update_current_slice_view(ui.ctx());
         }
 
         // Rebuild texture when window/level values change for active viewport
         if self.vp().wl_dirty {
-            self.update_current_slice_view(ctx);
+            self.update_current_slice_view(ui.ctx());
         }
 
         // Drag-and-drop: detect hovered and dropped files
-        ctx.input(|i| {
+        ui.ctx().input(|i| {
             self.files_hovered = !i.raw.hovered_files.is_empty();
         });
 
-        let dropped: Vec<PathBuf> = ctx.input(|i| {
-            i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+        let dropped: Vec<PathBuf> = ui.ctx().input(|i| {
+            i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect()
         });
         if !dropped.is_empty() {
             self.files_hovered = false;
-            self.load_files(dropped, ctx);
+            self.load_files(dropped, ui.ctx());
         }
 
         // Clear the locked zoom anchor once the zoom-drag gesture ends.
-        let zoom_dragging = ctx.input(|i| {
+        let zoom_dragging = ui.ctx().input(|i| {
             i.pointer.button_down(egui::PointerButton::Primary)
                 && i.pointer.button_down(egui::PointerButton::Secondary)
         });
@@ -1616,7 +1616,7 @@ impl eframe::App for DicomViewApp {
         // Clear the rotation anchor as soon as the rotate button is released, so
         // that a new rotate gesture starts from the current pointer position and
         // does not jump to the angle of the previous gesture.
-        let rotate_held = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Extra1));
+        let rotate_held = ui.ctx().input(|i| i.pointer.button_down(egui::PointerButton::Extra1));
         if !rotate_held {
             for vp in &mut self.viewports {
                 vp.rotation_drag_last_pos = None;
@@ -1624,7 +1624,7 @@ impl eframe::App for DicomViewApp {
         }
 
         // Keyboard navigation: arrow keys (operates on active viewport)
-        ctx.input(|i| {
+        ui.ctx().input(|i| {
             if i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowLeft) {
                 let current = match self.vp().view_mode {
                     ViewMode::Stack => self.vp().current_stack_slice,
@@ -1655,7 +1655,7 @@ impl eframe::App for DicomViewApp {
         });
 
         // ── Toolbar ───────────────────────────────────────────────────────────
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if self.series_groups.is_empty() {
                     if ui.button("📄 Open Files").clicked() {
@@ -1980,12 +1980,13 @@ impl eframe::App for DicomViewApp {
             }
 
             if !metadata.is_empty() {
-                egui::SidePanel::right("metadata_panel")
-                    .min_width(180.0)
-                    .max_width(300.0)
-                    .default_width(220.0)
+                let mut show_metadata = self.show_metadata;
+                egui::Panel::right("metadata_panel")
+                    .min_size(180.0)
+                    .max_size(300.0)
+                    .default_size(220.0)
                     .resizable(true)
-                    .show_animated(ctx, self.show_metadata, |ui| {
+                    .show_collapsible(ui, &mut show_metadata, |ui| {
                         ui.horizontal(|ui| {
                             ui.heading("Metadata");
                             ui.with_layout(
@@ -2015,11 +2016,15 @@ impl eframe::App for DicomViewApp {
                                 });
                         });
                     });
+                if !self.show_metadata {
+                    show_metadata = false;
+                }
+                self.show_metadata = show_metadata;
             }
         }
 
         // ── Image panel ───────────────────────────────────────────────────────
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             if let Some(err) = &self.error.clone() {
                 ui.centered_and_justified(|ui| {
                     ui.colored_label(
@@ -2186,7 +2191,7 @@ impl eframe::App for DicomViewApp {
                                             egui::Sense::click_and_drag(),
                                         );
                                         if scroll_resp.hovered() {
-                                            ctx.set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
                                         }
                                         if scroll_resp.dragged() || scroll_resp.clicked() {
                                             if let Some(pointer) = scroll_resp.interact_pointer_pos() {
@@ -2236,7 +2241,7 @@ impl eframe::App for DicomViewApp {
                                                 if changed {
                                                     self.active_viewport = idx;
                                                     self.viewports[idx].wl_dirty = true;
-                                                    self.update_current_slice_view(ctx);
+                                                    self.update_current_slice_view(ui.ctx());
                                                 }
                                             }
                                         }
@@ -2278,7 +2283,7 @@ impl eframe::App for DicomViewApp {
                                     self.active_viewport = idx;
                                     // Refresh the toolbar (window/level presets etc.)
                                     // immediately so it reflects the new active viewport.
-                                    ctx.request_repaint();
+                                    ui.ctx().request_repaint();
                                 }
                             }
 
@@ -2353,7 +2358,7 @@ impl eframe::App for DicomViewApp {
                             }
 
                             // Per-cell scroll: change slice (if stack/MPR) or zoom (single image)
-                            let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
+                            let scroll_delta = ui.ctx().input(|i| i.smooth_scroll_delta.y);
                             if response.hovered() && scroll_delta != 0.0 {
                                 let prev_active = self.active_viewport;
                                 self.active_viewport = idx;
@@ -2369,7 +2374,7 @@ impl eframe::App for DicomViewApp {
                                                 ViewMode::Mpr => self.set_current_mpr_slice(current - 1),
                                             }
                                             self.vp_mut().wl_dirty = true;
-                                            self.update_current_slice_view(ctx);
+                                            self.update_current_slice_view(ui.ctx());
                                         }
                                     } else {
                                         let current = match self.vp().view_mode {
@@ -2382,7 +2387,7 @@ impl eframe::App for DicomViewApp {
                                                 ViewMode::Mpr => self.set_current_mpr_slice(current + 1),
                                             }
                                             self.vp_mut().wl_dirty = true;
-                                            self.update_current_slice_view(ctx);
+                                            self.update_current_slice_view(ui.ctx());
                                         }
                                     }
                                 } else {
@@ -2406,12 +2411,12 @@ impl eframe::App for DicomViewApp {
                                 self.vp_mut().pan = Vec2::ZERO;
                                 self.apply_default_window_for_current_series();
                                 self.vp_mut().wl_dirty = true;
-                                self.update_current_slice_view(ctx);
+                                self.update_current_slice_view(ui.ctx());
                                 self.active_viewport = prev_active;
                             }
 
                             // Per-cell drag interactions (pan / rotate / window/level / slice)
-                            let (left_down, right_down, middle_down, side1_down) = ctx.input(|i| {
+                            let (left_down, right_down, middle_down, side1_down) = ui.ctx().input(|i| {
                                 (
                                     i.pointer.button_down(egui::PointerButton::Primary),
                                     i.pointer.button_down(egui::PointerButton::Secondary),
@@ -2458,20 +2463,20 @@ impl eframe::App for DicomViewApp {
                                             ViewMode::Mpr => self.set_current_mpr_slice(current - 1),
                                         }
                                         self.vp_mut().wl_dirty = true;
-                                        self.update_current_slice_view(ctx);
+                                        self.update_current_slice_view(ui.ctx());
                                     } else if delta.y < -2.0 && current < self.current_view_slice_len() - 1 {
                                         match self.vp().view_mode {
                                             ViewMode::Stack => self.vp_mut().current_stack_slice += 1,
                                             ViewMode::Mpr => self.set_current_mpr_slice(current + 1),
                                         }
                                         self.vp_mut().wl_dirty = true;
-                                        self.update_current_slice_view(ctx);
+                                        self.update_current_slice_view(ui.ctx());
                                     }
                                 }
                                 // Side mouse -> rotate
                                 else if side1_down {
                                     let image_center = cell_rect.center() + self.vp().pan;
-                                    let pointer_pos = ctx.input(|i| i.pointer.interact_pos());
+                                    let pointer_pos = ui.ctx().input(|i| i.pointer.interact_pos());
                                     if let Some(current_pos) = pointer_pos {
                                         if let Some(last_pos) = self.vp().rotation_drag_last_pos {
                                             let last_vec = last_pos - image_center;
@@ -2523,7 +2528,7 @@ impl eframe::App for DicomViewApp {
                                         self.vp_mut().window_width = (self.vp().window_width + delta.x * ww_scale).max(1.0);
                                         self.vp_mut().window_center += -delta.y * wc_scale;
                                         self.vp_mut().wl_dirty = true;
-                                        self.update_current_slice_view(ctx);
+                                        self.update_current_slice_view(ui.ctx());
                                     }
                                 }
 
@@ -2742,7 +2747,7 @@ impl eframe::App for DicomViewApp {
                 let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
                 // Check button states for multi-button combinations
-                let (left_down, right_down, middle_down, side1_down) = ctx.input(|i| {
+                let (left_down, right_down, middle_down, side1_down) = ui.ctx().input(|i| {
                     (
                         i.pointer.button_down(egui::PointerButton::Primary),
                         i.pointer.button_down(egui::PointerButton::Secondary),
@@ -2754,7 +2759,7 @@ impl eframe::App for DicomViewApp {
                 // Scroll wheel behavior:
                 // - Stack mode (multiple images): scroll navigates slices.
                 // - Single-image mode: scroll zooms.
-                let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
+                let scroll_delta = ui.ctx().input(|i| i.smooth_scroll_delta.y);
                 const WHEEL_SLICE_THRESHOLD: f32 = 48.0;
 
                 if !side1_down {
@@ -2858,7 +2863,7 @@ impl eframe::App for DicomViewApp {
                 // Side mouse button drag (Mouse4) -> rotate image (per-viewport)
                 else if response.hovered() && side1_down {
                     let image_center = rect.center() + self.vp().pan;
-                    let pointer_pos = ctx.input(|i| i.pointer.interact_pos());
+                    let pointer_pos = ui.ctx().input(|i| i.pointer.interact_pos());
                     if let Some(current_pos) = pointer_pos {
                         if let Some(last_pos) = self.vp().rotation_drag_last_pos {
                             let last_vec = last_pos - image_center;
@@ -3014,7 +3019,7 @@ impl eframe::App for DicomViewApp {
                         egui::Sense::click_and_drag(),
                     );
                     if scroll_resp.hovered() {
-                        ctx.set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
                     }
                     if scroll_resp.dragged() || scroll_resp.clicked() {
                         if let Some(pointer) = scroll_resp.interact_pointer_pos() {
@@ -3066,11 +3071,11 @@ impl eframe::App for DicomViewApp {
             let filename = state.current_filename.clone();
 
             // Dim the background
-            let screen = ctx.viewport_rect();
+            let screen = ui.ctx().viewport_rect();
             egui::Area::new(egui::Id::new("loading_overlay"))
                 .fixed_pos(screen.min)
                 .order(egui::Order::Background)
-                .show(ctx, |ui| {
+                .show(ui.ctx(), |ui| {
                     ui.painter().rect_filled(
                         screen,
                         0.0,
@@ -3084,7 +3089,7 @@ impl eframe::App for DicomViewApp {
                 .collapsible(false)
                 .title_bar(false)
                 .fixed_size([300.0, 90.0])
-                .show(ctx, |ui| {
+                .show(ui.ctx(), |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(8.0);
                         ui.label(format!("Loading {}/{}", received, total));

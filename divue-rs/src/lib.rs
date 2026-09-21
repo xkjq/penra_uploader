@@ -321,7 +321,7 @@ fn render_diff_preview(ui: &mut egui::Ui, pairs: &[(String, String)]) {
 
                 ui.label(prefix);
                 // colored mid (no brackets in preview) - choose color appropriate for theme
-                let dark = ui.ctx().style().visuals.dark_mode;
+                let dark = ui.style().visuals.dark_mode;
                 let diff_bg = if dark {
                     egui::Color32::from_rgb(150, 60, 60)
                 } else {
@@ -790,19 +790,20 @@ impl DivueApp {
 }
 
 impl eframe::App for DivueApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ui, |ui| {
+            let ctx = ui.ctx().clone();
             if self.show_comparison {
-                self.render_comparison_view(ui, ctx);
+                self.render_comparison_view(ui, &ctx);
             } else {
-                self.render_file_selection_view(ctx, ui);
+                self.render_file_selection_view(&ctx, ui);
             }
         });
 
         // transient copy feedback (top-right)
         if let Some((msg, time)) = &self.last_copy_feedback {
             if time.elapsed().as_secs_f32() < 2.0 {
-                    egui::Area::new("copy_feedback_meta".into()).anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0)).show(ctx, |ui| {
+                    egui::Area::new("copy_feedback_meta".into()).anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0)).show(ui.ctx(), |ui| {
                         ui.label(egui::RichText::new(msg).strong());
                     });
             } else {
@@ -814,7 +815,7 @@ impl eframe::App for DivueApp {
         if let Some((txt, retries, last_time)) = &mut self.pending_copy {
             if last_time.elapsed() >= Duration::from_millis(80) {
                 if *retries > 0 {
-                    ctx.output_mut(|o| o.commands.push(egui::output::OutputCommand::CopyText(txt.clone())));
+                    ui.ctx().output_mut(|o| o.commands.push(egui::output::OutputCommand::CopyText(txt.clone())));
                     *retries -= 1;
                     *last_time = Instant::now();
                 } else {
@@ -1239,8 +1240,8 @@ struct MetaApp {
 }
 
 impl eframe::App for MetaApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("DICOM Metadata Compare");
             if self.comps.is_empty() {
                 ui.label("No files loaded");
@@ -1342,7 +1343,7 @@ impl eframe::App for MetaApp {
                     .default_size([1000.0, 400.0])
                     .resizable(true)
                     .open(&mut self.full_open)
-                    .show(ctx, |ui| {
+                    .show(ui.ctx(), |ui| {
                         ui.vertical(|ui| {
                             if self.last_pairs.len() > 1 {
                                 ui.label("Preview (differences highlighted):");
@@ -1359,7 +1360,7 @@ impl eframe::App for MetaApp {
                             // reflect edits back into stored string so copy will use edited content
                             self.full_text = tmp;
                             if ui.button("Copy to clipboard").clicked() {
-                                copy_text_to_clipboard(ctx, &self.full_text);
+                                copy_text_to_clipboard(ui.ctx(), &self.full_text);
                                 self.last_copy_feedback = Some(("Copied to clipboard".to_string(), Instant::now()));
                                 self.pending_copy = Some((self.full_text.clone(), 3u8, Instant::now()));
                             }
@@ -1371,7 +1372,7 @@ impl eframe::App for MetaApp {
         // transient copy feedback (top-right)
         if let Some((msg, time)) = &self.last_copy_feedback {
             if time.elapsed().as_secs_f32() < 2.0 {
-                egui::Area::new("copy_feedback_meta".into()).anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0)).show(ctx, |ui| {
+                egui::Area::new("copy_feedback_meta".into()).anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0)).show(ui.ctx(), |ui| {
                     ui.label(egui::RichText::new(msg).strong());
                 });
             } else {
@@ -1383,7 +1384,7 @@ impl eframe::App for MetaApp {
         if let Some((txt, retries, last_time)) = &mut self.pending_copy {
             if last_time.elapsed() >= Duration::from_millis(80) {
                 if *retries > 0 {
-                    ctx.output_mut(|o| o.commands.push(egui::output::OutputCommand::CopyText(txt.clone())));
+                    ui.ctx().output_mut(|o| o.commands.push(egui::output::OutputCommand::CopyText(txt.clone())));
                     *retries -= 1;
                     *last_time = Instant::now();
                 } else {

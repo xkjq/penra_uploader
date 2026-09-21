@@ -947,7 +947,7 @@ impl ReportApp {
 }
 
 impl eframe::App for ReportApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // drain any IPC messages (e.g., from Dragon helper) and insert into report buffer
         if let Some(rx) = self.rx.clone() {
             while let Ok(msg) = rx.try_recv() {
@@ -969,7 +969,7 @@ impl eframe::App for ReportApp {
         // so we can handle insertion while ensuring widgets (TextEdit) don't
         // receive the numeric character.
         let mut removed_alt_keys: Vec<egui::Key> = Vec::new();
-        ctx.input_mut(|i| {
+        ui.ctx().input_mut(|i| {
             use egui::Event;
             let mut remove_idxs: Vec<usize> = Vec::new();
             for (idx, ev) in i.events.iter().enumerate() {
@@ -1012,7 +1012,7 @@ impl eframe::App for ReportApp {
             self.alt_number_quick_insert(key);
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             // Build a two-column layout: left = main report area, right = templates (fixed width)
             let avail = ui.available_rect_before_wrap();
             let avail_w = avail.width();
@@ -1023,7 +1023,7 @@ impl eframe::App for ReportApp {
             let left_rect = egui::Rect::from_min_max(avail.min, egui::pos2(avail.min.x + left_w, avail.max.y));
             let right_rect = egui::Rect::from_min_max(egui::pos2(avail.min.x + left_w, avail.min.y), avail.max);
 
-            ui.allocate_ui_at_rect(left_rect, |ui| {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(left_rect), |ui| {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         if ui.button("New").clicked() {
@@ -1066,7 +1066,7 @@ impl eframe::App for ReportApp {
                     // If Alt is currently pressed, make the TextEdit non-interactive
                     // so it doesn't receive/insert the numeric character while we
                     // intercept Alt+Number events.
-                    let alt_pressed = ctx.input(|i| i.modifiers.alt);
+                    let alt_pressed = ui.ctx().input(|i| i.modifiers.alt);
                     let is_interactive = (!self.vim_enabled || self.vim_mode == VimMode::Insert) && !alt_pressed;
                     // Precompute misspelled ranges and local flags so the layouter
                     // closure does not capture `self` (avoids borrow conflicts).
@@ -1177,7 +1177,7 @@ impl eframe::App for ReportApp {
 
                     // Capture events now (before show) so undo/redo and secondary-press
                     // detection are available both before and after the widget runs.
-                    let events = ctx.input(|i| i.events.clone());
+                    let events = ui.ctx().input(|i| i.events.clone());
 
                     // Snapshot selection before TextEdit handles pointer events in this frame.
                     let prev_selection_before_context = self.buffer.caret_char_range.clone();
@@ -1193,13 +1193,13 @@ impl eframe::App for ReportApp {
                             let e = sel.start.max(sel.end).min(report_char_len);
                             if e > s {
                                 if let Some(mut te_state) =
-                                    egui::TextEdit::load_state(ctx, textedit_id)
+                                    egui::TextEdit::load_state(ui.ctx(), textedit_id)
                                 {
                                     te_state.cursor.set_char_range(Some(CCursorRange::two(
                                         CCursor::new(s),
                                         CCursor::new(e),
                                     )));
-                                    egui::TextEdit::store_state(ctx, textedit_id, te_state);
+                                    egui::TextEdit::store_state(ui.ctx(), textedit_id, te_state);
                                 }
                             }
                         }
@@ -1242,7 +1242,7 @@ impl eframe::App for ReportApp {
                                     CCursor::new(s),
                                     CCursor::new(e),
                                 )));
-                                output.state.clone().store(ctx, output.response.id);
+                                output.state.clone().store(ui.ctx(), output.response.id);
                             } else {
                                 // User had no selection when they right-clicked — clear any
                                 // previously captured menu selection so Copy is correctly disabled.
@@ -1370,7 +1370,7 @@ impl eframe::App for ReportApp {
                     // yet) but we must NOT clear — otherwise the captured selection is
                     // thrown away every intermediate frame before the popup appears.
                     let secondary_is_held =
-                        ctx.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
+                        ui.ctx().input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
                     if !text_context_menu_open && !self.vim_enabled && !secondary_is_held {
                         self.context_menu_selection = None;
                     }
@@ -1387,7 +1387,7 @@ impl eframe::App for ReportApp {
                             }
                         } else if let Some(ccr) = output.cursor_range {
                             let sorted = ccr.as_sorted_char_range();
-                            self.buffer.caret_char_range = Some(sorted);
+                            self.buffer.caret_char_range = Some(sorted.start.0..sorted.end.0);
                         }
                     }
 
@@ -1581,20 +1581,20 @@ impl eframe::App for ReportApp {
                                 if let Some(ccr) = output.cursor_range {
                                     let sorted = ccr.as_sorted_char_range();
                                     eprintln!("[dbg] pointer button (interactive): widget reported cursor_range -> {:?} pressed={}", sorted, pressed);
-                                    self.buffer.caret_char_range = Some(sorted.clone());
+                                    self.buffer.caret_char_range = Some(sorted.start.0..sorted.end.0);
                                     self.last_vim_key = None;
 
                                     if *pressed && self.vim_enabled {
                                         // start drag using the reported cursor position
                                         self.mouse_dragging = true;
-                                        self.mouse_drag_anchor = Some(sorted.start);
+                                        self.mouse_drag_anchor = Some(sorted.start.0);
                                     }
 
                                     if !*pressed {
                                         if self.vim_enabled {
                                             if sorted.start != sorted.end {
                                                 self.vim_mode = VimMode::Visual;
-                                                self.visual_anchor = Some(sorted.start);
+                                                self.visual_anchor = Some(sorted.start.0);
                                             } else if self.vim_mode == VimMode::Visual {
                                                 self.vim_mode = VimMode::Normal;
                                                 self.visual_anchor = None;
@@ -1602,7 +1602,7 @@ impl eframe::App for ReportApp {
                                         }
                                     } else if self.vim_enabled && self.vim_mode == VimMode::Visual {
                                         if self.visual_anchor.is_none() {
-                                            self.visual_anchor = Some(sorted.start);
+                                            self.visual_anchor = Some(sorted.start.0);
                                         }
                                     }
                                 }
@@ -1728,12 +1728,12 @@ impl eframe::App for ReportApp {
                                                     let start = CCursor::new(range.start);
                                                     let end = CCursor::new(range.end);
                                                     output.state.cursor.set_char_range(Some(CCursorRange::two(start, end)));
-                                                    output.state.clone().store(ctx, output.response.id);
+                                                    output.state.clone().store(ui.ctx(), output.response.id);
                                                 } else {
                                                     let pos = self.buffer.report.chars().count();
                                                     let start = CCursor::new(pos);
                                                     output.state.cursor.set_char_range(Some(CCursorRange::one(start)));
-                                                    output.state.clone().store(ctx, output.response.id);
+                                                    output.state.clone().store(ui.ctx(), output.response.id);
                                                 }
                                             }
                                         }
@@ -1748,7 +1748,7 @@ impl eframe::App for ReportApp {
 
                         // Mirror Vim's internal yank register to the OS clipboard by default.
                         if let Some(yanked_text) = self.buffer.take_yank_for_clipboard() {
-                            ctx.copy_text(yanked_text);
+                            ui.ctx().copy_text(yanked_text);
                         }
                     }
 
@@ -2009,7 +2009,7 @@ impl eframe::App for ReportApp {
 
                     ui.horizontal(|ui| {
                         if ui.button("Preview").clicked() {
-                            ctx.request_repaint();
+                            ui.ctx().request_repaint();
                         }
                         if ui.button("Insert Template").clicked() {
                             self.show_templates_window = true;
@@ -2045,7 +2045,7 @@ impl eframe::App for ReportApp {
 
             // Templates area: render in the right column when requested
             if self.show_templates_window {
-                ui.allocate_ui_at_rect(right_rect, |ui| {
+                ui.scope_builder(egui::UiBuilder::new().max_rect(right_rect), |ui| {
                     ui.vertical(|ui| {
                         ui.heading("Templates");
                         ui.horizontal(|ui| {
@@ -2261,7 +2261,7 @@ impl eframe::App for ReportApp {
             if let Some(key) = self.show_edit_vars_dialog.clone() {
                 let mut open = true;
                 let txt = &mut self.edit_vars_text;
-                egui::Window::new("Edit template variables").open(&mut open).show(ctx, |ui| {
+                egui::Window::new("Edit template variables").open(&mut open).show(ui.ctx(), |ui| {
                     ui.label(format!("Template: {}", key));
                     ui.label("Enter one key: value per line:");
                     ui.add(egui::TextEdit::multiline(txt).desired_rows(10));
@@ -2300,7 +2300,7 @@ impl eframe::App for ReportApp {
                     let mut open = true;
                     // collect names first to avoid simultaneous mutable/immutable borrows of self
                     let var_names = self.collect_template_var_names();
-                    egui::Window::new("Global Variables").open(&mut open).show(ctx, |ui| {
+                    egui::Window::new("Global Variables").open(&mut open).show(ui.ctx(), |ui| {
                         ui.label("Variables referenced by templates (marked = present in global vars):");
                         ui.horizontal_wrapped(|ui| {
                             for name in var_names.iter() {
@@ -2346,7 +2346,7 @@ impl eframe::App for ReportApp {
             // Template editor window
             if self.show_template_editor {
                 let mut open = self.show_template_editor;
-                egui::Window::new("Template Editor").open(&mut open).show(ctx, |ui| {
+                egui::Window::new("Template Editor").open(&mut open).show(ui.ctx(), |ui| {
                     if let Some(mut t) = self.editing_template.clone() {
                         ui.horizontal(|ui| {
                             ui.label("ID:");

@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eframe = "0.33.3"
+eframe = "0.36"
 rfd = "0.17.2"
-cpal = "0.15"
+cpal = "0.18"
 crossbeam-channel = "0.5"
 anyhow = "1.0"
 # Optional Vosk bindings; enable with `--features vosk` when available
@@ -17,10 +17,10 @@ serde_yaml = "0.9"
 chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 hunspell = { version = "0.1", optional = true }
-windows = { version = "0.48", optional = true, features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls", "Win32_Networking_WinSock"] }
+windows = { version = "0.62", optional = true, features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_Networking_WinSock"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.48", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls", "Win32_Networking_WinSock"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_Networking_WinSock"] }
 
 [features]
 default = ["hunspell"]

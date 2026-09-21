@@ -4,14 +4,12 @@ mod windows_impl {
     use std::ffi::c_void;
     use std::io::{Read, Write};
     use std::net::TcpStream;
-    use std::ptr::null_mut;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-    use windows::Win32::UI::Controls::{
-        CreateWindowExW, EDIT_CLASSW, ES_AUTOVSCROLL, ES_MULTILINE, ES_WANTRETURN,
-    };
+    use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Graphics::Gdi::UpdateWindow;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     fn to_wstring(s: &str) -> Vec<u16> {
@@ -25,7 +23,9 @@ mod windows_impl {
     pub fn run() {
         unsafe {
             let hinstance = GetModuleHandleW(None).unwrap();
+            let hinstance = HINSTANCE(hinstance.0);
             let class_name = to_wstring("DragonOverlayWndClass");
+            let edit_class = to_wstring("EDIT");
 
             let wnd_class = WNDCLASSW {
                 lpfnWndProc: Some(wndproc),
@@ -37,8 +37,8 @@ mod windows_impl {
             RegisterClassW(&wnd_class);
 
             let window_name = to_wstring("Dragon Overlay");
-            let hwnd = CreateWindowExW(
-                WS_EX_TOOLWINDOW.0,
+            let hwnd = match CreateWindowExW(
+                WS_EX_TOOLWINDOW,
                 PCWSTR(class_name.as_ptr()),
                 PCWSTR(window_name.as_ptr()),
                 WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_POPUP,
@@ -48,30 +48,44 @@ mod windows_impl {
                 300,
                 None,
                 None,
-                hinstance,
-                null_mut(),
-            );
-
-            if hwnd.0 == 0 {
-                eprintln!("Failed to create window");
-                return;
-            }
+                Some(hinstance),
+                None,
+            ) {
+                Ok(h) => h,
+                Err(_) => {
+                    eprintln!("Failed to create window");
+                    return;
+                }
+            };
 
             // Create edit control
-            let edit = CreateWindowExW(
-                0,
-                PCWSTR(EDIT_CLASSW),
-                PCWSTR(to_wstring("").as_ptr()),
-                WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
+            let empty = to_wstring("");
+            let edit = match CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(edit_class.as_ptr()),
+                PCWSTR(empty.as_ptr()),
+                WINDOW_STYLE(
+                    WS_CHILD.0
+                        | WS_VISIBLE.0
+                        | ES_MULTILINE as u32
+                        | ES_AUTOVSCROLL as u32
+                        | ES_WANTRETURN as u32,
+                ),
                 0,
                 0,
                 600,
                 300,
-                hwnd,
-                HMENU(1),
-                hinstance,
-                null_mut(),
-            );
+                Some(hwnd),
+                Some(HMENU(1 as *mut c_void)),
+                Some(hinstance),
+                None,
+            ) {
+                Ok(h) => h,
+                Err(_) => {
+                    eprintln!("Failed to create edit control");
+                    return;
+                }
+            };
 
             // Connect to app
             let stream = TcpStream::connect(("127.0.0.1", 54231)).ok();
@@ -80,8 +94,11 @@ mod windows_impl {
             // Thread: read incoming messages from the socket and apply commands
             if let Some(s_arc) = stream.clone().lock().unwrap().as_ref() {
                 let mut s_clone = s_arc.try_clone().unwrap();
-                let hwnd_edit = edit;
+                let hwnd_edit_addr = edit.0 as isize;
+                let hwnd_addr = hwnd.0 as isize;
                 thread::spawn(move || {
+                    let hwnd_edit = HWND(hwnd_edit_addr as *mut c_void);
+                    let hwnd = HWND(hwnd_addr as *mut c_void);
                     let mut buf = String::new();
                     loop {
                         buf.clear();
@@ -101,7 +118,7 @@ mod windows_impl {
                                                     {
                                                         let w = to_wstring(t);
                                                         unsafe {
-                                                            SetWindowTextW(
+                                                            let _ = SetWindowTextW(
                                                                 hwnd_edit,
                                                                 PCWSTR(w.as_ptr()),
                                                             );
@@ -109,7 +126,7 @@ mod windows_impl {
                                                     }
                                                 }
                                                 "hide_overlay" => unsafe {
-                                                    ShowWindow(hwnd, SW_HIDE);
+                                                    let _ = ShowWindow(hwnd, SW_HIDE);
                                                 },
                                                 "set_overlay_position" => {
                                                     let x = v
@@ -133,9 +150,9 @@ mod windows_impl {
                                                         .unwrap_or(200)
                                                         as i32;
                                                     unsafe {
-                                                        SetWindowPos(
+                                                        let _ = SetWindowPos(
                                                             hwnd,
-                                                            HWND(0),
+                                                            None,
                                                             x,
                                                             y,
                                                             w,
@@ -157,7 +174,9 @@ mod windows_impl {
 
             // Hook for EN_CHANGE: poll edit periodically and send text back on change
             let stream_for_poll = stream.clone();
+            let edit_addr = edit.0 as isize;
             thread::spawn(move || {
+                let edit = HWND(edit_addr as *mut c_void);
                 let mut last = String::new();
                 loop {
                     unsafe {
@@ -183,12 +202,12 @@ mod windows_impl {
             });
 
             // Show window
-            ShowWindow(hwnd, SW_SHOW);
-            UpdateWindow(hwnd);
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = UpdateWindow(hwnd);
 
             let mut msg = MSG::default();
-            while GetMessageW(&mut msg, HWND(0), 0, 0).into() {
-                TranslateMessage(&msg);
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
