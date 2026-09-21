@@ -22,3 +22,9 @@ path = "src/main.rs"
 [lib]
 name = "diviz_rs_app"
 path = "src/lib.rs"
+
+# Pin the transitive `windows` crate used by wgpu-hal/gpu-allocator: 0.62.2
+# broke the Direct3D12 interface hierarchy they rely on. Remove once wgpu
+# ships a release compatible with windows 0.62.2+.
+[target.'cfg(windows)'.dependencies]
+windows = "=0.62.1"
