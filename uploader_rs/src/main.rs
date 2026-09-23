@@ -18,7 +18,7 @@ use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use rayon::prelude::*;
 use std::fs;
 use rfd::FileDialog;
-use interprocess::local_socket::{prelude::*, ConnectOptions, GenericFilePath, ListenerOptions};
+use interprocess::local_socket::{prelude::*, ConnectOptions, GenericFilePath, GenericNamespaced, ListenerOptions, Name};
 use std::io::{Read, Write};
 use fs2::FileExt;
 use chrono::Utc;
@@ -31,14 +31,41 @@ use tracing_subscriber::prelude::*;
 static FILTER_RELOADER: OnceCell<Box<dyn Fn(EnvFilter) -> Result<(), String> + Send + Sync>> = OnceCell::new();
 
 // Local-socket IPC helpers (interprocess 2.x requires converting the name first).
+fn local_socket_name(name: &str) -> std::io::Result<Name<'static>> {
+    #[cfg(windows)]
+    {
+        name.to_ns_name::<GenericNamespaced>().map(|n| n.into_owned())
+    }
+    #[cfg(not(windows))]
+    {
+        name.to_fs_name::<GenericFilePath>().map(|n| n.into_owned())
+    }
+}
+
 fn connect_ipc(name: &str) -> std::io::Result<LocalSocketStream> {
-    name.to_fs_name::<GenericFilePath>()
+    local_socket_name(name)
         .and_then(|n| ConnectOptions::new().name(n).connect_sync())
 }
 
 fn bind_ipc(name: &str) -> std::io::Result<LocalSocketListener> {
-    name.to_fs_name::<GenericFilePath>()
+    local_socket_name(name)
         .and_then(|n| ListenerOptions::new().name(n).create_sync())
+}
+
+#[cfg(test)]
+mod ipc_tests {
+    use super::*;
+
+    #[test]
+    fn local_socket_name_matches_platform_support() {
+        let name = local_socket_name("uploader_rs_test").expect("ipc name should be valid");
+
+        #[cfg(windows)]
+        assert!(name.is_namespaced(), "windows IPC should use the local-socket namespace");
+
+        #[cfg(not(windows))]
+        assert!(name.is_path(), "unix IPC should use a filesystem socket path");
+    }
 }
 
 const MAX_UI_MESSAGES_PER_FRAME: usize = 256;
