@@ -1,5 +1,15 @@
-use interprocess::local_socket::{prelude::*, ConnectOptions, GenericFilePath, GenericNamespaced};
+use interprocess::local_socket::{prelude::*, ConnectOptions};
+#[cfg(not(windows))]
+use interprocess::local_socket::GenericFilePath;
+#[cfg(windows)]
+use interprocess::local_socket::GenericNamespaced;
 use std::io::Write;
+use std::path::PathBuf;
+
+#[cfg(not(windows))]
+fn local_socket_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(name)
+}
 
 fn main() {
     // initialize basic tracing for this short-lived notifier (logs to stderr)
@@ -18,7 +28,11 @@ fn main() {
             .to_ns_name::<GenericNamespaced>();
         #[cfg(not(windows))]
         let name = ipc_name
-            .as_str()
+            .as_str();
+        #[cfg(not(windows))]
+        let name = local_socket_path(name)
+            .to_string_lossy()
+            .into_owned()
             .to_fs_name::<GenericFilePath>();
         name.and_then(|name| ConnectOptions::new().name(name).connect_sync())
     };
