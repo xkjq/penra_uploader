@@ -1217,12 +1217,6 @@ struct BrushEdits {
     force_keep: std::collections::HashSet<usize>,
 }
 
-impl BrushEdits {
-    fn is_empty(&self) -> bool {
-        self.force_remove.is_empty() && self.force_keep.is_empty()
-    }
-}
-
 impl ManualEdits {
     fn for_series(&self, uid: &str) -> Option<&BrushEdits> {
         self.per_series.get(uid)
@@ -1230,10 +1224,6 @@ impl ManualEdits {
 
     fn for_series_mut(&mut self, uid: &str) -> &mut BrushEdits {
         self.per_series.entry(uid.to_string()).or_default()
-    }
-
-    fn clear_series(&mut self, uid: &str) {
-        self.per_series.remove(uid);
     }
 
     /// Total brushed voxels across all series (for the UI status line).
@@ -2358,6 +2348,98 @@ impl DicomViewApp {
                 }
             }
         }
+    }
+
+    /// Draw a circle at the pointer showing the brush footprint, when the brush
+    /// is active over a Stack viewport. The on-screen radius is derived from the
+    /// brush millimetre size and the current zoom, so it matches what a stamp
+    /// would cover.
+    fn paint_brush_cursor(&self, ui: &egui::Ui, viewport: usize, cell_rect: egui::Rect) {
+        if !self.deface_brush_on || !self.deface_panel_open {
+            return;
+        }
+        let Some(vp) = self.viewports.get(viewport) else {
+            return;
+        };
+        if vp.view_mode != ViewMode::Stack {
+            return;
+        }
+        // Only on the viewport showing a defaceable (base) series.
+        let Some(base) = self.deface_base_group() else {
+            return;
+        };
+        let shows_base = self
+            .series_groups
+            .get(vp.current_series)
+            .map(|g| {
+                g.uid == base.uid
+                    || g.uid
+                        == format!("{}-DEFACED", base.uid)
+            })
+            .unwrap_or(false);
+        if !shows_base {
+            return;
+        }
+        let Some(rect) = self.viewport_image_rects.get(viewport).and_then(|r| *r) else {
+            return;
+        };
+        let Some(pointer) = ui.ctx().input(|i| i.pointer.hover_pos()) else {
+            return;
+        };
+        if !cell_rect.contains(pointer) {
+            return;
+        }
+        // On-screen pixels per image pixel, matching `pixel_to_screen`.
+        let geom = match self
+            .deface_volume_cache
+            .as_ref()
+            .and_then(|(uid, g)| (uid == &base.uid).then_some(g))
+        {
+            Some(g) => g,
+            None => return,
+        };
+        let (img_w, img_h) = (geom.width as f32, geom.height as f32);
+        let physical_size = vp.displayed_physical_size.unwrap_or_else(|| egui::vec2(img_w, img_h));
+        let display = if vp.view_mode == ViewMode::Mpr && !vp.scale_by_physical {
+            let fit = (cell_rect.width() / img_w).min(cell_rect.height() / img_h);
+            egui::vec2(img_w * fit * vp.zoom, img_h * fit * vp.zoom)
+        } else {
+            let fit = (cell_rect.width() / physical_size.x).min(cell_rect.height() / physical_size.y);
+            egui::vec2(physical_size.x * fit * vp.zoom, physical_size.y * fit * vp.zoom)
+        };
+        let px_per_img_x = display.x / img_w;
+        let px_per_img_y = display.y / img_h;
+        // Brush radius in image pixels (x/y), then to screen; use the average so
+        // the circle is visually circular even with anisotropic spacing.
+        let (rx_img, ry_img) = self.brush_radius_in_pixels();
+        let rx_screen = rx_img * px_per_img_x;
+        let ry_screen = ry_img * px_per_img_y;
+        let r_screen = ((rx_screen * rx_screen + ry_screen * ry_screen) * 0.5).sqrt().max(2.0);
+
+        let color = if self.deface_brush_add {
+            egui::Color32::from_rgba_unmultiplied(240, 60, 60, 200)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(60, 200, 120, 200)
+        };
+        let painter = ui.painter().with_clip_rect(rect);
+        painter.circle_stroke(pointer, r_screen, egui::Stroke::new(1.5, color));
+        painter.circle_stroke(pointer, 1.0, egui::Stroke::new(1.0, color));
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+    }
+
+    /// In-plane brush radius in base-series image pixels `(rx, ry)`, falling
+    /// back to the raw millimetre size when no geometry is cached yet.
+    fn brush_radius_in_pixels(&self) -> (f32, f32) {
+        let mm = self.deface_brush_radius_mm as f32;
+        let Some((_, geom)) = self.deface_volume_cache.as_ref() else {
+            return (mm.max(1.0), mm.max(1.0));
+        };
+        let sx = geom.volume.spacing[0].max(1e-3) as f32;
+        let sy = geom.volume.spacing[1].max(1e-3) as f32;
+        (
+            (self.deface_brush_radius_mm as f32 / sx).max(1.0),
+            (self.deface_brush_radius_mm as f32 / sy).max(1.0),
+        )
     }
 
     /// Paint the brush and schedule a preview update. Turns the preview on (so
@@ -4682,6 +4764,9 @@ impl eframe::App for DicomViewApp {
                             // Per-viewport controls drawn on top of this cell.
                             self.viewport_controls_overlay(ui, idx, cell_rect);
 
+                            // Brush footprint cursor (shows the paint size).
+                            self.paint_brush_cursor(ui, idx, cell_rect);
+
                             // record slice anchor point for cross-references (position along the displayed image)
                             if let Some(_tex) = self.viewport_textures.get(idx).and_then(|o| o.clone()) {
                                 let vp = &self.viewports[idx];
@@ -5346,6 +5431,9 @@ impl eframe::App for DicomViewApp {
 
                 // Per-viewport controls drawn on top of this viewport.
                 self.viewport_controls_overlay(ui, 0, rect);
+
+                // Brush footprint cursor (shows the paint size).
+                self.paint_brush_cursor(ui, 0, rect);
 
                 // Draw a vertical scroll indicator on the right side of the image panel
                 let total_slices = self.current_view_slice_len();
@@ -7486,6 +7574,23 @@ mod tests {
             });
             output.textures_delta.clear();
         }
+    }
+
+    #[test]
+    fn brush_radius_in_pixels_scales_with_millimetres() {
+        let mut app = app_with_head();
+        app.viewports = vec![ViewportState::default()];
+        app.active_viewport = 0;
+        // Build the geometry cache.
+        let _ = active_deface_mask(&mut app);
+
+        app.deface_brush_radius_mm = 5.0;
+        let (rx5, ry5) = app.brush_radius_in_pixels();
+        app.deface_brush_radius_mm = 20.0;
+        let (rx20, ry20) = app.brush_radius_in_pixels();
+        assert!(rx20 > rx5 && ry20 > ry5, "bigger brush -> bigger radius");
+        // The synthetic head uses 2 mm isotropic in-plane spacing.
+        assert!((rx5 - 2.5).abs() < 0.01, "5mm / 2mm spacing = 2.5 px ({rx5})");
     }
 
     #[test]

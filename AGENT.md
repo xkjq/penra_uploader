@@ -319,9 +319,15 @@ Facial anonymisation crate (diface-rs)
   `deface_active_series`, so the red overlay and the defaced copy both reflect
   them. Painting uses `stamp_brush`/`paint_brush_at` with `screen_to_pixel`
   (inverse of `pixel_to_screen`) to map the pointer to base-series voxels.
+  `paint_brush_cursor` draws a **footprint circle under the cursor** (radius from
+  `brush_radius_in_pixels` × on-screen pixels-per-image-pixel; red for Add, green
+  for Erase; crosshair cursor) so the brush size is visible before painting. It is
+  drawn in both the single- and multi-viewport paths, only on a viewport showing
+  the base (or its defaced copy) series.
   **Stack viewports only** (MPR painting unsupported). Session-only (not
   persisted). Tests: `manual_brush_add_and_erase_override_the_auto_mask`
-  (incl. preview reflects the paint), `brush_paint_marks_voxels_in_the_base_volume`.
+  (incl. preview reflects the paint), `brush_paint_marks_voxels_in_the_base_volume`,
+  `brush_radius_in_pixels_scales_with_millimetres`.
 - Uploader integration (uploader_rs):
   - `diface_rs::deface_dir_in_place(dir, opts)` defaces each series found in a
     directory **overwriting files in place** (names preserved), used after the

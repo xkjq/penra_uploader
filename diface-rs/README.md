@@ -267,10 +267,12 @@ Common controls:
   wrong: **Add** paints extra voxels for removal (fill missed tissue,
   under-segmentation), **Erase** protects voxels (fix over-segmentation). Set
   the brush **Size** (mm) and how many **Slices ±** the stamp spans, then
-  left-drag or click on a **Stack** viewport. Painted corrections override both
-  the red preview overlay and the defaced copy; **Clear** discards them. Brush
-  edits are session-only (not saved to disk) and **Stack-only** (no MPR
-  painting).
+  left-drag or click on a **Stack** viewport. While the brush is active a
+  **circle under the cursor shows the exact footprint** (its size in image
+  pixels, scaled by the current zoom), so you can judge the brush size before
+  painting. Painted corrections override both the red preview overlay and the
+  defaced copy; **Clear** discards them. Brush edits are session-only (not saved
+  to disk) and **Stack-only** (no MPR painting).
 
 With the **Segmentation** backend selected the panel also shows:
 
