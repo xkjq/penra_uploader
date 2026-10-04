@@ -1032,6 +1032,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "diface-rs"
+version = "0.1.0"
+dependencies = [
+ "dicom-core",
+ "dicom-dictionary-std",
+ "dicom-object",
+ "dicom-pixeldata",
+ "rayon",
+]
+
+[[package]]
 name = "directories"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1086,8 +1097,10 @@ name = "diviz-rs"
 version = "0.1.0"
 dependencies = [
  "dicom-core",
+ "dicom-dictionary-std",
  "dicom-object",
  "dicom-pixeldata",
+ "diface-rs",
  "directories",
  "eframe",
  "egui",
@@ -1095,6 +1108,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "tempfile",
  "windows",
 ]
 

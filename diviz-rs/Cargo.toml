@@ -14,6 +14,8 @@ rayon = "1.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 directories = "6.0"
+# In-memory defacing for the "Deface" comparison action.
+diface_rs = { package = "diface-rs", path = "../diface-rs" }
 
 [[bin]]
 name = "diviz-rs"
@@ -22,6 +24,10 @@ path = "src/main.rs"
 [lib]
 name = "diviz_rs_app"
 path = "src/lib.rs"
+
+[dev-dependencies]
+tempfile = "3"
+dicom-dictionary-std = "0.10"
 
 # Pin the transitive `windows` crate used by wgpu-hal/gpu-allocator: 0.62.2
 # broke the Direct3D12 interface hierarchy they rely on. Remove once wgpu
