@@ -21,6 +21,33 @@ fn make_minimal_dcm(path: &std::path::Path, sop_instance: &str, patient: &str) {
 }
 
 #[test]
+fn deface_config_maps_to_backend_options() {
+    // Default: disabled, geometric, defacing in place.
+    let cfg = DefaceConfig::default();
+    assert!(!cfg.enabled);
+    let opts = cfg.to_options();
+    assert!(matches!(opts.backend, diface_rs::BackendKind::Geometric(_)));
+    assert!(!opts.subdir_by_series, "defacing must overwrite in place");
+    assert!(!opts.remove_original);
+    assert_eq!(opts.min_slices, 3);
+
+    // Segmentation carries the region and the safety band.
+    let cfg = DefaceConfig {
+        enabled: true,
+        backend: DefaceBackendChoice::Segmentation,
+        region: diface_rs::MaskRegion::ExternalSoftTissue,
+        brain_protect_mm: 7.5,
+    };
+    match cfg.to_options().backend {
+        diface_rs::BackendKind::Segmentation(p) => {
+            assert_eq!(p.region, diface_rs::MaskRegion::ExternalSoftTissue);
+            assert!((p.brain_protect_mm - 7.5).abs() < 1e-9);
+        }
+        _ => panic!("expected a segmentation backend"),
+    }
+}
+
+#[test]
 fn test_export_processing_enqueues_and_anonymizes() {
     // Setup temporary workspace (export + anon)
     let tmp = tempdir().expect("tempdir");

@@ -96,14 +96,84 @@ const LOG_CACHE_REFRESH_INTERVAL: Duration = Duration::from_millis(800);
 use once_cell::sync::Lazy;
 use std::sync::mpsc as std_mpsc;
 
+/// Which defacing backend the uploader requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DefaceBackendChoice {
+    Geometric,
+    Segmentation,
+}
+
+impl DefaceBackendChoice {
+    fn label(self) -> &'static str {
+        match self {
+            DefaceBackendChoice::Geometric => "geometric",
+            DefaceBackendChoice::Segmentation => "segmentation",
+        }
+    }
+}
+
+/// Defacing configuration carried from the UI/IPC to the processing worker.
+///
+/// The original (pre-deface) pixel hash is always retained for duplicate
+/// detection regardless of these options.
+#[derive(Clone, Debug)]
+struct DefaceConfig {
+    enabled: bool,
+    backend: DefaceBackendChoice,
+    /// Segmentation region: flat face cut or "deflesh" (external soft tissue).
+    region: diface_rs::MaskRegion,
+    /// Segmentation safety band (mm) kept around the intracranial core.
+    brain_protect_mm: f64,
+}
+
+impl Default for DefaceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: DefaceBackendChoice::Geometric,
+            region: diface_rs::MaskRegion::Face,
+            brain_protect_mm: 2.0,
+        }
+    }
+}
+
+impl DefaceConfig {
+    /// Build the `diface_rs` options for this configuration. Defacing always
+    /// runs in place (names preserved) so the cached original hashes stay keyed
+    /// by the same paths.
+    fn to_options(&self) -> diface_rs::DefaceOptions {
+        let backend = match self.backend {
+            DefaceBackendChoice::Geometric => {
+                diface_rs::BackendKind::Geometric(diface_rs::GeometricParams::default())
+            }
+            DefaceBackendChoice::Segmentation => {
+                diface_rs::BackendKind::Segmentation(diface_rs::SegBackendParams {
+                    region: self.region,
+                    brain_protect_mm: self.brain_protect_mm,
+                    ..diface_rs::SegBackendParams::default()
+                })
+            }
+        };
+        diface_rs::DefaceOptions {
+            backend,
+            // Deface files in place; keep names and inputs.
+            subdir_by_series: false,
+            remove_original: false,
+            // Need whole series to reconstruct a volume.
+            min_slices: 3,
+            ..diface_rs::DefaceOptions::default()
+        }
+    }
+}
+
 // Queue item sent to the processing worker. The `tx` is the UI sender so
 // the worker can send progress/status messages back to the application.
 struct QueueItem {
     dir: PathBuf,
     notify: bool,
     seed: Option<String>,
-    /// Whether to blank facial voxels on the anonymised output.
-    deface: bool,
+    /// How to blank facial voxels on the anonymised output.
+    deface: DefaceConfig,
     tx: std_mpsc::Sender<String>,
 }
 
@@ -132,7 +202,7 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                 let tx = qi.tx.clone();
                 let notify_flag = qi.notify;
                 let seed_clone = qi.seed.clone();
-                let deface_flag = qi.deface;
+                let deface_cfg = qi.deface.clone();
 
                 // compute anon_dir relative to the processing dir
                 let anon_dir = processing_dir
@@ -246,18 +316,11 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                     // anonymised files in place; we then re-cache each output
                     // with the ORIGINAL pixel hash so duplicate detection is
                     // unaffected by the (intentionally) changed pixels.
-                    if deface_flag {
+                    if deface_cfg.enabled {
                         let _ = tx.send("PROC:STEP:Defacing facial voxels".to_string());
                         let records = hash_records.lock().map(|g| g.clone()).unwrap_or_default();
                         let mut defaced_ok = true;
-                        let deface_opts = diface_rs::DefaceOptions {
-                            // Deface files in place; keep names and inputs.
-                            subdir_by_series: false,
-                            remove_original: false,
-                            // Need whole series to reconstruct a volume.
-                            min_slices: 3,
-                            ..diface_rs::DefaceOptions::default()
-                        };
+                        let deface_opts = deface_cfg.to_options();
                         match diface_rs::deface_dir_in_place(&anon_dir, &deface_opts) {
                             Ok(report) => {
                                 let removed: usize =
@@ -267,7 +330,8 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                                     let _ = tx.send(format!("Deface warning: {w}"));
                                 }
                                 let _ = tx.send(format!(
-                                    "Defaced {series_n} series ({removed} voxels blanked); duplicate hashes kept from original pixels"
+                                    "Defaced {series_n} series with the {} backend ({removed} voxels blanked); duplicate hashes kept from original pixels",
+                                    deface_cfg.backend.label()
                                 ));
                             }
                             Err(e) => {
@@ -402,7 +466,7 @@ fn enqueue_export_processing(
     tx: std_mpsc::Sender<String>,
     notify_flag: bool,
     seed_clone: Option<String>,
-    deface: bool,
+    deface: DefaceConfig,
 ) {
     thread::spawn(move || {
         let anon_dir = export
@@ -653,7 +717,7 @@ struct AppState {
     processed: Vec<String>,
     seed: Option<String>,
     shared_seed: Option<Arc<std::sync::Mutex<Option<String>>>>,
-    shared_deface: Option<Arc<std::sync::Mutex<bool>>>,
+    shared_deface: Option<Arc<std::sync::Mutex<DefaceConfig>>>,
     username: String,
     password: String,
     logged_in_user: Option<String>,
@@ -661,9 +725,9 @@ struct AppState {
     recurse_depth: i32,
     ext_filter: String,
     notify_on_process: bool,
-    /// Blank facial voxels on the anonymised output (defacing). The original
+    /// Defacing configuration for the anonymised output. The original
     /// (pre-deface) pixel hash is retained for duplicate detection.
-    deface_faces: bool,
+    deface_cfg: DefaceConfig,
     login_open: bool,
     ready_series: Vec<SeriesInfo>,
     selected_series: Vec<bool>,
@@ -762,7 +826,7 @@ impl Default for AppState {
             recurse_depth: -1,
             ext_filter: "".to_string(),
             notify_on_process: false,
-            deface_faces: false,
+            deface_cfg: DefaceConfig::default(),
             ready_series: Vec::new(),
             selected_series: Vec::new(),
             base_url_mode: {
@@ -1057,7 +1121,7 @@ impl AppState {
         let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
         let notify_flag = self.notify_on_process;
         let seed_clone = self.seed.clone();
-        let deface = self.deface_faces;
+        let deface = self.deface_cfg.clone();
         enqueue_export_processing(export, tx, notify_flag, seed_clone, deface);
     }
 
@@ -2060,17 +2124,83 @@ impl eframe::App for AppState {
                 ui.checkbox(&mut self.skip_ssl, "Disable SSL verification (unsafe)");
                 // Deface faces on the anonymised output. The original pixel
                 // hash is preserved for duplicate detection.
-                if ui
-                    .checkbox(&mut self.deface_faces, "Deface faces (blank facial voxels)")
+                let mut deface_changed = ui
+                    .checkbox(
+                        &mut self.deface_cfg.enabled,
+                        "Deface faces (blank facial voxels)",
+                    )
                     .on_hover_text(
                         "Reconstructs each series in 3D and blanks facial voxels. Duplicate \
                          detection still uses the original (pre-deface) pixel hash.",
                     )
-                    .changed()
-                {
+                    .changed();
+                if self.deface_cfg.enabled {
+                    ui.horizontal(|ui| {
+                        ui.label("Backend:");
+                        let mut backend = self.deface_cfg.backend;
+                        deface_changed |= ui
+                            .selectable_value(
+                                &mut backend,
+                                DefaceBackendChoice::Geometric,
+                                "Geometric",
+                            )
+                            .on_hover_text("Fast principal-axis cut (no models)")
+                            .clicked();
+                        deface_changed |= ui
+                            .selectable_value(
+                                &mut backend,
+                                DefaceBackendChoice::Segmentation,
+                                "Segmentation",
+                            )
+                            .on_hover_text(
+                                "In-house head/brain segmentation; cut in front of the brain",
+                            )
+                            .clicked();
+                        self.deface_cfg.backend = backend;
+                    });
+                    if self.deface_cfg.backend == DefaceBackendChoice::Segmentation {
+                        ui.horizontal(|ui| {
+                            ui.label("Region:");
+                            let mut region = self.deface_cfg.region;
+                            deface_changed |= ui
+                                .selectable_value(&mut region, diface_rs::MaskRegion::Face, "Face")
+                                .on_hover_text("Flat anterior cut in front of the brain")
+                                .clicked();
+                            deface_changed |= ui
+                                .selectable_value(
+                                    &mut region,
+                                    diface_rs::MaskRegion::ExternalSoftTissue,
+                                    "Deflesh",
+                                )
+                                .on_hover_text(
+                                    "Remove external soft tissue/bone (scalp/face/table)",
+                                )
+                                .clicked();
+                            self.deface_cfg.region = region;
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Safety band:");
+                            deface_changed |= ui
+                                .add(
+                                    egui::Slider::new(
+                                        &mut self.deface_cfg.brain_protect_mm,
+                                        0.0..=20.0,
+                                    )
+                                    .suffix(" mm")
+                                    .clamping(egui::SliderClamping::Always),
+                                )
+                                .on_hover_text(
+                                    "Hard band kept around the brain/vault; larger is safer and \
+                                     removes slightly less face",
+                                )
+                                .changed();
+                        });
+                    }
+                }
+                if deface_changed {
                     if let Some(shared) = &self.shared_deface {
                         if let Ok(mut g) = shared.lock() {
-                            *g = self.deface_faces;
+                            *g = self.deface_cfg.clone();
                         }
                     }
                 }
@@ -2645,7 +2775,7 @@ fn main() {
         app.shared_seed = Some(shared_seed.clone());
         // Shared deface flag so the IPC (export "loaded") path uses the same
         // setting as the manual trigger.
-        let shared_deface = Arc::new(std::sync::Mutex::new(app.deface_faces));
+        let shared_deface = Arc::new(std::sync::Mutex::new(app.deface_cfg.clone()));
         app.shared_deface = Some(shared_deface.clone());
 
         // Deferred token validation: run off the main thread with a short,
@@ -2698,7 +2828,7 @@ fn main() {
                                     };
                                     if text == "loaded" {
                                         let current_seed = shared_seed_conn.lock().ok().and_then(|g| g.clone());
-                                        let deface = shared_deface_conn.lock().map(|g| *g).unwrap_or(false);
+                                        let deface = shared_deface_conn.lock().map(|g| g.clone()).unwrap_or_default();
                                         enqueue_export_processing(export_conn, tx_conn.clone(), false, current_seed, deface);
                                         let _ = tx_conn.send("IPC:RECV:loaded (enqueued)".to_string());
                                     } else if !text.is_empty() {
@@ -2750,7 +2880,7 @@ fn main() {
                                                         };
                                                         if text == "loaded" {
                                                             let current_seed = shared_seed_conn.lock().ok().and_then(|g| g.clone());
-                                                            let deface = shared_deface_conn.lock().map(|g| *g).unwrap_or(false);
+                                                            let deface = shared_deface_conn.lock().map(|g| g.clone()).unwrap_or_default();
                                                             enqueue_export_processing(export_conn, tx_conn.clone(), false, current_seed, deface);
                                                             let _ = tx_conn.send("IPC:RECV:loaded (enqueued)".to_string());
                                                         } else if !text.is_empty() {

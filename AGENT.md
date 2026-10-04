@@ -291,9 +291,15 @@ Facial anonymisation crate (diface-rs)
     `defacing_changes_pixels_but_keeps_original_cached_hash` in
     uploader_rs/src/upload/tests.rs (also asserts the output is JPEG-LS after
     recompression and that this is lossless).
-  - The flag is threaded via `QueueItem.deface` -> `enqueue_export_processing`,
-    kept in sync with the Settings checkbox through `AppState.shared_deface` for
-    the IPC ("loaded") path.
+  - The settings are carried as `DefaceConfig` (`enabled`, `backend`
+    Geometric/Segmentation, segmentation `region`, `brain_protect_mm`) via
+    `QueueItem.deface` -> `enqueue_export_processing`; `DefaceConfig::to_options()`
+    builds the `diface_rs::DefaceOptions` (always in place, `min_slices: 3`).
+    Kept in sync with the Settings controls through
+    `AppState.shared_deface: Arc<Mutex<DefaceConfig>>` for the IPC ("loaded")
+    path. The Settings panel exposes the Deface checkbox + Backend/Region/Safety
+    band. Tested by `deface_config_maps_to_backend_options` in
+    uploader_rs/src/processing_workflow_tests.rs.
 - diviz-rs tests: `mod tests` in diviz-rs/src/lib.rs (67 tests). Covers MPR
   construction (incl. gantry tilt), defacing (incl. largest-orientation-group
   selection), viewport sync, geometry helpers, file discovery, real on-disk
@@ -330,9 +336,9 @@ Facial anonymisation crate (diface-rs)
 
 Current status
 - The diface-rs crate and its diviz-rs/uploader_rs integration are **committed**
-  (see `git log --oneline`: 8da1354, a53c234, 9df25ca, 815e97b, a8b39e7,
-  62dff07, 6445460). Working tree is clean apart from ignored build artifacts.
-- Test counts: diface-rs 37, diviz-rs 67, uploader_rs 11 (10 unit + 1
+  (see `git log --oneline`). Working tree is clean apart from ignored build
+  artifacts.
+- Test counts: diface-rs 37, diviz-rs 67, uploader_rs 12 (11 unit + 1
   anonymiser integration). All green.
 - Recent fixes worth knowing:
   - `build_deface_volume` groups by `ImageOrientationPatient` and keeps the
@@ -340,12 +346,16 @@ Current status
   - `--brain-protect` (segmentation safety band) is wired; the dead
     `DefaceOptions.brain_protect_mm` field was removed.
   - The viewer Align panel exposes segmentation **Cut at** and **Safety band**.
+  - The uploader Settings panel exposes backend/region/safety band via
+    `DefaceConfig`.
+  - `.github/workflows/build-windows.yml` builds and uploads the `diface.exe`
+    CLI artifact alongside diviz/dicor/divue/uploader.
 
 Next recommended work (defacing)
-- Packaging/CI: `build.py` and `launcher/` still have **no** diface/diviz
-  references; wire the new binaries into the Linux build/launcher.
-- Uploader settings: expose the segmentation `--brain-protect` / `cut_reference`
-  knobs in the GUI settings (currently only the viewer and CLI do).
+- Packaging: `build.py` (PyInstaller) is Python-only and never bundled the Rust
+  binaries; if a single shippable bundle is wanted, collect `uploader_rs`,
+  `diviz-rs`, `divue` and `diface` together (the launcher/uploader currently
+  resolve `diviz-rs` on PATH then via workspace `target/{debug,release}`).
 - Validation: keep re-running `seg_debug` / `deface_debug` over `~/dicoms` as new
   MR series arrive; MR has no detectable skull, so `vault` is empty and
   `SkullFront`/deflesh fall back to the brain/closed-cavity path.
