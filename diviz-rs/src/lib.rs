@@ -1199,6 +1199,52 @@ impl DefaceGeometry {
     }
 }
 
+/// Manual brush corrections to the automatic defacing mask.
+///
+/// Two sparse sets of voxel indices (into the base series volume grid, laid out
+/// `(z*ny + y)*nx + x`): `force_remove` are voxels the brush added (fixing
+/// under-segmentation), `force_keep` are voxels the brush protected (fixing
+/// over-segmentation). `force_keep` wins when a voxel is in both. Keyed by base
+/// series UID so switching series keeps each series' edits separate.
+#[derive(Default)]
+struct ManualEdits {
+    per_series: HashMap<String, BrushEdits>,
+}
+
+#[derive(Default, Clone)]
+struct BrushEdits {
+    force_remove: std::collections::HashSet<usize>,
+    force_keep: std::collections::HashSet<usize>,
+}
+
+impl BrushEdits {
+    fn is_empty(&self) -> bool {
+        self.force_remove.is_empty() && self.force_keep.is_empty()
+    }
+}
+
+impl ManualEdits {
+    fn for_series(&self, uid: &str) -> Option<&BrushEdits> {
+        self.per_series.get(uid)
+    }
+
+    fn for_series_mut(&mut self, uid: &str) -> &mut BrushEdits {
+        self.per_series.entry(uid.to_string()).or_default()
+    }
+
+    fn clear_series(&mut self, uid: &str) {
+        self.per_series.remove(uid);
+    }
+
+    /// Total brushed voxels across all series (for the UI status line).
+    fn total(&self) -> usize {
+        self.per_series
+            .values()
+            .map(|e| e.force_remove.len() + e.force_keep.len())
+            .sum()
+    }
+}
+
 /// A defacing removal preview for one series, usable in both Stack and MPR.
 #[derive(Clone)]
 struct DefacePreview {
@@ -1543,6 +1589,19 @@ struct DicomViewApp {
     /// Live removal-mask preview (3D + per-image), tinted in viewports that
     /// show the base series (Stack and MPR). `None` when preview is off.
     deface_preview: Option<DefacePreview>,
+    /// Manual brush corrections, per base series UID. Applied on top of the
+    /// automatic mask (see [`ManualEdits`]). Session-only (not persisted).
+    deface_edits: ManualEdits,
+    /// Whether the manual brush is active (left-drag paints instead of panning).
+    deface_brush_on: bool,
+    /// Brush mode: `true` = add removal (fix under-segmentation), `false` =
+    /// erase/protect (fix over-segmentation).
+    deface_brush_add: bool,
+    /// Brush in-plane radius (mm).
+    deface_brush_radius_mm: f64,
+    /// Brush slice radius (slices): the disc is stamped on this many slices either
+    /// side of the painted one.
+    deface_brush_slice_radius: i32,
     /// Cached reconstructed volume + geometry for the active base series, so
     /// changing a defacing setting does not re-decode and re-convert every
     /// voxel on each drag frame. Keyed by the base series UID.
@@ -1618,6 +1677,11 @@ impl DicomViewApp {
             deface_deflesh_posterior_mm: 0.0,
             deface_deflesh_smooth_mm: 3.0,
             deface_preview: None,
+            deface_edits: ManualEdits::default(),
+            deface_brush_on: false,
+            deface_brush_add: true,
+            deface_brush_radius_mm: 12.0,
+            deface_brush_slice_radius: 1,
             deface_volume_cache: None,
             deface_seg_cache: None,
             deface_preview_dirty: false,
@@ -1975,6 +2039,39 @@ impl DicomViewApp {
         (u, vcoord)
     }
 
+    /// Inverse of [`Self::pixel_to_screen`]: map a screen position inside an
+    /// image cell back to (column, row) pixel coordinates, or `None` when the
+    /// point falls outside the displayed image.
+    fn screen_to_pixel(
+        &self,
+        pos: egui::Pos2,
+        img_w: f32,
+        img_h: f32,
+        cell_rect: egui::Rect,
+        vp: &ViewportState,
+    ) -> Option<(f32, f32)> {
+        let physical_size = vp.displayed_physical_size.unwrap_or_else(|| egui::vec2(img_w, img_h));
+        let display = if vp.view_mode == ViewMode::Mpr && !vp.scale_by_physical {
+            let fit = (cell_rect.width() / img_w).min(cell_rect.height() / img_h);
+            egui::vec2(img_w * fit * vp.zoom, img_h * fit * vp.zoom)
+        } else {
+            let fit = (cell_rect.width() / physical_size.x).min(cell_rect.height() / physical_size.y);
+            egui::vec2(physical_size.x * fit * vp.zoom, physical_size.y * fit * vp.zoom)
+        };
+        if display.x.abs() < 1e-3 || display.y.abs() < 1e-3 {
+            return None;
+        }
+        let center = cell_rect.center() + vp.pan;
+        // Undo rotation, then the scale, to get centered pixel offsets.
+        let rel = rotate_vec2(pos - center, -vp.rotation_degrees.to_radians());
+        let u = rel.x * (img_w / display.x) + img_w * 0.5;
+        let v = rel.y * (img_h / display.y) + img_h * 0.5;
+        if u < 0.0 || v < 0.0 || u >= img_w || v >= img_h {
+            return None;
+        }
+        Some((u, v))
+    }
+
     // Convert image pixel coords to screen pos inside a cell (handles pan/zoom/rotation similar to texture drawing)
     fn pixel_to_screen(
         &self,
@@ -2230,13 +2327,172 @@ impl DicomViewApp {
         }
     }
 
+    /// Apply the manual brush edits for `uid` on top of an automatic mask, in
+    /// place. `force_keep` wins over `force_remove` for a voxel in both sets.
+    fn apply_manual_edits(
+        mask: &mut diface_rs::volume::Mask,
+        edits: Option<&BrushEdits>,
+    ) {
+        let Some(edits) = edits else {
+            return;
+        };
+        if !edits.force_remove.is_empty() {
+            mask.ensure_weight();
+            for &i in &edits.force_remove {
+                if edits.force_keep.contains(&i) {
+                    continue;
+                }
+                if i < mask.remove.len() && mask.remove[i] == 0 {
+                    mask.remove[i] = 1;
+                    mask.weight[i] = 1.0;
+                }
+            }
+        }
+        if !edits.force_keep.is_empty() {
+            for &i in &edits.force_keep {
+                if i < mask.remove.len() {
+                    mask.remove[i] = 0;
+                    if i < mask.weight.len() {
+                        mask.weight[i] = 0.0;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Paint the brush and schedule a preview update. Turns the preview on (so
+    /// the painted region is visible) when it was off. Returns true if anything
+    /// changed.
+    fn stamp_brush(&mut self, viewport: usize, pos: egui::Pos2, ctx: &egui::Context) -> bool {
+        if !self.paint_brush_at(viewport, pos) {
+            return false;
+        }
+        self.deface_preview_dirty = true;
+        self.deface_preview_dirty_since = Some(std::time::Instant::now());
+        if !self.deface_preview_on {
+            self.deface_preview_on = true;
+        }
+        if self.deface_preview.is_none() {
+            // No preview yet (e.g. fresh series): build it now so the user sees
+            // the brush take effect immediately.
+            self.refresh_deface_preview(ctx);
+        }
+        true
+    }
+
+    /// Stamp the manual brush at a screen position on the active base series.
+    ///
+    /// Converts the pointer to native pixel coordinates (inverse of
+    /// `pixel_to_screen`), maps `z` to the base series' volume slice, and marks a
+    /// disc of radius `deface_brush_radius_mm` on `deface_brush_slice_radius`
+    /// slices either side. In Add mode voxels go into `force_remove` (and are
+    /// removed from `force_keep`); in Erase mode the opposite. Returns true when
+    /// anything changed, so the caller can refresh the preview.
+    fn paint_brush_at(&mut self, viewport: usize, pos: egui::Pos2) -> bool {
+        let Some(group) = self.deface_base_group() else {
+            return false;
+        };
+        let geom = match self.deface_volume_for(&group) {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        let Some(rect) = self
+            .viewport_image_rects
+            .get(viewport)
+            .and_then(|r| *r)
+        else {
+            return false;
+        };
+        // Stack-only for now: painting in MPR is not supported yet.
+        let in_stack = self
+            .viewports
+            .get(viewport)
+            .map(|vp| vp.view_mode == ViewMode::Stack)
+            .unwrap_or(false);
+        if !in_stack {
+            return false;
+        }
+        let (img_w, img_h) = (geom.width as f32, geom.height as f32);
+        let vp = &self.viewports[viewport];
+        let Some((u, v)) = self.screen_to_pixel(pos, img_w, img_h, rect, vp) else {
+            return false;
+        };
+        let x = u.floor() as isize;
+        let y = v.floor() as isize;
+        if x < 0 || y < 0 {
+            return false;
+        }
+
+        // Which volume z (slice within the base group's order) is displayed?
+        let z = match self.base_slice_index(&group, &self.viewports[viewport]) {
+            Some(z) => z as isize,
+            None => return false,
+        };
+
+        // Brush radius in voxels (in-plane; uses x/y spacing).
+        let rx = (self.deface_brush_radius_mm / geom.volume.spacing[0].max(1e-3)).max(1.0) as f32;
+        let ry = (self.deface_brush_radius_mm / geom.volume.spacing[1].max(1e-3)).max(1.0) as f32;
+        let nx = geom.width;
+        let ny = geom.height;
+        let nz = geom.order.len();
+        let add = self.deface_brush_add;
+        let slice_r = self.deface_brush_slice_radius.max(0) as isize;
+
+        let uid = group.uid.clone();
+        let edits = self.deface_edits.for_series_mut(&uid);
+        let mut changed = false;
+        for dz in -slice_r..=slice_r {
+            let zz = z + dz;
+            if zz < 0 || zz as usize >= nz {
+                continue;
+            }
+            let zz = zz as usize;
+            for yy in 0..ny {
+                for xx in 0..nx {
+                    let dx = (xx as f32 - x as f32) / rx;
+                    let dy = (yy as f32 - y as f32) / ry;
+                    if dx * dx + dy * dy > 1.0 {
+                        continue;
+                    }
+                    let i = (zz * ny + yy) * nx + xx;
+                    if add {
+                        if edits.force_keep.remove(&i) {
+                            changed = true;
+                        }
+                        changed |= edits.force_remove.insert(i);
+                    } else {
+                        if edits.force_remove.remove(&i) {
+                            changed = true;
+                        }
+                        changed |= edits.force_keep.insert(i);
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// The volume z index (slice within the base group's deface order) shown in
+    /// `viewport` for a Stack viewport, or `None` if it cannot be resolved.
+    fn base_slice_index(&self, group: &SeriesGroup, vp: &ViewportState) -> Option<usize> {
+        // The viewport shows a specific image from the group; find its position in
+        // the deface volume's slice order.
+        let img_idx = *group.image_indices.get(vp.current_stack_slice)?;
+        let geom = self.deface_volume_cache.as_ref().and_then(|(uid, g)| {
+            (uid == &group.uid).then_some(g)
+        })?;
+        geom.order.iter().position(|&i| i == img_idx)
+    }
+
     /// Recompute the removal-mask preview for the active base series.
     fn refresh_deface_preview(&mut self, ctx: &egui::Context) {
         let Some(group) = self.deface_base_group() else {
             return;
         };
         let computed = self.deface_volume_for(&group).and_then(|geom| {
-            let mask = self.mask_for_geometry(&geom)?;
+            let mut mask = self.mask_for_geometry(&geom)?;
+            let edits = self.deface_edits.for_series(&group.uid);
+            Self::apply_manual_edits(&mut mask, edits);
             Ok((geom, mask))
         });
         match computed {
@@ -2371,7 +2627,9 @@ impl DicomViewApp {
         };
 
         let computed = self.deface_volume_for(&group).and_then(|geom| {
-            let mask = self.mask_for_geometry(&geom)?;
+            let mut mask = self.mask_for_geometry(&geom)?;
+            let edits = self.deface_edits.for_series(&group.uid);
+            Self::apply_manual_edits(&mut mask, edits);
             Ok((geom, mask))
         });
         let (geom, mask) = match computed {
@@ -2889,6 +3147,59 @@ impl DicomViewApp {
                         .clicked()
                     {
                         self.deface_active_series(ui.ctx());
+                    }
+                });
+
+                // Manual brush: correct over/under-segmentation by painting the
+                // removal mask directly. Only meaningful for Stack viewports.
+                ui.horizontal_wrapped(|ui| {
+                    let brush_toggle = ui
+                        .selectable_label(self.deface_brush_on, "🖌 Brush")
+                        .on_hover_text(
+                            "Paint the removal mask by hand. Add covers missed tissue \
+                             (under-segmentation); Erase protects tissue removed by mistake \
+                             (over-segmentation). Left-drag or click on a Stack viewport.",
+                        );
+                    if brush_toggle.clicked() {
+                        self.deface_brush_on = !self.deface_brush_on;
+                    }
+                    if self.deface_brush_on {
+                        ui.separator();
+                        let mut add = self.deface_brush_add;
+                        ui.selectable_value(&mut add, true, "Add")
+                            .on_hover_text("Force-remove painted voxels (fill under-segmentation)");
+                        ui.selectable_value(&mut add, false, "Erase")
+                            .on_hover_text("Protect painted voxels (fix over-segmentation)");
+                        self.deface_brush_add = add;
+
+                        ui.label("Size");
+                        ui.add(
+                            egui::Slider::new(&mut self.deface_brush_radius_mm, 2.0..=40.0)
+                                .suffix(" mm")
+                                .clamping(egui::SliderClamping::Always),
+                        );
+                        ui.label("Slices ±");
+                        ui.add(
+                            egui::Slider::new(&mut self.deface_brush_slice_radius, 0..=8)
+                                .clamping(egui::SliderClamping::Always),
+                        );
+
+                        let count = self.deface_edits.total();
+                        if ui
+                            .add_enabled(count > 0, egui::Button::new("Clear"))
+                            .on_hover_text("Discard all manual brush edits")
+                            .clicked()
+                        {
+                            self.deface_edits.per_series.clear();
+                            if self.deface_preview.is_some() {
+                                self.refresh_deface_preview(ui.ctx());
+                            }
+                        }
+                        ui.label(
+                            egui::RichText::new(format!("{count} painted"))
+                                .small()
+                                .weak(),
+                        );
                     }
                 });
             });
@@ -4465,6 +4776,23 @@ impl eframe::App for DicomViewApp {
                                 self.active_viewport = prev_active;
                             }
 
+                            // Per-cell single click with the brush on: stamp once.
+                            if response.clicked() {
+                                let prev_active = self.active_viewport;
+                                self.active_viewport = idx;
+                                if self.deface_brush_on
+                                    && self.deface_panel_open
+                                    && self.vp().view_mode == ViewMode::Stack
+                                {
+                                    if let Some(pos) = response.interact_pointer_pos() {
+                                        if self.stamp_brush(idx, pos, ui.ctx()) {
+                                            ui.ctx().request_repaint_after(DEFACE_PREVIEW_DEBOUNCE);
+                                        }
+                                    }
+                                }
+                                self.active_viewport = prev_active;
+                            }
+
                             // Per-cell double-click: reset view for that viewport
                             if response.double_clicked() {
                                 let prev_active = self.active_viewport;
@@ -4565,9 +4893,20 @@ impl eframe::App for DicomViewApp {
                                         self.vp_mut().rotation_drag_last_pos = None;
                                     }
                                 }
-                                // Left drag -> pan
+                                // Left drag -> paint (brush) or pan
                                 else if response.dragged_by(egui::PointerButton::Primary) && !right_down {
-                                    self.vp_mut().pan += response.drag_delta();
+                                    if self.deface_brush_on
+                                        && self.deface_panel_open
+                                        && self.vp().view_mode == ViewMode::Stack
+                                    {
+                                        if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos()) {
+                                            if self.stamp_brush(idx, pos, ui.ctx()) {
+                                                ui.ctx().request_repaint_after(DEFACE_PREVIEW_DEBOUNCE);
+                                            }
+                                        }
+                                    } else {
+                                        self.vp_mut().pan += response.drag_delta();
+                                    }
                                 }
                                 // Right drag -> window/level
                                 else if response.dragged_by(egui::PointerButton::Secondary) && !left_down {
@@ -4926,9 +5265,20 @@ impl eframe::App for DicomViewApp {
                         self.vp_mut().rotation_drag_last_pos = None;
                     }
                 }
-                // Left-button drag → pan (only if right button is not pressed)
+                // Left-button drag → paint the brush (when active) or pan.
                 else if response.dragged_by(egui::PointerButton::Primary) && !right_down {
-                    self.vp_mut().pan += response.drag_delta();
+                    if self.deface_brush_on
+                        && self.deface_panel_open
+                        && self.vp().view_mode == ViewMode::Stack
+                    {
+                        if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos()) {
+                            if self.stamp_brush(0, pos, ui.ctx()) {
+                                ui.ctx().request_repaint_after(DEFACE_PREVIEW_DEBOUNCE);
+                            }
+                        }
+                    } else {
+                        self.vp_mut().pan += response.drag_delta();
+                    }
                 }
                 // Right-button drag → window / level (only if left button is not pressed)
                 // Horizontal drag adjusts Window Width; vertical drag adjusts Window Centre.
@@ -4948,6 +5298,19 @@ impl eframe::App for DicomViewApp {
                         self.vp_mut().window_width = (self.vp().window_width + delta.x * ww_scale).max(1.0);
                         self.vp_mut().window_center += -delta.y * wc_scale;
                         self.vp_mut().wl_dirty = true;
+                    }
+                }
+
+                // Single click with the brush on → stamp once at the cursor.
+                if self.deface_brush_on
+                    && self.deface_panel_open
+                    && self.vp().view_mode == ViewMode::Stack
+                    && response.clicked()
+                {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        if self.stamp_brush(0, pos, ui.ctx()) {
+                            ui.ctx().request_repaint_after(DEFACE_PREVIEW_DEBOUNCE);
+                        }
                     }
                 }
 
@@ -7013,11 +7376,15 @@ mod tests {
     }
 
     /// Compute the deface mask for the active base series, using the cached
-    /// volume. Mirrors what `deface_active_series` / `refresh_deface_preview` do.
+    /// volume and applying the manual brush edits. Mirrors what
+    /// `deface_active_series` / `refresh_deface_preview` do.
     fn active_deface_mask(app: &mut DicomViewApp) -> diface_rs::volume::Mask {
         let group = app.series_groups[0].clone();
         let geom = app.deface_volume_for(&group).expect("geometry");
-        app.mask_for_geometry(&geom).expect("mask")
+        let mut mask = app.mask_for_geometry(&geom).expect("mask");
+        let edits = app.deface_edits.for_series(&group.uid);
+        DicomViewApp::apply_manual_edits(&mut mask, edits);
+        mask
     }
 
     #[test]
@@ -7119,6 +7486,111 @@ mod tests {
             });
             output.textures_delta.clear();
         }
+    }
+
+    #[test]
+    fn manual_brush_add_and_erase_override_the_auto_mask() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_head();
+        app.viewports = vec![ViewportState::default()];
+        app.active_viewport = 0;
+        app.deface_backend = DefaceBackendSel::Segmentation;
+        app.deface_seg_region = diface_rs::MaskRegion::Face;
+
+        let base_uid = app.series_groups[0].uid.clone();
+
+        // Baseline auto mask.
+        let auto = active_deface_mask(&mut app);
+        let before = auto.count_removed();
+
+        // Add-edit a voxel deep inside the brain (which the auto mask keeps):
+        // the manual brush must be able to force its removal.
+        let (nx, ny) = {
+            let geom = app.deface_volume_for(&app.series_groups[0].clone()).unwrap();
+            (geom.width, geom.height)
+        };
+        let z = 10usize;
+        let i = (z * ny + ny / 2) * nx + nx / 2;
+        app.deface_edits
+            .for_series_mut(&base_uid)
+            .force_remove
+            .insert(i);
+        let added = active_deface_mask(&mut app);
+        assert_eq!(
+            added.count_removed(),
+            before + 1,
+            "an add-edit must force-remove one extra voxel"
+        );
+
+        // Erase-edit a voxel the auto mask removed: it must be protected.
+        // Find an index the auto mask removes.
+        let removed_idx = auto
+            .remove
+            .iter()
+            .position(|&r| r != 0)
+            .expect("auto mask removes something");
+        app.deface_edits
+            .for_series_mut(&base_uid)
+            .force_keep
+            .insert(removed_idx);
+        let erased = active_deface_mask(&mut app);
+        assert_eq!(
+            erased.count_removed(),
+            before,
+            "an erase-edit protects the added voxel from removal"
+        );
+        assert_eq!(erased.remove[removed_idx], 0, "protected voxel kept");
+        assert_eq!(erased.remove[i], 1, "added voxel still removed");
+
+        // force_keep wins when both sets contain the same voxel.
+        app.deface_edits
+            .for_series_mut(&base_uid)
+            .force_keep
+            .insert(i);
+        let both = active_deface_mask(&mut app);
+        assert_eq!(both.remove[i], 0, "force_keep wins over force_remove");
+
+        // The preview overlay must include the manually added voxel.
+        app.deface_edits.for_series_mut(&base_uid).force_keep.remove(&i);
+        app.deface_panel_open = true;
+        app.refresh_deface_preview(&ctx);
+        let preview = app.deface_preview.as_ref().expect("preview");
+        let (px, py, pz) = (i % nx, (i / nx) % ny, i / (nx * ny));
+        assert!(
+            preview.is_removed(px, py, pz),
+            "painted add must appear in the preview overlay"
+        );
+    }
+
+    #[test]
+    fn brush_paint_marks_voxels_in_the_base_volume() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_head();
+        app.viewports = vec![ViewportState::default()];
+        app.active_viewport = 0;
+        app.deface_panel_open = true;
+        app.deface_brush_on = true;
+        app.deface_brush_add = true;
+        app.deface_brush_radius_mm = 8.0;
+        app.deface_brush_slice_radius = 1;
+
+        // Render once so the viewport image rect is recorded, then paint at the
+        // image centre.
+        run_headless_frame(&mut app, &ctx);
+
+        let rect = match app.viewport_image_rects.get(0).and_then(|r| *r) {
+            Some(r) => r,
+            None => return, // headless frame did not lay out an image rect
+        };
+        let changed = app.paint_brush_at(0, rect.center());
+        assert!(changed, "painting at the image centre should mark voxels");
+        assert!(app.deface_edits.total() > 0, "edits recorded");
+        let base_uid = app.series_groups[0].uid.clone();
+        assert!(app
+            .deface_edits
+            .for_series(&base_uid)
+            .map(|e| !e.force_remove.is_empty())
+            .unwrap_or(false));
     }
 
     #[test]

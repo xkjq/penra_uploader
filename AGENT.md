@@ -309,6 +309,19 @@ Facial anonymisation crate (diface-rs)
   params, only **Load atlas…** and the template dims. Depth/Preset map onto the
   Segmentation backend via `SegBackendParams::brain_margin_mm`. Tested by
   `deface_panel_renders_for_every_backend`.
+  **Manual brush** (`🖌 Brush` in the Align panel): correct over/under-segmentation
+  by painting the mask. `ManualEdits` holds sparse `BrushEdits`
+  (`force_remove` / `force_keep` voxel-index sets) per base-series UID; **Add**
+  fills missed tissue (under-segmentation), **Erase** protects wrongly removed
+  tissue (over-segmentation; wins if a voxel is in both). Size (mm) + `Slices ±`
+  stamp a disc across neighbouring slices. `apply_manual_edits` overlays the edits
+  on the automatic mask in `refresh_deface_preview` **and**
+  `deface_active_series`, so the red overlay and the defaced copy both reflect
+  them. Painting uses `stamp_brush`/`paint_brush_at` with `screen_to_pixel`
+  (inverse of `pixel_to_screen`) to map the pointer to base-series voxels.
+  **Stack viewports only** (MPR painting unsupported). Session-only (not
+  persisted). Tests: `manual_brush_add_and_erase_override_the_auto_mask`
+  (incl. preview reflects the paint), `brush_paint_marks_voxels_in_the_base_volume`.
 - Uploader integration (uploader_rs):
   - `diface_rs::deface_dir_in_place(dir, opts)` defaces each series found in a
     directory **overwriting files in place** (names preserved), used after the

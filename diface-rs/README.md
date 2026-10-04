@@ -263,6 +263,14 @@ Common controls:
   **head (blue)**, **brain (green)**, **vault (orange)** and the intracranial
   **cavity (cyan)** — the cavity/vault boundary is exactly the deflesh keep
   region, so you can confirm it never crosses the skull.
+- **🖌 Brush** manually corrects the mask where the automatic segmentation is
+  wrong: **Add** paints extra voxels for removal (fill missed tissue,
+  under-segmentation), **Erase** protects voxels (fix over-segmentation). Set
+  the brush **Size** (mm) and how many **Slices ±** the stamp spans, then
+  left-drag or click on a **Stack** viewport. Painted corrections override both
+  the red preview overlay and the defaced copy; **Clear** discards them. Brush
+  edits are session-only (not saved to disk) and **Stack-only** (no MPR
+  painting).
 
 With the **Segmentation** backend selected the panel also shows:
 
