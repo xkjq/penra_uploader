@@ -1517,6 +1517,8 @@ struct DicomViewApp {
     deface_brain_protect_mm: f64,
     /// Deflesh: keep external tissue posterior of brain centre + this (mm).
     deface_deflesh_posterior_mm: f64,
+    /// Deflesh: feather width (mm) for the removal boundary (0 = hard cut).
+    deface_deflesh_smooth_mm: f64,
     /// Live removal-mask preview (3D + per-image), tinted in viewports that
     /// show the base series (Stack and MPR). `None` when preview is off.
     deface_preview: Option<DefacePreview>,
@@ -1593,6 +1595,7 @@ impl DicomViewApp {
             deface_cut_reference: diface_rs::CutReference::BrainFront,
             deface_brain_protect_mm: 2.0,
             deface_deflesh_posterior_mm: 0.0,
+            deface_deflesh_smooth_mm: 3.0,
             deface_preview: None,
             deface_volume_cache: None,
             deface_seg_cache: None,
@@ -2136,6 +2139,7 @@ impl DicomViewApp {
             brain_margin_mm: margin,
             brain_protect_mm: self.deface_brain_protect_mm,
             deflesh_posterior_mm: self.deface_deflesh_posterior_mm,
+            deflesh_smooth_mm: self.deface_deflesh_smooth_mm,
             seg: diface_rs::SegParams::default(),
             ..diface_rs::SegBackendParams::default()
         }
@@ -2550,6 +2554,27 @@ impl DicomViewApp {
                                     self.refresh_deface_preview(ui.ctx());
                                 }
                             }
+                            ui.separator();
+                            ui.label("Smooth");
+                            let mut smooth = self.deface_deflesh_smooth_mm;
+                            let slider = ui.add(
+                                egui::Slider::new(&mut smooth, 0.0..=15.0)
+                                    .suffix(" mm")
+                                    .clamping(egui::SliderClamping::Always),
+                            );
+                            if slider
+                                .on_hover_text(
+                                    "Feather the removal boundary by this width: the defleshed \
+                                     surface fades toward the fill instead of ending in a hard \
+                                     cut (0 = hard edge)",
+                                )
+                                .changed()
+                            {
+                                self.deface_deflesh_smooth_mm = smooth;
+                                if self.deface_preview.is_some() {
+                                    self.refresh_deface_preview(ui.ctx());
+                                }
+                            }
                         }
                         if self.deface_seg_region == diface_rs::MaskRegion::Face {
                             ui.separator();
@@ -2805,6 +2830,7 @@ impl DicomViewApp {
                         self.deface_cut_reference = diface_rs::CutReference::BrainFront;
                         self.deface_brain_protect_mm = 2.0;
                         self.deface_deflesh_posterior_mm = 0.0;
+                        self.deface_deflesh_smooth_mm = 3.0;
                         if self.deface_preview.is_some() {
                             self.refresh_deface_preview(ui.ctx());
                         }

@@ -124,6 +124,8 @@ struct DefaceConfig {
     region: diface_rs::MaskRegion,
     /// Segmentation safety band (mm) kept around the intracranial core.
     brain_protect_mm: f64,
+    /// Deflesh: feather width (mm) for the removal boundary (0 = hard cut).
+    deflesh_smooth_mm: f64,
 }
 
 impl Default for DefaceConfig {
@@ -133,6 +135,7 @@ impl Default for DefaceConfig {
             backend: DefaceBackendChoice::Geometric,
             region: diface_rs::MaskRegion::Face,
             brain_protect_mm: 2.0,
+            deflesh_smooth_mm: 3.0,
         }
     }
 }
@@ -150,6 +153,7 @@ impl DefaceConfig {
                 diface_rs::BackendKind::Segmentation(diface_rs::SegBackendParams {
                     region: self.region,
                     brain_protect_mm: self.brain_protect_mm,
+                    deflesh_smooth_mm: self.deflesh_smooth_mm,
                     ..diface_rs::SegBackendParams::default()
                 })
             }
@@ -2195,6 +2199,25 @@ impl eframe::App for AppState {
                                 )
                                 .changed();
                         });
+                        if self.deface_cfg.region == diface_rs::MaskRegion::ExternalSoftTissue {
+                            ui.horizontal(|ui| {
+                                ui.label("Smooth deflesh edge:");
+                                deface_changed |= ui
+                                    .add(
+                                        egui::Slider::new(
+                                            &mut self.deface_cfg.deflesh_smooth_mm,
+                                            0.0..=15.0,
+                                        )
+                                        .suffix(" mm")
+                                        .clamping(egui::SliderClamping::Always),
+                                    )
+                                    .on_hover_text(
+                                        "Feather the removal boundary: the defleshed surface \
+                                         fades instead of ending in a hard cut (0 = hard edge)",
+                                    )
+                                    .changed();
+                            });
+                        }
                     }
                 }
                 if deface_changed {

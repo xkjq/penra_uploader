@@ -358,7 +358,9 @@ pub fn deface_volume(
     let mut removed = 0usize;
     for (i, r) in mask.remove.iter().enumerate() {
         if *r != 0 {
-            volume.data[i] = fill_raw;
+            let orig = volume.data[i];
+            let w = mask.weight_at(i);
+            volume.data[i] = orig + (fill_raw - orig) * w;
             removed += 1;
         }
     }

@@ -29,6 +29,8 @@ OPTIONS:
                                     (remove external soft tissue/bone)
     --brain-protect <MM>            Segmentation: safety band kept around the
                                     intracranial core (default: 2)
+    --deflesh-smooth <MM>           Deflesh: feather the removal boundary by MM
+                                    (0 = hard cut; default: 3)
     --deflesh-posterior <MM|all>    Deflesh: keep external tissue posterior of
                                     brain centre + MM (0 = keep neck/back; all
                                     = remove all external tissue)
@@ -84,6 +86,7 @@ fn run() -> Result<(), String> {
     let mut seg_region = diface_rs::MaskRegion::Face;
     let mut deflesh_posterior_mm = 0.0f64;
     let mut brain_protect_mm = 2.0f64;
+    let mut deflesh_smooth_mm = 3.0f64;
 
     let mut i = 0;
     while i < args.len() {
@@ -155,6 +158,12 @@ fn run() -> Result<(), String> {
                 brain_protect_mm = v
                     .parse::<f64>()
                     .map_err(|_| format!("invalid --brain-protect '{v}'"))?;
+            }
+            "--deflesh-smooth" => {
+                let v = take_value(&mut i)?;
+                deflesh_smooth_mm = v
+                    .parse::<f64>()
+                    .map_err(|_| format!("invalid --deflesh-smooth '{v}'"))?;
             }
             "--deflesh-posterior" => {
                 let v = take_value(&mut i)?;
@@ -274,6 +283,7 @@ fn run() -> Result<(), String> {
             region: seg_region,
             brain_protect_mm,
             deflesh_posterior_mm,
+            deflesh_smooth_mm,
             seg: diface_rs::SegParams {
                 threshold: params.threshold.clone(),
                 ..diface_rs::SegParams::default()

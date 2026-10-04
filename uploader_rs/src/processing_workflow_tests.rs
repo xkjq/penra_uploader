@@ -37,11 +37,13 @@ fn deface_config_maps_to_backend_options() {
         backend: DefaceBackendChoice::Segmentation,
         region: diface_rs::MaskRegion::ExternalSoftTissue,
         brain_protect_mm: 7.5,
+        deflesh_smooth_mm: 5.0,
     };
     match cfg.to_options().backend {
         diface_rs::BackendKind::Segmentation(p) => {
             assert_eq!(p.region, diface_rs::MaskRegion::ExternalSoftTissue);
             assert!((p.brain_protect_mm - 7.5).abs() < 1e-9);
+            assert!((p.deflesh_smooth_mm - 5.0).abs() < 1e-9);
         }
         _ => panic!("expected a segmentation backend"),
     }

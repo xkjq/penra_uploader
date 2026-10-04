@@ -404,6 +404,76 @@ fn vault_is_a_shell_that_excludes_the_face() {
 }
 
 #[test]
+fn deflesh_smooth_feathers_the_boundary_without_changing_removal() {
+    use diface_rs::MaskRegion;
+    let volume = head_with_table();
+    let mk = |smooth: f64| {
+        SegmentationBackend::new(SegBackendParams {
+            region: MaskRegion::ExternalSoftTissue,
+            brain_margin_mm: 10.0,
+            deflesh_smooth_mm: smooth,
+            ..SegBackendParams::default()
+        })
+        .compute_mask(&volume)
+        .expect("deflesh mask")
+    };
+
+    let hard = mk(0.0);
+    let soft = mk(6.0);
+
+    // The binary removal set is identical: feathering only softens the edge, so
+    // the safety guarantee (0 brain / 0 vault removed) still holds.
+    assert_eq!(
+        hard.count_removed(),
+        soft.count_removed(),
+        "feathering must not change which voxels are removed"
+    );
+    // The hard mask has no feather buffer; the soft one does.
+    assert!(hard.weight.is_empty());
+    assert_eq!(soft.weight.len(), soft.remove.len());
+
+    // At least one removed voxel is partially blended (0 < w < 1)...
+    let partial = soft
+        .weight
+        .iter()
+        .enumerate()
+        .filter(|(i, w)| soft.remove[*i] != 0 && **w > 0.0 && **w < 1.0)
+        .count();
+    assert!(partial > 0, "expected feathered (partial) voxels");
+    // ...and the boundary itself (weight 0) exists.
+    let zero = soft
+        .weight
+        .iter()
+        .enumerate()
+        .filter(|(i, w)| soft.remove[*i] != 0 && **w == 0.0)
+        .count();
+    assert!(zero > 0, "expected boundary voxels at weight 0");
+
+    // Deeper into the removed region the weight approaches 1.
+    assert!(
+        soft.weight.iter().cloned().fold(0.0f32, f32::max) >= 0.999,
+        "some removed voxels should be fully removed"
+    );
+
+    // Feathering does not add brain removal.
+    let seg = segment(&volume, &SegParams::default()).expect("segment");
+    let mut brain_removed = 0usize;
+    for z in 0..volume.nz() {
+        for y in 0..volume.ny() {
+            for x in 0..volume.nx() {
+                let cx = (x / seg.stride[0]).min(seg.dims[0] - 1);
+                let cy = (y / seg.stride[1]).min(seg.dims[1] - 1);
+                let cz = (z / seg.stride[2]).min(seg.dims[2] - 1);
+                if seg.brain_at(cx, cy, cz) && soft.is_removed(x, y, z) {
+                    brain_removed += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(brain_removed, 0, "feathered deflesh must keep all brain");
+}
+
+#[test]
 fn segmentation_rejects_empty_volume() {
     let volume = Volume {
         data: Vec::new(),

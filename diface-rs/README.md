@@ -73,6 +73,7 @@ Run `diface --help` for all options:
 | `--extent` | Preserve-ellipsoid scale per axis, `A,L,S` | `1,1,1` |
 | `--seg-region` | Segmentation region: `face`, `deflesh` | `face` |
 | `--brain-protect` | Segmentation: safety band (mm) kept around the intracranial core | `2` |
+| `--deflesh-smooth` | Deflesh: feather the removal boundary by mm (`0` = hard cut) | `3` |
 | `--deflesh-posterior` | Deflesh: keep external tissue posterior of brain centre + mm, or `all` | `0` |
 | `--fill` | `min`, `zero`, or a raw value | `min` |
 | `--min-slices` | Skip smaller series | `3` |
@@ -175,7 +176,13 @@ omits it). `Atlas::to_bytes`/`from_bytes` read/write the format, and the viewer'
 
    `SegBackendParams::brain_margin_mm` widens the margin in front of the cut
    reference; `vault_shell_radius` sets the vault shell thickness (coarse voxels);
-   `deflesh_posterior_mm` gates deflesh's posterior extent (keeps the neck).
+   `deflesh_posterior_mm` gates deflesh's posterior extent (keeps the neck);
+   `deflesh_smooth_mm` (default `3`, CLI `--deflesh-smooth`) **feathers** the
+   removal boundary: removed voxels within that distance of the keep edge are
+   blended toward the fill by a weight that ramps 0 → 1, so the defleshed surface
+   fades smoothly instead of ending in a hard wall. It does not change *which*
+   voxels are removed, so the 0 brain / 0 vault guarantee still holds (`0` = hard
+   cut).
 
 This backend is deliberately conservative — it only removes tissue between the
 face and the brain, so on a tight-FOV head CT it removes a few percent
@@ -260,7 +267,8 @@ Common controls:
 With the **Segmentation** backend selected the panel also shows:
 
 - **Region** – `Face` (flat cut) or `Deflesh` (strip external tissue/bone),
-  with a **Keep back-of-head after** slider for Deflesh,
+  with **Keep back-of-head after** and **Smooth** (feather width) sliders for
+  Deflesh,
 - **Cut at** – `Brain front` or `Skull front` (Face region only); the skull
   reference removes the whole face and falls back to the brain front when no
   vault is detected (MR),

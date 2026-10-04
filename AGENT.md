@@ -215,6 +215,17 @@ Facial anonymisation crate (diface-rs)
   the run-level `--brain-protect` CLI flag (default 2); the same value lives on
   `SegBackendParams`, and the ambiguous `DefaceOptions.brain_protect_mm` was
   removed (it was never read). `seg_debug --protect MM` exercises it.
+  Deflesh **boundary feathering**: `SegBackendParams::deflesh_smooth_mm`
+  (default 3, CLI `--deflesh-smooth`, viewer **Smooth** slider,
+  uploader `DefaceConfig::deflesh_smooth_mm`) blends the defleshed edge instead
+  of a hard wall. `feather_boundary` runs a 6-connected multi-source BFS from the
+  removed/kept boundary (seeded from kept neighbours, the volume border, and the
+  coarse `core` keep cells) and writes a per-voxel `Mask::weight` that ramps
+  0 → 1 over `deflesh_smooth_mm`. The binary `remove` flags are unchanged, so the
+  0 brain / 0 vault guarantee holds; `Mask::weight` (empty = binary) is consumed
+  by `series::write_defaced_series` and `deface_volume`, which compute
+  `orig + (fill - orig) * w`. Test
+  `deflesh_smooth_feathers_the_boundary_without_changing_removal`.
   Types:
   `SegParams`, `Segmentation`, `segment()`, `SegBackendParams`,
   `SegmentationBackend`; `BackendKind::Segmentation`; CLI `--backend
@@ -366,8 +377,8 @@ Current status
   - `--brain-protect` (segmentation safety band) is wired; the dead
     `DefaceOptions.brain_protect_mm` field was removed.
   - The viewer Align panel exposes segmentation **Cut at** and **Safety band**.
-  - The uploader Settings panel exposes backend/region/safety band via
-    `DefaceConfig`.
+  - The uploader Settings panel exposes backend/region/safety band/deflesh
+    smooth via `DefaceConfig`.
   - `.github/workflows/build-windows.yml` builds and uploads the `diface.exe`
     CLI artifact alongside diviz/dicor/divue/uploader.
 

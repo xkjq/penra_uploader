@@ -106,11 +106,17 @@ fn add3(a: V3, b: V3) -> V3 {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 
-/// A boolean per-voxel removal mask. `1` means "remove / blank this voxel".
+/// A per-voxel removal mask. `remove[i] != 0` means "this voxel is removed /
+/// blanked". `weight` optionally carries how strongly each removed voxel is
+/// blended toward the fill value (`1.0` = fully removed, `< 1.0` = feathered),
+/// so a boundary can fade instead of ending in a hard wall. When `weight` is
+/// empty the removal is binary (`1.0` for every removed voxel).
 #[derive(Clone, Debug)]
 pub struct Mask {
     pub dims: [usize; 3],
     pub remove: Vec<u8>,
+    /// Optional per-voxel removal strength in `0..=1`, same length as `remove`.
+    pub weight: Vec<f32>,
 }
 
 impl Mask {
@@ -119,6 +125,7 @@ impl Mask {
         Mask {
             dims,
             remove: vec![0u8; n],
+            weight: Vec::new(),
         }
     }
 
@@ -149,6 +156,32 @@ impl Mask {
     pub fn set(&mut self, x: usize, y: usize, z: usize, remove: bool) {
         let i = self.idx(x, y, z);
         self.remove[i] = remove as u8;
+    }
+
+    /// Removal strength at a flat index: `1.0` unless a feathered `weight` says
+    /// otherwise. Removed voxels with no explicit weight are fully removed.
+    #[inline]
+    pub fn weight_at(&self, i: usize) -> f32 {
+        if self.weight.is_empty() {
+            1.0
+        } else {
+            self.weight.get(i).copied().unwrap_or(1.0)
+        }
+    }
+
+    /// Enable a feathered weight buffer (initialised to `1.0` everywhere).
+    pub fn ensure_weight(&mut self) {
+        if self.weight.len() != self.remove.len() {
+            self.weight = vec![1.0f32; self.remove.len()];
+        }
+    }
+
+    /// Set the removal strength for a voxel (enables the weight buffer lazily).
+    #[inline]
+    pub fn set_weight(&mut self, x: usize, y: usize, z: usize, w: f32) {
+        self.ensure_weight();
+        let i = self.idx(x, y, z);
+        self.weight[i] = w.clamp(0.0, 1.0);
     }
 
     pub fn count_removed(&self) -> usize {

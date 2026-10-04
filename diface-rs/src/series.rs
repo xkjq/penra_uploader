@@ -457,10 +457,14 @@ pub fn write_defaced_series(
         let base = z * nxy;
         let mut slice: Vec<f32> = Vec::with_capacity(nxy);
         for i in 0..nxy {
+            let orig = volume.data[base + i];
             let v = if mask.remove[base + i] != 0 {
-                fill_raw
+                // Feathered masks blend toward the fill by `weight`; a binary
+                // mask (no weight buffer) is fully replaced.
+                let w = mask.weight_at(base + i);
+                orig + (fill_raw - orig) * w
             } else {
-                volume.data[base + i]
+                orig
             };
             slice.push(v);
         }

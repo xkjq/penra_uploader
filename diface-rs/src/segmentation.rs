@@ -574,6 +574,134 @@ fn protected_core(
     core
 }
 
+/// Feather the removal weight of a deflesh mask so the keep boundary fades
+/// instead of ending in a hard wall.
+///
+/// For every removed voxel, the weight ramps linearly from `0` at the nearest
+/// kept voxel to `1` at `smooth_mm` inside the removed region. Distance is
+/// measured with a 6-connected multi-source BFS seeded from every removed voxel
+/// that neighbours a kept voxel (or the volume border) — i.e. the boundary of
+/// the removed set. This leaves the binary `remove` flags untouched, so the
+/// safety guarantees (0 brain / 0 vault removed) are unchanged; only the
+/// rendering strength at the edge is softened. The optional `core` (coarse keep
+/// grid) is used to respect the true keep boundary, which is finer than the
+/// binary mask on the coarse grid.
+fn feather_boundary(
+    mask: &mut Mask,
+    volume: &Volume,
+    smooth_mm: f64,
+    core: &[u8],
+    cd: [usize; 3],
+    stride: [usize; 3],
+) {
+    let (nx, ny, nz) = (volume.nx(), volume.ny(), volume.nz());
+    if nx == 0 || ny == 0 || nz == 0 {
+        return;
+    }
+    // Voxel-scale distance in cells along each axis (the feather is isotropic in
+    // millimetres, so the per-axis step differs when spacing is anisotropic).
+    let step = [
+        ((volume.spacing[0].abs().max(1e-3) / smooth_mm).max(1e-6)) as f32,
+        ((volume.spacing[1].abs().max(1e-3) / smooth_mm).max(1e-6)) as f32,
+        ((volume.spacing[2].abs().max(1e-3) / smooth_mm).max(1e-6)) as f32,
+    ];
+
+    let idx = |x: usize, y: usize, z: usize| (z * ny + y) * nx + x;
+    let n = nx * ny * nz;
+    // Normalised distance from the boundary (0 = boundary, >=1 = fully removed).
+    let mut dist = vec![f32::INFINITY; n];
+    let mut queue: VecDeque<usize> = VecDeque::new();
+
+    // Seed: removed voxels adjacent to a kept voxel (or the volume border), or
+    // adjacent to a coarse keep cell (the true boundary is the coarse `core`).
+    for z in 0..nz {
+        let cz = (z / stride[2]).min(cd[2] - 1);
+        for y in 0..ny {
+            let cy = (y / stride[1]).min(cd[1] - 1);
+            for x in 0..nx {
+                let i = idx(x, y, z);
+                if mask.remove[i] == 0 {
+                    continue;
+                }
+                let cx = (x / stride[0]).min(cd[0] - 1);
+                // A removed voxel sitting on a coarse keep cell is boundary.
+                let mut boundary =
+                    !core.is_empty() && core[(cz * cd[1] + cy) * cd[0] + cx] != 0;
+                if !boundary {
+                    for (dx, dy, dz) in NEIGHBORS6 {
+                        let (ox, oy, oz) = (x as isize + dx, y as isize + dy, z as isize + dz);
+                        if ox < 0 || oy < 0 || oz < 0 {
+                            boundary = true;
+                            break;
+                        }
+                        let (ox, oy, oz) = (ox as usize, oy as usize, oz as usize);
+                        if ox >= nx || oy >= ny || oz >= nz {
+                            boundary = true;
+                            break;
+                        }
+                        if mask.remove[idx(ox, oy, oz)] == 0 {
+                            boundary = true;
+                            break;
+                        }
+                    }
+                }
+                if boundary {
+                    dist[i] = 0.0;
+                    queue.push_back(i);
+                }
+            }
+        }
+    }
+
+    // 6-connected BFS with anisotropic step cost; keep the min distance.
+    while let Some(i) = queue.pop_front() {
+        let x = i % nx;
+        let y = (i / nx) % ny;
+        let z = i / (nx * ny);
+        let d = dist[i];
+        for (k, (dx, dy, dz)) in NEIGHBORS6.iter().enumerate() {
+            let cost = step[k / 2];
+            let (ox, oy, oz) = (x as isize + dx, y as isize + dy, z as isize + dz);
+            if ox < 0 || oy < 0 || oz < 0 {
+                continue;
+            }
+            let (ox, oy, oz) = (ox as usize, oy as usize, oz as usize);
+            if ox >= nx || oy >= ny || oz >= nz {
+                continue;
+            }
+            let j = idx(ox, oy, oz);
+            if mask.remove[j] == 0 {
+                continue;
+            }
+            let nd = d + cost;
+            if nd < dist[j] {
+                dist[j] = nd;
+                queue.push_back(j);
+            }
+        }
+    }
+
+    // weight = clamp(distance, 0..1); 0 at the boundary, 1 at/beyond smooth_mm.
+    mask.ensure_weight();
+    for i in 0..n {
+        if mask.remove[i] == 0 {
+            continue;
+        }
+        let d = if dist[i].is_finite() { dist[i] } else { 1.0 };
+        mask.weight[i] = d.clamp(0.0, 1.0);
+    }
+}
+
+/// The 6 face-neighbours `(dx, dy, dz)`; index/2 gives the axis (0=x,1=y,2=z).
+const NEIGHBORS6: [(isize, isize, isize); 6] = [
+    (-1, 0, 0),
+    (1, 0, 0),
+    (0, -1, 0),
+    (0, 1, 0),
+    (0, 0, -1),
+    (0, 0, 1),
+];
+
 /// The connected component (of a coarse binary grid) that contains the voxel
 /// extreme in some direction, chosen by `score` (maximised when `maximize`).
 fn component_of_extreme<F: Fn(V3) -> f64>(
@@ -1116,6 +1244,13 @@ pub struct SegBackendParams {
     /// Larger values are safer (and remove slightly less face); `0` disables the
     /// extra band. Default `2.0`.
     pub brain_protect_mm: f64,
+    /// Feather width (mm) for [`MaskRegion::ExternalSoftTissue`] ("deflesh").
+    /// Instead of a hard binary wall at the keep boundary, removed voxels within
+    /// this distance of the boundary are blended toward the fill by a weight that
+    /// ramps from `0` at the boundary to `1` this far inside — so the defleshed
+    /// surface fades smoothly rather than ending in a flat cut. `0` disables the
+    /// feather (hard cut); the default `3.0` gives a soft edge.
+    pub deflesh_smooth_mm: f64,
 }
 
 impl Default for SegBackendParams {
@@ -1129,6 +1264,7 @@ impl Default for SegBackendParams {
             max_removed_fraction: 0.6,
             deflesh_posterior_mm: 0.0,
             brain_protect_mm: 2.0,
+            deflesh_smooth_mm: 3.0,
         }
     }
 }
@@ -1297,6 +1433,21 @@ impl SegmentationBackend {
                         removed += 1;
                     }
                 }
+            }
+
+            // Optional feather: ramp the removal weight from 0 at the kept
+            // boundary to 1 `deflesh_smooth_mm` inside, so the surface fades
+            // instead of ending in a hard wall. Only the boundary voxels change;
+            // the binary `remove` set (and the safety guarantee) is unaffected.
+            if self.params.deflesh_smooth_mm > 0.0 {
+                feather_boundary(
+                    &mut mask,
+                    volume,
+                    self.params.deflesh_smooth_mm,
+                    &core,
+                    seg.dims,
+                    seg.stride,
+                );
             }
 
             let max_removed = (self.params.max_removed_fraction * volume.len() as f64) as usize;
