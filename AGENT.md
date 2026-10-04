@@ -269,8 +269,23 @@ Facial anonymisation crate (diface-rs)
   `tint_segmentation`.
   Preview is on by default (`deface_preview_on`, `toggle_deface_preview` flips
   the preference) but **only auto-computes while the Align panel is open**
-  (`deface_panel_open`); closing the panel clears the overlay. It refreshes each
-  frame and after `deface_active_series`.
+  (`deface_panel_open`); closing the panel clears the overlay.
+  Performance: the preview path is expensive (the volume build re-decodes every
+  voxel to `f32`; the segmentation backend re-runs `segment()`; the Areas overlay
+  segments again). Three caches/deferrals avoid redoing it on every drag frame:
+  - `deface_volume_cache: Option<(String, DefaceGeometry)>` — reconstructed
+    volume + geometry, keyed by base series UID (`deface_volume_for`), so a
+    slider change does not re-decode. Invalidated in `load_files`.
+  - `deface_seg_cache: Option<(String, diface_rs::Segmentation)>`
+    (`segmentation_for`), shared by the mask and the Areas overlay. The new
+    `SegmentationBackend::compute_mask_from_segmentation` builds the mask from an
+    existing segmentation, so only the cut plane is recomputed (CT ~340 ms ->
+    ~55 ms per adjustment).
+  - **Debounce**: a changed parameter sets `deface_preview_dirty` and a timestamp;
+    `flush_pending_deface_preview` (end of `update`, `DEFACE_PREVIEW_DEBOUNCE`
+    = 120 ms) recomputes once the drag settles instead of per intermediate value.
+  Tests: `deface_volume_and_segmentation_are_cached_across_param_changes`,
+  `deface_preview_debounce_coalesces_and_flushes`.
   The Align panel shows **only the controls the active backend reads**
   (per-backend gating in `deface_alignment_ui`): Geometric = Preset / Algorithm /
   Yaw / Depth / Extent / Preserve; Segmentation = Preset / Depth / Preserve /

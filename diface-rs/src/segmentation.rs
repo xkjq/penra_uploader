@@ -1158,10 +1158,27 @@ impl crate::backend::DefacingBackend for SegmentationBackend {
     }
 
     fn compute_mask(&self, volume: &Volume) -> Result<Mask, String> {
+        let seg = segment(volume, &self.params.seg)?;
+        self.compute_mask_from_segmentation(volume, &seg)
+    }
+}
+
+impl SegmentationBackend {
+    /// Build the removal mask from an already-computed [`Segmentation`].
+    ///
+    /// The segmentation (threshold + morphology + brain/vault/cavity grow) is
+    /// the dominant cost of this backend and does not depend on the defacing
+    /// parameters that only move the cut plane (margin, region, safety band).
+    /// Callers that tune those parameters live — e.g. the viewer preview — can
+    /// segment once and reuse it across slider changes.
+    pub fn compute_mask_from_segmentation(
+        &self,
+        volume: &Volume,
+        seg: &Segmentation,
+    ) -> Result<Mask, String> {
         if volume.is_empty() {
             return Err("cannot deface an empty volume".to_string());
         }
-        let seg = segment(volume, &self.params.seg)?;
         if seg.brain_count() == 0 {
             return Err("segmentation found no brain region; refusing to deface".to_string());
         }

@@ -37,6 +37,11 @@ const CT_WL_PRESETS: &[(&str, f32, f32)] = &[
     ("Mediastinum", 50.0, 350.0),
 ];
 
+/// How long defacing input must be idle before the live preview recomputes.
+/// Dragging a slider fires `changed()` every frame; without this debounce the
+/// whole mask + overlay would be rebuilt on each intermediate value.
+const DEFACE_PREVIEW_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
+
 /// Wheel input (in egui points) required before advancing one slice. `smooth_scroll_delta`
 /// delivers a decaying tail after each physical notch, so stepping directly on every
 /// non-zero delta scrolls several slices per notch; accumulating to this threshold and
@@ -1145,6 +1150,7 @@ fn decode_single_file(path: &PathBuf) -> Result<LoadedImage, String> {
 /// `[col_dir, row_dir, slice_dir]`; this matches `diface-rs`'s `series.rs` and
 /// handles oblique and gantry-tilted stacks, since the geometric backend works
 /// in patient space and is robust to the residual shear.
+#[derive(Clone)]
 struct DefaceGeometry {
     /// Volume whose z-axis follows the sorted slice order.
     volume: DifaceVolume,
@@ -1514,6 +1520,19 @@ struct DicomViewApp {
     /// Live removal-mask preview (3D + per-image), tinted in viewports that
     /// show the base series (Stack and MPR). `None` when preview is off.
     deface_preview: Option<DefacePreview>,
+    /// Cached reconstructed volume + geometry for the active base series, so
+    /// changing a defacing setting does not re-decode and re-convert every
+    /// voxel on each drag frame. Keyed by the base series UID.
+    deface_volume_cache: Option<(String, DefaceGeometry)>,
+    /// Cached segmentation for the active base series, keyed by the series UID.
+    /// Shared by the segmentation mask and the Areas overlay so a slider drag
+    /// segments once instead of on every frame.
+    deface_seg_cache: Option<(String, diface_rs::Segmentation)>,
+    /// A defacing parameter changed; the preview must be recomputed once the
+    /// input settles (debounced so dragging does not recompute every frame).
+    deface_preview_dirty: bool,
+    /// When the preview first became dirty, for the debounce timer.
+    deface_preview_dirty_since: Option<std::time::Instant>,
     /// Viewports whose inline window/level editor is open (toggled by
     /// double-clicking the W/L overlay).
     wl_editor_open: Vec<bool>,
@@ -1575,6 +1594,10 @@ impl DicomViewApp {
             deface_brain_protect_mm: 2.0,
             deface_deflesh_posterior_mm: 0.0,
             deface_preview: None,
+            deface_volume_cache: None,
+            deface_seg_cache: None,
+            deface_preview_dirty: false,
+            deface_preview_dirty_since: None,
             wl_editor_open: Vec::new(),
             last_navs: Vec::new(),
         }
@@ -1587,6 +1610,10 @@ impl DicomViewApp {
         self.error = None;
         self.images.clear();
         self.series_groups.clear();
+        // Any cached deface volume/segmentation belongs to the old images.
+        self.deface_volume_cache = None;
+        self.deface_seg_cache = None;
+        self.deface_preview = None;
         // reset to a single default viewport
         self.viewports = vec![ViewportState::default()];
         self.active_viewport = 0;
@@ -2075,49 +2102,99 @@ impl DicomViewApp {
         )
     }
 
-    /// Build the deface geometry and removal mask for a series group with the
-    /// current settings (geometric algorithm or atlas template).
-    fn compute_deface_mask(
-        &self,
-        group: &SeriesGroup,
-    ) -> Result<(DefaceGeometry, diface_rs::volume::Mask), String> {
+    /// Reconstruct (and cache) the deface volume for the active base series.
+    ///
+    /// The volume build re-decodes and re-converts every voxel to `f32`, which
+    /// is the single most expensive step in the preview path. Caching it means
+    /// changing a slider only re-runs the mask computation, not the whole
+    /// reconstruction. The cache is keyed by the base series UID and invalidated
+    /// when the images are reloaded (see `load_files`).
+    fn deface_volume_for(&mut self, group: &SeriesGroup) -> Result<DefaceGeometry, String> {
+        if let Some((uid, geom)) = &self.deface_volume_cache {
+            if uid == &group.uid {
+                return Ok(geom.clone());
+            }
+        }
         let geom = build_deface_volume(&self.images, &group.image_indices)?;
-        let mask = match self.deface_backend {
-            DefaceBackendSel::Atlas => diface_rs::AtlasBackend::new(
+        self.deface_volume_cache = Some((group.uid.clone(), geom.clone()));
+        Ok(geom)
+    }
+
+    /// The segmentation parameters derived from the current UI state.
+    fn seg_backend_params(&self) -> diface_rs::SegBackendParams {
+        let p = &self.deface_params;
+        // Map the geometric alignment controls onto the segmentation backend so
+        // the same sliders/presets apply:
+        //  - Depth (`anterior_offset_mm`) reduces the safety margin in front of
+        //    the brain (positive == removes more face).
+        //  - Preset/preserve fraction widens the margin (more brain-safe).
+        let margin = (12.0 - p.anterior_offset_mm - (p.preserve_fraction - 0.82) * 40.0)
+            .clamp(0.0, 40.0);
+        diface_rs::SegBackendParams {
+            region: self.deface_seg_region,
+            cut_reference: self.deface_cut_reference,
+            brain_margin_mm: margin,
+            brain_protect_mm: self.deface_brain_protect_mm,
+            deflesh_posterior_mm: self.deface_deflesh_posterior_mm,
+            seg: diface_rs::SegParams::default(),
+            ..diface_rs::SegBackendParams::default()
+        }
+    }
+
+    /// Segment the volume, reusing the cached result when the volume (and thus
+    /// the segmentation inputs) is unchanged. Keyed by the base series UID.
+    fn segmentation_for(
+        &mut self,
+        volume: &DifaceVolume,
+        key: &str,
+    ) -> Result<diface_rs::Segmentation, String> {
+        if let Some((cached_key, seg)) = &self.deface_seg_cache {
+            if cached_key == key {
+                return Ok(seg.clone());
+            }
+        }
+        let seg = diface_rs::segment(volume, &diface_rs::SegParams::default())?;
+        self.deface_seg_cache = Some((key.to_string(), seg.clone()));
+        Ok(seg)
+    }
+
+    /// Compute a removal mask for an already-built geometry with the current
+    /// settings (geometric algorithm, atlas template, or segmentation).
+    ///
+    /// For the segmentation backend, a cached [`diface_rs::Segmentation`] is
+    /// reused when possible: only the cut plane depends on the live settings, so
+    /// dragging a slider must not re-run the (expensive) segmentation.
+    fn mask_for_geometry(
+        &mut self,
+        geom: &DefaceGeometry,
+    ) -> Result<diface_rs::volume::Mask, String> {
+        match self.deface_backend {
+            DefaceBackendSel::Atlas => Ok(diface_rs::AtlasBackend::new(
                 self.deface_atlas.clone(),
                 diface_rs::AtlasParams::default(),
             )
-            .compute_mask(&geom.volume)?,
+            .compute_mask(&geom.volume)?),
             DefaceBackendSel::Segmentation => {
-                let p = &self.deface_params;
-                // Map the geometric alignment controls onto the segmentation
-                // backend so the same sliders/presets apply:
-                //  - Depth (`anterior_offset_mm`) reduces the safety margin in
-                //    front of the brain (positive == removes more face).
-                //  - Preset/preserve fraction widens the margin (more brain-safe).
-                let margin = (12.0 - p.anterior_offset_mm
-                    - (p.preserve_fraction - 0.82) * 40.0)
-                    .clamp(0.0, 40.0);
-                let params = diface_rs::SegBackendParams {
-                    region: self.deface_seg_region,
-                    cut_reference: self.deface_cut_reference,
-                    brain_margin_mm: margin,
-                    brain_protect_mm: self.deface_brain_protect_mm,
-                    deflesh_posterior_mm: self.deface_deflesh_posterior_mm,
-                    seg: diface_rs::SegParams::default(),
-                    ..diface_rs::SegBackendParams::default()
-                };
-                diface_rs::SegmentationBackend::new(params).compute_mask(&geom.volume)?
+                let params = self.seg_backend_params();
+                let key = format!(
+                    "{}x{}x{}:{}",
+                    geom.volume.dims[0], geom.volume.dims[1], geom.volume.dims[2], geom.volume.modality
+                );
+                let seg = self.segmentation_for(&geom.volume, &key)?;
+                Ok(diface_rs::SegmentationBackend::new(params)
+                    .compute_mask_from_segmentation(&geom.volume, &seg)?)
             }
             DefaceBackendSel::Geometric => {
-                GeometricBackend::new(self.deface_params.clone()).compute_mask(&geom.volume)?
+                Ok(GeometricBackend::new(self.deface_params.clone()).compute_mask(&geom.volume)?)
             }
-        };
-        Ok((geom, mask))
+        }
     }
 
     /// Toggle the live removal-mask preview for the active series.
     fn toggle_deface_preview(&mut self, ctx: &egui::Context) {
+        // An explicit recompute supersedes any pending debounced one.
+        self.deface_preview_dirty = false;
+        self.deface_preview_dirty_since = None;
         self.deface_preview_on = !self.deface_preview_on;
         if self.deface_preview_on {
             self.refresh_deface_preview(ctx);
@@ -2133,7 +2210,11 @@ impl DicomViewApp {
         let Some(group) = self.deface_base_group() else {
             return;
         };
-        match self.compute_deface_mask(&group) {
+        let computed = self.deface_volume_for(&group).and_then(|geom| {
+            let mask = self.mask_for_geometry(&geom)?;
+            Ok((geom, mask))
+        });
+        match computed {
             Ok((geom, mask)) => {
                 let nx = geom.width;
                 let ny = geom.height;
@@ -2158,9 +2239,18 @@ impl DicomViewApp {
                 }
                 let removed = mask.count_removed();
 
-                // Optional segmentation-area labels for the overlay.
+                // Optional segmentation-area labels for the overlay. Reuse the
+                // cached segmentation when available so the Areas overlay does
+                // not segment the volume a second time.
                 let (volume_labels, per_image_labels) = if self.deface_show_segmentation {
-                    match diface_rs::segment(&geom.volume, &diface_rs::SegParams::default()) {
+                    let key = format!(
+                        "{}x{}x{}:{}",
+                        geom.volume.dims[0],
+                        geom.volume.dims[1],
+                        geom.volume.dims[2],
+                        geom.volume.modality
+                    );
+                    match self.segmentation_for(&geom.volume, &key) {
                         Ok(seg) => {
                             let mut vl = vec![0u8; n * nz];
                             let mut pil: HashMap<usize, Vec<u8>> = HashMap::new();
@@ -2216,6 +2306,28 @@ impl DicomViewApp {
         }
     }
 
+    /// Recompute the preview if a parameter change has been idle for the debounce
+    /// window. This coalesces drag/slider updates into a single recompute.
+    fn flush_pending_deface_preview(&mut self, ctx: &egui::Context) {
+        if !self.deface_preview_dirty {
+            return;
+        }
+        let Some(since) = self.deface_preview_dirty_since else {
+            self.deface_preview_dirty = false;
+            return;
+        };
+        if since.elapsed() < DEFACE_PREVIEW_DEBOUNCE {
+            // Still settling: keep the repaint scheduled.
+            ctx.request_repaint_after(DEFACE_PREVIEW_DEBOUNCE);
+            return;
+        }
+        self.deface_preview_dirty = false;
+        self.deface_preview_dirty_since = None;
+        if self.deface_preview_on && self.deface_panel_open {
+            self.refresh_deface_preview(ctx);
+        }
+    }
+
     /// Rebuild the texture of every viewport.
     fn redraw_all_viewports(&mut self, ctx: &egui::Context) {
         let saved = self.active_viewport;
@@ -2233,7 +2345,11 @@ impl DicomViewApp {
             return;
         };
 
-        let (geom, mask) = match self.compute_deface_mask(&group) {
+        let computed = self.deface_volume_for(&group).and_then(|geom| {
+            let mask = self.mask_for_geometry(&geom)?;
+            Ok((geom, mask))
+        });
+        let (geom, mask) = match computed {
             Ok(v) => v,
             Err(e) => {
                 self.deface_message = Some(e);
@@ -2662,8 +2778,13 @@ impl DicomViewApp {
                     if toggle {
                         self.toggle_deface_preview(ui.ctx());
                     } else if changed && previewing {
-                        // Live-update the overlay as parameters change.
-                        self.refresh_deface_preview(ui.ctx());
+                        // Coalesce live updates: mark dirty and recompute once the
+                        // slider/drag settles, instead of on every intermediate
+                        // frame. `refresh_pending_deface_preview` (called at the
+                        // end of `update`) does the actual work.
+                        self.deface_preview_dirty = true;
+                        self.deface_preview_dirty_since = Some(std::time::Instant::now());
+                        ui.ctx().request_repaint_after(DEFACE_PREVIEW_DEBOUNCE);
                     }
 
                     if ui
@@ -4970,7 +5091,12 @@ impl eframe::App for DicomViewApp {
             && self.loading.is_none()
         {
             self.refresh_deface_preview(ui.ctx());
+            self.deface_preview_dirty = false;
+            self.deface_preview_dirty_since = None;
         }
+
+        // Apply a pending preview update once input has settled.
+        self.flush_pending_deface_preview(ui.ctx());
     }
 }
 
@@ -6831,6 +6957,66 @@ mod tests {
         assert_eq!(&rgba0[0..4], &[100, 100, 100, 100]);
     }
 
+    /// Compute the deface mask for the active base series, using the cached
+    /// volume. Mirrors what `deface_active_series` / `refresh_deface_preview` do.
+    fn active_deface_mask(app: &mut DicomViewApp) -> diface_rs::volume::Mask {
+        let group = app.series_groups[0].clone();
+        let geom = app.deface_volume_for(&group).expect("geometry");
+        app.mask_for_geometry(&geom).expect("mask")
+    }
+
+    #[test]
+    fn deface_volume_and_segmentation_are_cached_across_param_changes() {
+        let mut app = app_with_head();
+        app.viewports = vec![ViewportState::default()];
+        app.active_viewport = 0;
+        app.deface_backend = DefaceBackendSel::Segmentation;
+
+        // First computation populates both caches.
+        let _ = active_deface_mask(&mut app);
+        let vol_key = app.deface_volume_cache.as_ref().unwrap().0.clone();
+        let seg_key = app.deface_seg_cache.as_ref().unwrap().0.clone();
+
+        // Changing a setting reuses them (keys unchanged, no rebuild).
+        app.deface_brain_protect_mm = 6.0;
+        app.deface_params.anterior_offset_mm = 4.0;
+        let _ = active_deface_mask(&mut app);
+        assert_eq!(app.deface_volume_cache.as_ref().unwrap().0, vol_key);
+        assert_eq!(app.deface_seg_cache.as_ref().unwrap().0, seg_key);
+
+        // Reloading images invalidates the volume cache but not the (rebuilt) one.
+        app.load_files(Vec::new(), false, &egui::Context::default());
+        assert!(app.deface_volume_cache.is_none());
+        assert!(app.deface_seg_cache.is_none());
+    }
+
+    #[test]
+    fn deface_preview_debounce_coalesces_and_flushes() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_head();
+        app.viewports = vec![ViewportState::default()];
+        app.active_viewport = 0;
+        app.deface_panel_open = true;
+        app.deface_preview_on = true;
+        app.deface_preview = None;
+        app.refresh_deface_preview(&ctx);
+        assert!(app.deface_preview.is_some(), "immediate refresh builds a preview");
+
+        // Marking dirty does not recompute immediately; flushing before the
+        // debounce elapses keeps it pending.
+        app.deface_preview_dirty = true;
+        app.deface_preview_dirty_since = Some(std::time::Instant::now());
+        app.flush_pending_deface_preview(&ctx);
+        assert!(app.deface_preview_dirty, "still settling");
+
+        // After the debounce window, a flush clears the flag and recomputes.
+        app.deface_preview_dirty_since =
+            Some(std::time::Instant::now() - DEFACE_PREVIEW_DEBOUNCE - std::time::Duration::from_millis(1));
+        app.flush_pending_deface_preview(&ctx);
+        assert!(!app.deface_preview_dirty, "flushed");
+        assert!(app.deface_preview.is_some());
+    }
+
     #[test]
     fn deflesh_region_removes_more_than_face() {
         let ctx = egui::Context::default();
@@ -6840,13 +7026,9 @@ mod tests {
         app.deface_backend = DefaceBackendSel::Segmentation;
 
         app.deface_seg_region = diface_rs::MaskRegion::Face;
-        let (_, face) = app
-            .compute_deface_mask(&app.series_groups[0].clone())
-            .expect("face mask");
+        let face = active_deface_mask(&mut app);
         app.deface_seg_region = diface_rs::MaskRegion::ExternalSoftTissue;
-        let (_, deflesh) = app
-            .compute_deface_mask(&app.series_groups[0].clone())
-            .expect("deflesh mask");
+        let deflesh = active_deface_mask(&mut app);
         assert!(
             deflesh.count_removed() > face.count_removed(),
             "deflesh ({}) should remove more than face ({})",
@@ -6893,18 +7075,13 @@ mod tests {
         app.deface_backend = DefaceBackendSel::Segmentation;
         app.deface_seg_region = diface_rs::MaskRegion::Face;
 
-        let removed = |app: &DicomViewApp| {
-            app.compute_deface_mask(&app.series_groups[0].clone())
-                .expect("mask")
-                .1
-                .count_removed()
-        };
+        let removed = |app: &mut DicomViewApp| active_deface_mask(app).count_removed();
 
         // A wider safety band must not remove more than a narrow one.
         app.deface_brain_protect_mm = 0.0;
-        let narrow = removed(&app);
+        let narrow = removed(&mut app);
         app.deface_brain_protect_mm = 20.0;
-        let wide = removed(&app);
+        let wide = removed(&mut app);
         assert!(
             wide < narrow,
             "a wider safety band should remove strictly less ({wide} vs {narrow})"
@@ -6914,9 +7091,9 @@ mod tests {
         // (equal when no vault is detected, e.g. the synthetic soft-tissue head).
         app.deface_brain_protect_mm = 2.0;
         app.deface_cut_reference = diface_rs::CutReference::BrainFront;
-        let brain_cut = removed(&app);
+        let brain_cut = removed(&mut app);
         app.deface_cut_reference = diface_rs::CutReference::SkullFront;
-        let skull_cut = removed(&app);
+        let skull_cut = removed(&mut app);
         assert!(
             skull_cut >= brain_cut,
             "skull-front cut should remove at least as much ({skull_cut} vs {brain_cut})"
@@ -6994,9 +7171,7 @@ mod tests {
         // Use the atlas backend with the built-in synthetic template.
         app.deface_backend = DefaceBackendSel::Atlas;
 
-        let (_, mask) = app
-            .compute_deface_mask(&app.series_groups[0].clone())
-            .expect("atlas mask");
+        let mask = active_deface_mask(&mut app);
         assert!(mask.count_removed() > 0);
 
         // Preview + deface work with the atlas backend selected.

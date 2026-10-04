@@ -249,6 +249,9 @@ Common controls:
   series giving exactly which voxels would be removed, in both **Stack and MPR**
   views. It updates as the orientation/depth/extent sliders (and presets) change,
   and stays on after **✓ Re-apply**, so the cut can be tuned before committing.
+  The preview caches the reconstructed volume and (for the segmentation backend)
+  the segmentation, and debounces recomputation while you drag, so tuning stays
+  responsive on large series.
 - **🗺 Areas** additionally shows the in-house **segmentation** in the overlay:
   **head (blue)**, **brain (green)**, **vault (orange)** and the intracranial
   **cavity (cyan)** — the cavity/vault boundary is exactly the deflesh keep
