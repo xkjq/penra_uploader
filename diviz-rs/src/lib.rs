@@ -1451,16 +1451,6 @@ enum DefaceBackendSel {
     Segmentation,
 }
 
-impl DefaceBackendSel {
-    fn name(self) -> &'static str {
-        match self {
-            DefaceBackendSel::Geometric => "Geometric",
-            DefaceBackendSel::Atlas => "Atlas",
-            DefaceBackendSel::Segmentation => "Segmentation",
-        }
-    }
-}
-
 struct DicomViewApp {
     /// A queued load: the paths plus whether the open should be recorded in the
     /// recent-folders history. Programmatic loads (CLI arguments, `diface --view`,
@@ -2492,35 +2482,35 @@ impl DicomViewApp {
                             }
                         }
                     }
-                    if ui
-                        .button("Load atlas…")
-                        .on_hover_text("Load a .dfatlas brain mask")
-                        .clicked()
-                    {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("diface atlas", &["dfatlas", "bin"])
-                            .pick_file()
+                    // Atlas file loading is only relevant to the atlas backend.
+                    if self.deface_backend == DefaceBackendSel::Atlas {
+                        if ui
+                            .button("Load atlas…")
+                            .on_hover_text("Load a .dfatlas brain mask")
+                            .clicked()
                         {
-                            match std::fs::read(&path)
-                                .map_err(|e| e.to_string())
-                                .and_then(|b| diface_rs::Atlas::from_bytes(&b))
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("diface atlas", &["dfatlas", "bin"])
+                                .pick_file()
                             {
-                                Ok(a) => {
-                                    self.deface_atlas = a;
-                                    self.deface_backend = DefaceBackendSel::Atlas;
-                                    self.deface_message =
-                                        Some(format!("Loaded atlas {}", path.display()));
-                                    if self.deface_preview.is_some() {
-                                        self.refresh_deface_preview(ui.ctx());
+                                match std::fs::read(&path)
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|b| diface_rs::Atlas::from_bytes(&b))
+                                {
+                                    Ok(a) => {
+                                        self.deface_atlas = a;
+                                        self.deface_message =
+                                            Some(format!("Loaded atlas {}", path.display()));
+                                        if self.deface_preview.is_some() {
+                                            self.refresh_deface_preview(ui.ctx());
+                                        }
                                     }
-                                }
-                                Err(e) => {
-                                    self.deface_message = Some(format!("Atlas load failed: {e}"))
+                                    Err(e) => {
+                                        self.deface_message = Some(format!("Atlas load failed: {e}"))
+                                    }
                                 }
                             }
                         }
-                    }
-                    if self.deface_backend == DefaceBackendSel::Atlas {
                         ui.label(
                             egui::RichText::new(format!(
                                 "{}×{}×{}",
@@ -2534,12 +2524,12 @@ impl DicomViewApp {
                     }
                 });
 
-                // Algorithm row: pick the masking strategy (geometric backend).
-                ui.horizontal_wrapped(|ui| {
-                    ui.strong("Algorithm");
-                    let enabled = self.deface_backend == DefaceBackendSel::Geometric;
-                    let mut chosen = self.deface_params.algorithm;
-                    ui.add_enabled_ui(enabled, |ui| {
+                // Algorithm row: only the geometric backend uses a masking
+                // algorithm; the atlas and segmentation backends decide their own.
+                if self.deface_backend == DefaceBackendSel::Geometric {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong("Algorithm");
+                        let mut chosen = self.deface_params.algorithm;
                         egui::ComboBox::from_id_salt("deface_algorithm")
                             .selected_text(chosen.name())
                             .show_ui(ui, |ui| {
@@ -2548,91 +2538,121 @@ impl DicomViewApp {
                                         .on_hover_text(algo.description());
                                 }
                             });
+                        if chosen != self.deface_params.algorithm {
+                            self.deface_params.algorithm = chosen;
+                            if self.deface_preview.is_some() {
+                                self.refresh_deface_preview(ui.ctx());
+                            }
+                        }
+                        ui.label(egui::RichText::new(chosen.description()).small().weak());
                     });
-                    if chosen != self.deface_params.algorithm {
-                        self.deface_params.algorithm = chosen;
-                        if self.deface_preview.is_some() {
-                            self.refresh_deface_preview(ui.ctx());
-                        }
-                    }
-                    let note = if self.deface_backend == DefaceBackendSel::Geometric {
-                        self.deface_params.algorithm.description().to_string()
-                    } else {
-                        self.deface_backend.name().to_string()
-                    };
-                    ui.label(egui::RichText::new(note).small().weak());
-                });
+                }
 
-                // Preset row: quick, brain-safety-oriented choices.
-                ui.horizontal_wrapped(|ui| {
-                    ui.strong("Preset");
-                    let matching = self.deface_params.matching_preset();
-                    let mut apply: Option<DefacePreset> = None;
-                    for preset in DefacePreset::all() {
-                        let selected = matching == Some(preset);
-                        if ui
-                            .selectable_label(selected, preset.name())
-                            .on_hover_text(preset.description())
-                            .clicked()
-                        {
-                            apply = Some(preset);
+                // Preset row: quick, brain-safety-oriented choices. Presets size
+                // the geometric preserve ellipsoid and (via the mapping below)
+                // the segmentation brain margin; the atlas ignores them.
+                if self.deface_backend != DefaceBackendSel::Atlas {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong("Preset");
+                        let matching = self.deface_params.matching_preset();
+                        let mut apply: Option<DefacePreset> = None;
+                        for preset in DefacePreset::all() {
+                            let selected = matching == Some(preset);
+                            if ui
+                                .selectable_label(selected, preset.name())
+                                .on_hover_text(preset.description())
+                                .clicked()
+                            {
+                                apply = Some(preset);
+                            }
                         }
-                    }
-                    if let Some(preset) = apply {
-                        // Preserve manual orientation (yaw/axis override).
-                        self.deface_params.apply_preset(preset);
-                        if self.deface_preview.is_some() {
-                            self.refresh_deface_preview(ui.ctx());
+                        if let Some(preset) = apply {
+                            // Preserve manual orientation (yaw/axis override).
+                            self.deface_params.apply_preset(preset);
+                            if self.deface_preview.is_some() {
+                                self.refresh_deface_preview(ui.ctx());
+                            }
                         }
-                    }
-                });
+                    });
+                }
 
+                // Manual alignment: show only the controls the active backend
+                // actually reads. Geometric: Yaw/Depth/Extent/Preserve.
+                // Segmentation: Depth/Preserve (mapped to the brain margin).
+                // Atlas: no geometric params (it uses its own registration).
+                let backend = self.deface_backend;
                 ui.horizontal_wrapped(|ui| {
-                    ui.strong("Deface alignment");
-                    ui.label(
-                        egui::RichText::new("(applies to the defaced copy of the active series)")
+                    if backend == DefaceBackendSel::Atlas {
+                        ui.strong("Defacing");
+                        ui.label(
+                            egui::RichText::new(
+                                "(the atlas uses its own registration; load an atlas above)",
+                            )
                             .small()
                             .weak(),
-                    );
-
-                    // Yaw about the superior axis.
-                    ui.label("Yaw°");
-                    let yaw_resp = ui.add(
-                        egui::DragValue::new(&mut self.deface_params.yaw_deg)
-                            .speed(1.0)
-                            .range(-180.0..=180.0),
-                    );
-
-                    // Anterior/posterior depth of the cut.
-                    ui.label("Depth mm");
-                    let depth_resp = ui.add(
-                        egui::DragValue::new(&mut self.deface_params.anterior_offset_mm)
-                            .speed(1.0)
-                            .range(-100.0..=100.0),
-                    );
-
-                    // Preserve-ellipsoid size along each anatomical axis.
-                    ui.label("Extent A/L/S");
-                    let mut extent_changed = false;
-                    for axis in 0..3 {
-                        let r = ui.add(
-                            egui::DragValue::new(&mut self.deface_params.extent_scale[axis])
-                                .speed(0.01)
-                                .range(0.1..=3.0),
                         );
-                        extent_changed |= r.changed();
+                    } else {
+                        ui.strong("Deface alignment");
+                        ui.label(
+                            egui::RichText::new("(applies to the defaced copy of the active series)")
+                                .small()
+                                .weak(),
+                        );
                     }
 
-                    // Coarse preserve fraction (overall safety margin).
-                    ui.label("Preserve");
-                    let preserve = ui.add(
-                        egui::DragValue::new(&mut self.deface_params.preserve_fraction)
-                            .speed(0.01)
-                            .range(0.3..=1.2),
-                    );
+                    let mut changed = false;
 
-                    let changed =
-                        yaw_resp.changed() || depth_resp.changed() || preserve.changed() || extent_changed;
+                    // Yaw about the superior axis (geometric only).
+                    if backend == DefaceBackendSel::Geometric {
+                        ui.label("Yaw°");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.deface_params.yaw_deg)
+                                    .speed(1.0)
+                                    .range(-180.0..=180.0),
+                            )
+                            .changed();
+                    }
+
+                    // Anterior/posterior depth of the cut (geometric + segmentation).
+                    if backend != DefaceBackendSel::Atlas {
+                        ui.label("Depth mm");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.deface_params.anterior_offset_mm)
+                                    .speed(1.0)
+                                    .range(-100.0..=100.0),
+                            )
+                            .changed();
+                    }
+
+                    // Preserve-ellipsoid size along each anatomical axis
+                    // (geometric only).
+                    if backend == DefaceBackendSel::Geometric {
+                        ui.label("Extent A/L/S");
+                        for axis in 0..3 {
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut self.deface_params.extent_scale[axis])
+                                        .speed(0.01)
+                                        .range(0.1..=3.0),
+                                )
+                                .changed();
+                        }
+                    }
+
+                    // Coarse preserve fraction: geometric sizing, and for the
+                    // segmentation backend it widens/narrows the brain margin.
+                    if backend != DefaceBackendSel::Atlas {
+                        ui.label("Preserve");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.deface_params.preserve_fraction)
+                                    .speed(0.01)
+                                    .range(0.3..=1.2),
+                            )
+                            .changed();
+                    }
 
                     let previewing = self.deface_preview_on;
                     let toggle = ui
@@ -6840,6 +6860,28 @@ mod tests {
             app.deface_alignment_ui(ui);
         });
         output.textures_delta.clear();
+    }
+
+    #[test]
+    fn deface_panel_renders_for_every_backend() {
+        // The Align panel shows only backend-applicable controls; render it with
+        // each backend to prove the conditional rows do not panic.
+        let ctx = egui::Context::default();
+        let mut app = app_with_head();
+        app.viewports = vec![ViewportState::default()];
+        app.active_viewport = 0;
+        app.deface_panel_open = true;
+        for backend in [
+            DefaceBackendSel::Geometric,
+            DefaceBackendSel::Segmentation,
+            DefaceBackendSel::Atlas,
+        ] {
+            app.deface_backend = backend;
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.deface_alignment_ui(ui);
+            });
+            output.textures_delta.clear();
+        }
     }
 
     #[test]

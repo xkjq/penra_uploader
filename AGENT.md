@@ -271,8 +271,13 @@ Facial anonymisation crate (diface-rs)
   the preference) but **only auto-computes while the Align panel is open**
   (`deface_panel_open`); closing the panel clears the overlay. It refreshes each
   frame and after `deface_active_series`.
-  The alignment controls map onto the Segmentation backend too (Depth/Preset ->
-  `SegBackendParams::brain_margin_mm`).
+  The Align panel shows **only the controls the active backend reads**
+  (per-backend gating in `deface_alignment_ui`): Geometric = Preset / Algorithm /
+  Yaw / Depth / Extent / Preserve; Segmentation = Preset / Depth / Preserve /
+  Region / Cut at / Safety band (no Yaw/Extent/Algorithm); Atlas = no manual
+  params, only **Load atlas…** and the template dims. Depth/Preset map onto the
+  Segmentation backend via `SegBackendParams::brain_margin_mm`. Tested by
+  `deface_panel_renders_for_every_backend`.
 - Uploader integration (uploader_rs):
   - `diface_rs::deface_dir_in_place(dir, opts)` defaces each series found in a
     directory **overwriting files in place** (names preserved), used after the

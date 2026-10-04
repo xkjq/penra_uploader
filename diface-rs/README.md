@@ -225,14 +225,24 @@ Align panel (with live preview).
 ### Manual alignment (viewer)
 
 The toolbar **🎛 Align** toggle opens manual defacing controls that apply on top
-of the automatic head estimate:
+of the automatic head estimate. The panel shows **only the controls the active
+backend reads**:
+
+- **Geometric** – Preset, Algorithm, Yaw°, Depth mm, Extent A/L/S, Preserve,
+- **Segmentation** – Preset, Depth mm, Preserve, plus Region / Cut at / Safety
+  band (below); Yaw/Extent and the Algorithm dropdown are hidden because that
+  backend ignores them,
+- **Atlas** – no manual parameters (it uses its own registration); only
+  **Load atlas…** and the template dimensions appear.
+
+Common controls:
 
 - **Preset** – quickly pick a brain-safety profile (see below); switching
   live-updates the preview and keeps any manual orientation,
-- **Yaw°** – rotate the anterior/left frame about the superior axis,
 - **Depth mm** – shift the cut anteriorly/posteriorly,
-- **Extent A/L/S** – scale the preserve ellipsoid per anatomical axis,
-- **Preserve** – overall preserve fraction,
+- **Yaw°** – rotate the anterior/left frame about the superior axis (geometric),
+- **Extent A/L/S** – scale the preserve ellipsoid per anatomical axis (geometric),
+- **Preserve** – overall preserve fraction (geometric sizing; segmentation margin),
 - **↺ Auto** resets, **✓ Re-apply** rebuilds the defaced copy from the base
   series with the current settings,
 - **👁 Preview** is **on by default** and shows a live **red overlay** on the base
