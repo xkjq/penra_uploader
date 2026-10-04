@@ -1515,6 +1515,10 @@ struct DicomViewApp {
     deface_preview_on: bool,
     /// What the segmentation backend removes (face cut or external soft tissue).
     deface_seg_region: diface_rs::MaskRegion,
+    /// Segmentation: what the anterior cut is referenced to (brain or skull).
+    deface_cut_reference: diface_rs::CutReference,
+    /// Segmentation: safety band (mm) kept around the intracranial core.
+    deface_brain_protect_mm: f64,
     /// Deflesh: keep external tissue posterior of brain centre + this (mm).
     deface_deflesh_posterior_mm: f64,
     /// Live removal-mask preview (3D + per-image), tinted in viewports that
@@ -1577,6 +1581,8 @@ impl DicomViewApp {
             deface_show_segmentation: false,
             deface_preview_on: true,
             deface_seg_region: diface_rs::MaskRegion::Face,
+            deface_cut_reference: diface_rs::CutReference::BrainFront,
+            deface_brain_protect_mm: 2.0,
             deface_deflesh_posterior_mm: 0.0,
             deface_preview: None,
             wl_editor_open: Vec::new(),
@@ -2104,7 +2110,9 @@ impl DicomViewApp {
                     .clamp(0.0, 40.0);
                 let params = diface_rs::SegBackendParams {
                     region: self.deface_seg_region,
+                    cut_reference: self.deface_cut_reference,
                     brain_margin_mm: margin,
+                    brain_protect_mm: self.deface_brain_protect_mm,
                     deflesh_posterior_mm: self.deface_deflesh_posterior_mm,
                     seg: diface_rs::SegParams::default(),
                     ..diface_rs::SegBackendParams::default()
@@ -2437,6 +2445,52 @@ impl DicomViewApp {
                                 }
                             }
                         }
+                        if self.deface_seg_region == diface_rs::MaskRegion::Face {
+                            ui.separator();
+                            ui.label("Cut at");
+                            let mut cut = self.deface_cut_reference;
+                            ui.selectable_value(
+                                &mut cut,
+                                diface_rs::CutReference::BrainFront,
+                                "Brain front",
+                            )
+                            .on_hover_text("Cut just ahead of the brain's frontal pole");
+                            ui.selectable_value(
+                                &mut cut,
+                                diface_rs::CutReference::SkullFront,
+                                "Skull front",
+                            )
+                            .on_hover_text(
+                                "Cut ahead of the frontal bone so the whole face is removed; \
+                                 falls back to the brain front when no vault is detected (MR)",
+                            );
+                            if cut != self.deface_cut_reference {
+                                self.deface_cut_reference = cut;
+                                if self.deface_preview.is_some() {
+                                    self.refresh_deface_preview(ui.ctx());
+                                }
+                            }
+                        }
+                        ui.separator();
+                        ui.label("Safety band");
+                        let mut protect = self.deface_brain_protect_mm;
+                        let slider = ui.add(
+                            egui::Slider::new(&mut protect, 0.0..=20.0)
+                                .suffix(" mm")
+                                .clamping(egui::SliderClamping::Always),
+                        );
+                        if slider
+                            .on_hover_text(
+                                "Hard band kept around the brain/vault; larger is safer and \
+                                 removes slightly less face",
+                            )
+                            .changed()
+                        {
+                            self.deface_brain_protect_mm = protect;
+                            if self.deface_preview.is_some() {
+                                self.refresh_deface_preview(ui.ctx());
+                            }
+                        }
                     }
                     if ui
                         .button("Load atlas…")
@@ -2607,6 +2661,9 @@ impl DicomViewApp {
 
                     if ui.button("↺ Auto").on_hover_text("Reset defacing settings to automatic").clicked() {
                         self.deface_params = GeometricParams::default();
+                        self.deface_cut_reference = diface_rs::CutReference::BrainFront;
+                        self.deface_brain_protect_mm = 2.0;
+                        self.deface_deflesh_posterior_mm = 0.0;
                         if self.deface_preview.is_some() {
                             self.refresh_deface_preview(ui.ctx());
                         }
@@ -6778,6 +6835,52 @@ mod tests {
         );
 
         // The panel renders with the Region selector without panicking.
+        app.deface_panel_open = true;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.deface_alignment_ui(ui);
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn segmentation_safety_band_and_cut_reference_reach_the_backend() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_head();
+        app.viewports = vec![ViewportState::default()];
+        app.active_viewport = 0;
+        app.deface_backend = DefaceBackendSel::Segmentation;
+        app.deface_seg_region = diface_rs::MaskRegion::Face;
+
+        let removed = |app: &DicomViewApp| {
+            app.compute_deface_mask(&app.series_groups[0].clone())
+                .expect("mask")
+                .1
+                .count_removed()
+        };
+
+        // A wider safety band must not remove more than a narrow one.
+        app.deface_brain_protect_mm = 0.0;
+        let narrow = removed(&app);
+        app.deface_brain_protect_mm = 20.0;
+        let wide = removed(&app);
+        assert!(
+            wide < narrow,
+            "a wider safety band should remove strictly less ({wide} vs {narrow})"
+        );
+
+        // A skull-front cut removes at least as much as a brain-front cut
+        // (equal when no vault is detected, e.g. the synthetic soft-tissue head).
+        app.deface_brain_protect_mm = 2.0;
+        app.deface_cut_reference = diface_rs::CutReference::BrainFront;
+        let brain_cut = removed(&app);
+        app.deface_cut_reference = diface_rs::CutReference::SkullFront;
+        let skull_cut = removed(&app);
+        assert!(
+            skull_cut >= brain_cut,
+            "skull-front cut should remove at least as much ({skull_cut} vs {brain_cut})"
+        );
+
+        // The panel renders both new controls without panicking.
         app.deface_panel_open = true;
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             app.deface_alignment_ui(ui);

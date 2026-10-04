@@ -47,7 +47,8 @@ pub use atlas::{Atlas, AtlasBackend, AtlasParams, AtlasSpec};
 pub use backend::{BackendKind, DefacingBackend};
 pub use geometric::{DefaceAlgorithm, DefacePreset, GeometricBackend, GeometricParams, Threshold};
 pub use segmentation::{
-    segment, MaskRegion, SegBackendParams, SegParams, Segmentation, SegmentationBackend,
+    segment, CutReference, MaskRegion, SegBackendParams, SegParams, Segmentation,
+    SegmentationBackend,
 };
 pub use series::{SeriesGroup, SliceEntry};
 pub use volume::{Mask, Volume};

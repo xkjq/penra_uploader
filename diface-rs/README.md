@@ -244,6 +244,16 @@ of the automatic head estimate:
   **cavity (cyan)** — the cavity/vault boundary is exactly the deflesh keep
   region, so you can confirm it never crosses the skull.
 
+With the **Segmentation** backend selected the panel also shows:
+
+- **Region** – `Face` (flat cut) or `Deflesh` (strip external tissue/bone),
+  with a **Keep back-of-head after** slider for Deflesh,
+- **Cut at** – `Brain front` or `Skull front` (Face region only); the skull
+  reference removes the whole face and falls back to the brain front when no
+  vault is detected (MR),
+- **Safety band** – the hard band (mm) kept around the brain/vault; larger is
+  safer. This is the CLI `--brain-protect` option.
+
 The alignment controls (Yaw / Depth / Extent / Preset / Preserve) apply to the
 **Segmentation** backend too at the viewer level: Depth and Preset adjust the
 safety margin in front of the brain (positive Depth removes more face, higher

@@ -171,7 +171,11 @@ Facial anonymisation crate (diface-rs)
   `f64::INFINITY` / CLI `--deflesh-posterior all` to remove all external
   tissue). CLI `--seg-region face|deflesh`; viewer **Region** selector +
   **Keep back-of-head after** slider (`deface_deflesh_posterior_mm`).
-  `cut_reference` selects `BrainFront` (default) or `SkullFront`.
+  `cut_reference` selects `BrainFront` (default) or `SkullFront`; the viewer
+  exposes it as the **Cut at** selector (`deface_cut_reference`, Face region),
+  and a **Safety band** slider (`deface_brain_protect_mm`, default 2 mm)
+  mirrors the CLI `--brain-protect`. Both live-update the preview, and
+  **↺ Auto** resets them together with `deface_params`.
   **Vault autosegmentation** (`vault_from_cavity`): the brain grow is re-run
   without the ellipsoid clamp to produce `cavity` (brain + CSF to the inner
   table); `vault` = the closed skull shell surrounding the cavity
