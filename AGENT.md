@@ -1,4 +1,4 @@
-Project: uploader (Python + Rust)
+Project: penra_uploader (Python + Rust)
 
 Critical policy: duplicate detection hashing
 - Duplicate detection must use PixelData-only hashing.
@@ -7,20 +7,32 @@ Critical policy: duplicate detection hashing
 - Canonical implementation location: uploader_rs/src/upload.rs (`calculate_pixel_hash`).
 
 Purpose
-- Anonymiser + uploader for DICOM files. Rust port (`uploader_rs`) aims for parity with Python dicognito-based anonymiser and the existing Nice uploader flow.
+- Anonymiser + uploader for DICOM files. Rust port (`uploader_rs`) aims for
+  parity with Python dicognito-based anonymiser and the existing Nice uploader
+  flow, and now also defaces faces in the export pipeline.
+- The defacing toolchain is `diface-rs` (pixel-level facial removal, metadata
+  untouched) plus `diviz-rs` (viewer with in-viewer defacing for tuning).
 
 Important paths
-- Root: uploader/
+- Root: penra_uploader/
   - anonymiser.py             (Python wrapper using dicognito)
   - scripts/compare_anonymizers.py  (runs dicognito and Rust anon binary and compares cleared fields)
   - test_dicoms/              (sample DICOMs used for tests)
   - .venv/                    (project virtualenv for Python testing)
-- Rust project: uploader/uploader_rs
+- Rust project: penra_uploader/uploader_rs
   - src/anonymizer.rs         (Rust anonymiser core)
   - src/main.rs               (CLI + GUI skeleton)
   - src/upload.rs             (upload multipart logic)
   - tests/anonymizer_tests.rs (integration tests invoking the binary)
   - Cargo.toml                (Rust deps and dev-deps)
+- Related Rust crates in the same repo:
+  - diface-rs/                (facial defacing; see below)
+  - diviz-rs/                 (DICOM viewer; in-viewer defacing)
+  - dicor-rs/                 (metadata anonymisation / compression)
+  - divue-rs/, diforge-rs/, launcher/, dicom_viewer/
+- Real validation data lives outside the repo in `~/dicoms` (case 546 CT,
+  case 554 MR x6, case_811 MR x4, case/series_2079-2081).
+- Toolchain: nightly (`rust-toolchain.toml`).
 
 High-level design (Rust anonymiser)
 - Deterministic pseudonymization:
@@ -52,7 +64,8 @@ Tags & behavior (summary)
 - SR Content Sequence `(0040,A730)`: scrubbed (structure preserved; PHI fields cleared/remapped/shifted).
 
 Implementation notes
-- Uses `dicom-object` / `dicom-core` crates (0.6), `blake3`, `chrono`, `num-bigint`, `serde_json`.
+- Uses `dicom-object` / `dicom-core` 0.10 (also `dicom-pixeldata` 0.10 with
+  `charls` for JPEG-LS), `blake3`, `chrono`, `num-bigint`, `serde_json`.
 - Mutation-safe iteration pattern: collect `to_remove` and `puts` during iteration, apply changes after loop; mutate SQ items via `update_value` and `items_mut()`.
 - Be careful with string types (`Cow<str>`) when parsing dates/times.
 
@@ -61,21 +74,26 @@ Testing & validation
 - Rust integration test: `uploader_rs/tests/anonymizer_tests.rs` invokes the binary against a sample DICOM from `test_dicoms` and asserts anonymisation outcomes.
 
 Build & run
-- Build Rust: `cd uploader/uploader_rs && cargo build`
+- Build Rust: `cd uploader_rs && cargo build`
 - Run anonymiser: `./target/debug/uploader_rs --anon <input.dcm> <output.dcm>`
 - Compare with dicognito (from repo root): `PYTHONPATH=. .venv/bin/python scripts/compare_anonymizers.py test_dicoms`
-- Run Rust tests: `cd uploader/uploader_rs && cargo test`
+- Run Rust tests: `cd uploader_rs && cargo test`
 
 Facial anonymisation crate (diface-rs)
-- Root: uploader/diface-rs
-  - src/lib.rs        High-level API: `deface()`, `DefaceOptions`, reports
-  - src/backend.rs    `DefacingBackend` trait + `BackendKind` selector
-  - src/geometric.rs  Default geometric backend (head stats + preserve ellipsoid)
-  - src/geometry.rs   Vec3/percentile helpers (LPS patient coords)
-  - src/volume.rs     `Volume` + `Mask`
-  - src/series.rs     DICOM discovery, loading, defaced writing
-  - src/main.rs       `diface` CLI
-  - tests/            Synthetic-volume + end-to-end DICOM round-trip tests
+- Root: penra_uploader/diface-rs
+  - src/lib.rs         High-level API: `deface()`, `deface_dir_in_place()`,
+                       `DefaceOptions`, reports; re-exports `CutReference`.
+  - src/backend.rs     `DefacingBackend` trait + `BackendKind` selector
+  - src/geometric.rs   Default geometric backend (head stats + preserve ellipsoid)
+  - src/geometry.rs    Vec3/percentile helpers (LPS patient coords)
+  - src/volume.rs      `Volume` + `Mask`
+  - src/series.rs      DICOM discovery, loading, defaced writing
+  - src/segmentation.rs In-house head/brain segmentation + vault/cavity
+  - src/atlas.rs       `.dfatlas` atlas format + registration backend
+  - src/viewer.rs      `--view` launcher for diviz-rs
+  - src/main.rs        `diface` CLI
+  - tests/             Synthetic-volume + end-to-end DICOM round-trip tests
+                       (37 tests across geometric/segmentation/atlas/series/viewer)
 - Purpose: pixel-level removal of identifiable facial anatomy from multi-file
   CT/MR series. Metadata is left untouched so it composes with dicor-rs.
 - Design: pluggable backends. Default `geometric` thresholds the volume, keeps
@@ -88,10 +106,14 @@ Facial anonymisation crate (diface-rs)
   whole series was rejected). Verified on real data in ~/dicoms: CT head
   (case 546) and six MR brain series (case 554) all give `mask match: OK`,
   `wrong-fill: 0`, and 94-97% of removed voxels anterior of the head centre.
-- Debug helpers: `cargo run --example inspect_series -- <dir>` lists slice
-  geometry; `cargo run --example verify_defacing -- <orig> <defaced>` compares
-  the output against a freshly computed mask, reports anterior/posterior split
-  and renders ASCII axial previews.
+- Debug helpers (all under `diface-rs`): `inspect_series <dir>` lists per-slice
+  geometry; `verify_defacing <orig> <defaced>` compares the output against a
+  freshly computed mask (anterior/posterior split, ASCII axial previews);
+  `seg_debug <dir> [--ascii] [--protect MM]` prints the segmentation, vault/cavity
+  stats and per-region removal (0 brain / 0 vault expected); `atlas_debug <dir>`.
+  The diviz-rs example `deface_debug <dir>` prints the viewer's volume geometry,
+  estimated head axes, and the anterior/posterior split, and cross-checks against
+  `diface_rs::series::load_series` (`diface-rs ref:` line; dims/counts must match).
 - Output pixel data: uncompressed Explicit VR Little Endian; run dicor-rs after
   to compress/anonymise metadata.
 - Viewer integration: `--view` opens the defaced output in `diviz-rs`
@@ -147,8 +169,8 @@ Facial anonymisation crate (diface-rs)
   0.6`), otherwise the eigenvector most aligned with world Z; `anterior`/`left`
   from the in-plane row/column axes, orthogonalised. Verified: case 546 now
   76.6% anterior (was 36%), brain series 80-100% anterior. Diagnose with
-  `cargo run --example deface_debug -- <series_dir>` (prints foreground extents,
-  estimated axes, and anterior/posterior split).
+  `cargo run --example deface_debug -- <series_dir>` from `diviz-rs` (it prints
+  the viewer's volume geometry, estimated axes, and anterior/posterior split).
 - Manual defacing controls (`GeometricParams`): `axis_override` (explicit unit
   frame), `yaw_deg` (rotate about superior), `anterior_offset_mm` (cut depth),
   and `extent_scale` (per-axis preserve-ellipsoid multipliers). Exposed as CLI
@@ -272,12 +294,13 @@ Facial anonymisation crate (diface-rs)
   - The flag is threaded via `QueueItem.deface` -> `enqueue_export_processing`,
     kept in sync with the Settings checkbox through `AppState.shared_deface` for
     the IPC ("loaded") path.
-- diviz-rs tests: `mod tests` in diviz-rs/src/lib.rs (~52 tests). Covers MPR
-  construction (incl. gantry tilt), defacing, viewport sync, geometry helpers,
-  file discovery, real on-disk DICOM decode, and headless `eframe` UI frames via
-  `run_headless_frame[_with]` (drives `App::ui` through `ctx.run_ui`). Coverage:
-  `cargo llvm-cov --lib` -> ~80% regions / 86% functions; the remainder is UI
-  interaction closures and the window-launching `run_viewer*` entry points.
+- diviz-rs tests: `mod tests` in diviz-rs/src/lib.rs (67 tests). Covers MPR
+  construction (incl. gantry tilt), defacing (incl. largest-orientation-group
+  selection), viewport sync, geometry helpers, file discovery, real on-disk
+  DICOM decode, and headless `eframe` UI frames via `run_headless_frame[_with]`
+  (drives `App::ui` through `ctx.run_ui`). Coverage: `cargo llvm-cov --lib` ->
+  ~80% regions / 86% functions; the remainder is UI interaction closures and the
+  window-launching `run_viewer*` entry points.
 - Recent-folders history: `load_files(paths, record_recent, ctx)` only records a
   recent folder when `record_recent` is true. User-initiated opens (Open
   Files/Folder dialog, drag-and-drop, Recent menu) pass `true`;
@@ -305,11 +328,35 @@ Facial anonymisation crate (diface-rs)
 - Run: `cargo run --release -- [--recursive] [--dry-run] [--view] <INPUT> <OUTPUT>`
 - See diface-rs/README.md for options, limitations and backend extension.
 
-Next recommended work
+Current status
+- The diface-rs crate and its diviz-rs/uploader_rs integration are **committed**
+  (see `git log --oneline`: 8da1354, a53c234, 9df25ca, 815e97b, a8b39e7,
+  62dff07, 6445460). Working tree is clean apart from ignored build artifacts.
+- Test counts: diface-rs 37, diviz-rs 67, uploader_rs 11 (10 unit + 1
+  anonymiser integration). All green.
+- Recent fixes worth knowing:
+  - `build_deface_volume` groups by `ImageOrientationPatient` and keeps the
+    largest group, so the viewer matches the CLI/uploader on mixed series.
+  - `--brain-protect` (segmentation safety band) is wired; the dead
+    `DefaceOptions.brain_protect_mm` field was removed.
+  - The viewer Align panel exposes segmentation **Cut at** and **Safety band**.
+
+Next recommended work (defacing)
+- Packaging/CI: `build.py` and `launcher/` still have **no** diface/diviz
+  references; wire the new binaries into the Linux build/launcher.
+- Uploader settings: expose the segmentation `--brain-protect` / `cut_reference`
+  knobs in the GUI settings (currently only the viewer and CLI do).
+- Validation: keep re-running `seg_debug` / `deface_debug` over `~/dicoms` as new
+  MR series arrive; MR has no detectable skull, so `vault` is empty and
+  `SkullFront`/deflesh fall back to the brain/closed-cavity path.
+- Higher-assurance option: a registration/atlas or model (ONNX/HD-BET) backend
+  behind the existing `DefacingBackend` trait.
+
+Next recommended work (metadata anonymiser)
 - CLI options: `--seed`, `--clear-text-vr` (configurable behaviour)
 - Add more unit tests: SR content checks, nested UID remap, date/time shift correctness
 - Template-aware SR handling (if clinical SR utility must be preserved)
 - Documentation (README) describing anonymisation policy
-- Commit changes and package for Linux
 
-Recorded: 2026-03-16
+Recorded: 2026-03-16 (metadata-anonymiser notes)
+Updated: 2026-10-04 (diface-rs + diviz/uploader defacing integration)
