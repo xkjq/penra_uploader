@@ -104,6 +104,11 @@ Facial anonymisation crate (diface-rs)
   copy of the active series, groups it as `<uid>-DEFACED`, and opens it in a
   second viewport next to the original. Clicking again refreshes the copy
   (always rebuilt from the base series, so the uid never gets double-suffixed).
+  `build_deface_volume` mirrors `diface_rs::series::load_series`: it requires
+  identical dimensions, groups slices by `ImageOrientationPatient` (1e-3) and
+  defaces only the **largest** orientation-consistent group, so a mixed series
+  (localisers under one SeriesInstanceUID) previews exactly what the CLI/uploader
+  produces. Test `build_deface_volume_keeps_the_largest_orientation_group`.
   MPR volumes are **per series** (`mpr_volumes: Vec<Option<MprVolume>>`), so
   the original and the defaced copy each have their own volume and can be
   viewed in MPR side by side. `refresh_mpr_volumes` rebuilds them all;
@@ -179,12 +184,18 @@ Facial anonymisation crate (diface-rs)
   head(blue)/brain(green)/vault(orange)/cavity(cyan) — labels 1..4.
   Note: `erode` treats out-of-bounds neighbours as foreground so morphological
   closings never clip cells at the volume border.
+  `brain_protect_mm` is the hard safety band (mm) dilated around the protected
+  core (`cavity ∪ vault`); nothing inside it is removed by either region. It is
+  the run-level `--brain-protect` CLI flag (default 2); the same value lives on
+  `SegBackendParams`, and the ambiguous `DefaceOptions.brain_protect_mm` was
+  removed (it was never read). `seg_debug --protect MM` exercises it.
   Types:
   `SegParams`, `Segmentation`, `segment()`, `SegBackendParams`,
   `SegmentationBackend`; `BackendKind::Segmentation`; CLI `--backend
   segmentation`; viewer Backend row (3-way). Tests: diface-rs/tests/
   segmentation_tests.rs (skull-bounded phantom; `vault_is_a_shell_that_excludes_the_face`,
-  `deflesh_removes_external_tissue_and_keeps_brain` asserts 0 brain **and** 0 vault removed).
+  `deflesh_removes_external_tissue_and_keeps_brain` asserts 0 brain **and** 0 vault removed,
+  `brain_protect_band_shrinks_removal_and_spares_the_core`).
 - Head-stats stabilisation: `geometric::head_statistics_best` runs the
   in-house segmentation and restricts the principal-axis point cloud to the
   segmented head (via `head_filter`), falling back to the plain estimate if

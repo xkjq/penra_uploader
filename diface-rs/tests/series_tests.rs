@@ -226,7 +226,7 @@ fn deface_dir_in_place_overwrites_files_preserving_names() {
     let tmp = tempfile::tempdir().unwrap();
     let input = tmp.path().join("anon");
     std::fs::create_dir_all(&input).unwrap();
-    let (_uid, rows, cols) = make_series(&input);
+    let (_uid, _rows, cols) = make_series(&input);
 
     let before: Vec<PathBuf> = collect_dicom_files(&input, false).unwrap();
     let before_len = before.len();

@@ -27,6 +27,8 @@ OPTIONS:
     --atlas <FILE>                  Use an atlas brain mask file (.dfatlas)
     --seg-region <face|deflesh>     Segmentation region: face cut or deflesh
                                     (remove external soft tissue/bone)
+    --brain-protect <MM>            Segmentation: safety band kept around the
+                                    intracranial core (default: 2)
     --deflesh-posterior <MM|all>    Deflesh: keep external tissue posterior of
                                     brain centre + MM (0 = keep neck/back; all
                                     = remove all external tissue)
@@ -81,6 +83,7 @@ fn run() -> Result<(), String> {
     let mut atlas_path: Option<std::path::PathBuf> = None;
     let mut seg_region = diface_rs::MaskRegion::Face;
     let mut deflesh_posterior_mm = 0.0f64;
+    let mut brain_protect_mm = 2.0f64;
 
     let mut i = 0;
     while i < args.len() {
@@ -146,6 +149,12 @@ fn run() -> Result<(), String> {
                     "deflesh" | "external" => diface_rs::MaskRegion::ExternalSoftTissue,
                     other => return Err(format!("unknown --seg-region '{other}'")),
                 };
+            }
+            "--brain-protect" => {
+                let v = take_value(&mut i)?;
+                brain_protect_mm = v
+                    .parse::<f64>()
+                    .map_err(|_| format!("invalid --brain-protect '{v}'"))?;
             }
             "--deflesh-posterior" => {
                 let v = take_value(&mut i)?;
@@ -263,6 +272,7 @@ fn run() -> Result<(), String> {
     } else if backend_choice == "segmentation" {
         BackendKind::Segmentation(diface_rs::SegBackendParams {
             region: seg_region,
+            brain_protect_mm,
             deflesh_posterior_mm,
             seg: diface_rs::SegParams {
                 threshold: params.threshold.clone(),

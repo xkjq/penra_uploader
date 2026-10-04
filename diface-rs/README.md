@@ -72,6 +72,7 @@ Run `diface --help` for all options:
 | `--depth` | Anterior/posterior shift of the cut (mm) | `0` |
 | `--extent` | Preserve-ellipsoid scale per axis, `A,L,S` | `1,1,1` |
 | `--seg-region` | Segmentation region: `face`, `deflesh` | `face` |
+| `--brain-protect` | Segmentation: safety band (mm) kept around the intracranial core | `2` |
 | `--deflesh-posterior` | Deflesh: keep external tissue posterior of brain centre + mm, or `all` | `0` |
 | `--fill` | `min`, `zero`, or a raw value | `min` |
 | `--min-slices` | Skip smaller series | `3` |

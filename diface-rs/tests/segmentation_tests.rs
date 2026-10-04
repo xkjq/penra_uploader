@@ -237,6 +237,54 @@ fn segmentation_margin_controls_removal_amount() {
 }
 
 #[test]
+fn brain_protect_band_shrinks_removal_and_spares_the_core() {
+    // `brain_protect_mm` is the hard safety band kept around the intracranial
+    // core (`cavity ∪ vault`). A wider band must remove strictly less face while
+    // still sparing the brain. This is the control exposed as `--brain-protect`.
+    let volume = head_with_table();
+    let mk = |protect: f64| {
+        SegmentationBackend::new(SegBackendParams {
+            brain_margin_mm: 20.0,
+            brain_protect_mm: protect,
+            ..SegBackendParams::default()
+        })
+        .compute_mask(&volume)
+        .expect("mask")
+    };
+    let none = mk(0.0);
+    let wide = mk(15.0);
+    assert!(
+        wide.count_removed() <= none.count_removed(),
+        "a wider safety band must not remove more ({} vs {})",
+        wide.count_removed(),
+        none.count_removed()
+    );
+    assert!(
+        wide.count_removed() < none.count_removed(),
+        "a wider safety band should remove strictly less on the phantom"
+    );
+
+    // Neither mask may remove a brain voxel.
+    let seg = segment(&volume, &SegParams::default()).expect("segment");
+    for mask in [&none, &wide] {
+        let mut brain_removed = 0usize;
+        for z in 0..volume.nz() {
+            for y in 0..volume.ny() {
+                for x in 0..volume.nx() {
+                    let cx = (x / seg.stride[0]).min(seg.dims[0] - 1);
+                    let cy = (y / seg.stride[1]).min(seg.dims[1] - 1);
+                    let cz = (z / seg.stride[2]).min(seg.dims[2] - 1);
+                    if seg.brain_at(cx, cy, cz) && mask.is_removed(x, y, z) {
+                        brain_removed += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(brain_removed, 0, "the safety band must keep all brain voxels");
+    }
+}
+
+#[test]
 fn deflesh_removes_external_tissue_and_keeps_brain() {
     use diface_rs::MaskRegion;
     let volume = head_with_table();

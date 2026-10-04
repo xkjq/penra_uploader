@@ -4,8 +4,6 @@
 //! cargo run --example atlas_debug -- <series_dir>
 //! ```
 
-use std::path::PathBuf;
-
 use diface_rs::atlas::{Atlas, AtlasBackend, AtlasParams};
 use diface_rs::backend::DefacingBackend;
 use diface_rs::geometric::{choose_threshold, head_statistics, Threshold};

@@ -87,9 +87,6 @@ pub struct DefaceOptions {
     pub dry_run: bool,
     /// Delete the original input files after a successful write.
     pub remove_original: bool,
-    /// Safety band (mm) around the intracranial core that no backend may remove.
-    /// `0` disables the extra pass. Default `2.0`.
-    pub brain_protect_mm: f64,
 }
 
 impl Default for DefaceOptions {
@@ -102,7 +99,6 @@ impl Default for DefaceOptions {
             subdir_by_series: true,
             dry_run: false,
             remove_original: false,
-            brain_protect_mm: 2.0,
         }
     }
 }
