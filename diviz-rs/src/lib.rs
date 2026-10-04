@@ -1295,8 +1295,48 @@ fn build_deface_volume(
         return Err("Defacing requires at least 2 slices".to_string());
     }
 
+    // All candidates must share dimensions, like `diface_rs::series::load_series`.
+    let (width, height) = images[order[0]].raw_image.dimensions();
+    for &i in &order {
+        if images[i].raw_image.dimensions() != (width, height) {
+            return Err("Defacing requires slices with identical dimensions".to_string());
+        }
+    }
+
+    // Group slices by ImageOrientationPatient and keep the largest
+    // orientation-consistent group, mirroring `diface_rs::series::load_series`.
+    // A multi-orientation series (e.g. localisers saved under one
+    // SeriesInstanceUID) is not a rigid volume; the in-viewer deface must pick
+    // the same subset the CLI/uploader would, so the preview matches the output.
+    const IOP_TOL: f32 = 1e-3;
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for &i in &order {
+        let iop = images[i].image_orientation_patient;
+        let mut matched = false;
+        for members in groups.iter_mut() {
+            let Some(reference) = images[members[0]].image_orientation_patient else {
+                continue;
+            };
+            let Some(iop) = iop else { continue };
+            if (0..6).all(|k| (iop[k] - reference[k]).abs() <= IOP_TOL) {
+                members.push(i);
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            groups.push(vec![i]);
+        }
+    }
+    groups.sort_by(|a, b| b.len().cmp(&a.len()));
+    order = groups.into_iter().next().unwrap_or_default();
+    if order.len() < 2 {
+        return Err(
+            "Defacing requires at least 2 slices with a consistent orientation".to_string(),
+        );
+    }
+
     let first = &images[order[0]];
-    let (width, height) = first.raw_image.dimensions();
     let orientation = first
         .image_orientation_patient
         .ok_or_else(|| "Defacing requires ImageOrientationPatient".to_string())?;
@@ -5831,6 +5871,30 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.contains("grayscale"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn build_deface_volume_keeps_the_largest_orientation_group() {
+        let data = vec![0.0f32; 4];
+        // One slice with orientation A (sagittal, slice normal = -Y).
+        let mut a = gray16_image("a", 1, [0.0, 0.0, 0.0], [1.0, 1.0], 2, 2, &data);
+        a.image_orientation_patient = Some([1.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+        // Three slices with orientation B (axial, slice normal = +Z).
+        let mut b0 = gray16_image("b0", 2, [0.0, 0.0, 0.0], [1.0, 1.0], 2, 2, &data);
+        b0.image_orientation_patient = Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        let mut b1 = gray16_image("b1", 3, [0.0, 0.0, 1.0], [1.0, 1.0], 2, 2, &data);
+        b1.image_orientation_patient = Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        let mut b2 = gray16_image("b2", 4, [0.0, 0.0, 2.0], [1.0, 1.0], 2, 2, &data);
+        b2.image_orientation_patient = Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+
+        let images = vec![a, b0, b1, b2];
+        let geom = build_deface_volume(&images, &[0, 1, 2, 3]).expect("geometry");
+        assert_eq!(
+            geom.order,
+            vec![1, 2, 3],
+            "the largest orientation group should be selected"
+        );
+        assert_eq!(geom.volume.dims[2], 3);
     }
 
     // ── Pure helper functions ───────────────────────────────────────────────
