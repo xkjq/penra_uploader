@@ -31,6 +31,7 @@ image = "0.25"
 dicor_rs = { package = "dicor-rs", path = "../dicor-rs" }
 dicom_viewer = { path = "../dicom_viewer" }
 divue_rs = { package = "divue-rs", path = "../divue-rs" }
+diface_rs = { package = "diface-rs", path = "../diface-rs" }
 dicom-pixeldata = "0.10"
 dicom-object = "0.10"
 dicom-core = "0.10"

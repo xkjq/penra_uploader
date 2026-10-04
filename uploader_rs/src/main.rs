@@ -102,6 +102,8 @@ struct QueueItem {
     dir: PathBuf,
     notify: bool,
     seed: Option<String>,
+    /// Whether to blank facial voxels on the anonymised output.
+    deface: bool,
     tx: std_mpsc::Sender<String>,
 }
 
@@ -130,6 +132,7 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                 let tx = qi.tx.clone();
                 let notify_flag = qi.notify;
                 let seed_clone = qi.seed.clone();
+                let deface_flag = qi.deface;
 
                 // compute anon_dir relative to the processing dir
                 let anon_dir = processing_dir
@@ -153,10 +156,17 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                     let _ = tx.send("PROC:STEP:Anonymizing export files".to_string());
                     let processed_count = Arc::new(AtomicUsize::new(0));
                     let total_copy = total; // capture for closure
+                    // (output path, original pixel hash) for every anonymised
+                    // file. Needed to re-cache the hash after defacing changes
+                    // the output pixels (duplicate detection must keep using the
+                    // ORIGINAL pixels' hash).
+                    let hash_records: Arc<std::sync::Mutex<Vec<(PathBuf, Option<String>)>>> =
+                        Arc::new(std::sync::Mutex::new(Vec::with_capacity(total)));
                     dcm_files.par_iter().for_each(|p| {
                         let tx = tx.clone();
                         let processed_count = processed_count.clone();
                         let seed = seed_clone.clone();
+                        let hash_records = hash_records.clone();
                         // Open each input once, hash its pixels, then anonymize the
                         // same in-memory object. Compression is lossless, so the
                         // input digest equals the output's, and the anonymized
@@ -178,6 +188,9 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                         let handle_ok = |out: &std::path::Path,
                                              anon_obj: &dicom_object::DefaultDicomObject,
                                              tx: &std_mpsc::Sender<String>| {
+                            if let Ok(mut g) = hash_records.lock() {
+                                g.push((out.to_path_buf(), pixel_hash.clone()));
+                            }
                             upload::cache_ready_file_from_obj(out, anon_obj, pixel_hash.clone());
                             match &pixel_hash {
                                 Some(hash_hex) => {
@@ -226,6 +239,96 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                             let _ = tx.send(format!("PROC:PROG:{}", prog));
                         }
                     });
+
+                    // ── Defacing pass ─────────────────────────────────────
+                    // Runs after anonymisation because it needs whole series
+                    // reconstructed in 3D. The defaced output overwrites the
+                    // anonymised files in place; we then re-cache each output
+                    // with the ORIGINAL pixel hash so duplicate detection is
+                    // unaffected by the (intentionally) changed pixels.
+                    if deface_flag {
+                        let _ = tx.send("PROC:STEP:Defacing facial voxels".to_string());
+                        let records = hash_records.lock().map(|g| g.clone()).unwrap_or_default();
+                        let mut defaced_ok = true;
+                        let deface_opts = diface_rs::DefaceOptions {
+                            // Deface files in place; keep names and inputs.
+                            subdir_by_series: false,
+                            remove_original: false,
+                            // Need whole series to reconstruct a volume.
+                            min_slices: 3,
+                            ..diface_rs::DefaceOptions::default()
+                        };
+                        match diface_rs::deface_dir_in_place(&anon_dir, &deface_opts) {
+                            Ok(report) => {
+                                let removed: usize =
+                                    report.series.iter().map(|s| s.removed_voxels).sum();
+                                let series_n = report.series.len();
+                                for w in &report.warnings {
+                                    let _ = tx.send(format!("Deface warning: {w}"));
+                                }
+                                let _ = tx.send(format!(
+                                    "Defaced {series_n} series ({removed} voxels blanked); duplicate hashes kept from original pixels"
+                                ));
+                            }
+                            Err(e) => {
+                                defaced_ok = false;
+                                let _ = tx.send(format!("Defacing failed, keeping anonymised pixels: {e}"));
+                            }
+                        }
+                        if defaced_ok {
+                            // Defacing rewrites pixels uncompressed; recompress
+                            // each output to JPEG-LS lossless to match the
+                            // anonymise step's output size.
+                            let _ = tx.send("PROC:STEP:Compressing defaced files".to_string());
+                            let outputs: Vec<PathBuf> = records
+                                .iter()
+                                .map(|(p, _)| p.clone())
+                                .filter(|p| p.exists())
+                                .collect();
+                            outputs.par_iter().for_each(|path| {
+                                match dicom_object::open_file(path) {
+                                    Ok(mut obj) => {
+                                        match dicor_rs::compress_to_jpegls(&mut obj) {
+                                            Ok(true) | Ok(false) => {
+                                                if let Err(e) = obj.write_to_file(path) {
+                                                    upload::log_rpc_debug(&format!(
+                                                        "recompress write failed for {}: {}",
+                                                        path.display(),
+                                                        e
+                                                    ));
+                                                }
+                                            }
+                                            Err(e) => upload::log_rpc_debug(&format!(
+                                                "recompress failed for {}: {}",
+                                                path.display(),
+                                                e
+                                            )),
+                                        }
+                                    }
+                                    Err(e) => upload::log_rpc_debug(&format!(
+                                        "recompress open failed for {}: {}",
+                                        path.display(),
+                                        e
+                                    )),
+                                }
+                            });
+
+                            // Re-cache each output's ORIGINAL pixel hash against
+                            // the defaced+recompressed file's new size/mtime. A
+                            // subsequent scan then keeps the original hash
+                            // (duplicate detection is unaffected by defacing or
+                            // recompression: JPEG-LS is lossless).
+                            for (path, hash) in records.iter() {
+                                if let Some(h) = hash {
+                                    if path.exists() {
+                                        upload::cache_pixel_hash(path, h);
+                                    }
+                                }
+                            }
+                            // Rebuild ready metadata from the defaced files.
+                            let _ = upload::request_scan(&anon_dir, Some(tx.clone()));
+                        }
+                    }
                 }
 
                 if notify_flag {
@@ -299,6 +402,7 @@ fn enqueue_export_processing(
     tx: std_mpsc::Sender<String>,
     notify_flag: bool,
     seed_clone: Option<String>,
+    deface: bool,
 ) {
     thread::spawn(move || {
         let anon_dir = export
@@ -352,6 +456,7 @@ fn enqueue_export_processing(
             dir: processing_dir.clone(),
             notify: notify_flag,
             seed: seed_clone,
+            deface,
             tx: tx.clone(),
         };
         if let Err(e) = PROCESS_QUEUE.send(qi) {
@@ -548,6 +653,7 @@ struct AppState {
     processed: Vec<String>,
     seed: Option<String>,
     shared_seed: Option<Arc<std::sync::Mutex<Option<String>>>>,
+    shared_deface: Option<Arc<std::sync::Mutex<bool>>>,
     username: String,
     password: String,
     logged_in_user: Option<String>,
@@ -555,6 +661,9 @@ struct AppState {
     recurse_depth: i32,
     ext_filter: String,
     notify_on_process: bool,
+    /// Blank facial voxels on the anonymised output (defacing). The original
+    /// (pre-deface) pixel hash is retained for duplicate detection.
+    deface_faces: bool,
     login_open: bool,
     ready_series: Vec<SeriesInfo>,
     selected_series: Vec<bool>,
@@ -645,6 +754,7 @@ impl Default for AppState {
                 Some(format!("{:016x}", raw & 0xFFFF_FFFF_FFFF_FFFFu128))
             },
             shared_seed: None,
+            shared_deface: None,
             username: String::new(),
             password: String::new(),
             logged_in_user: None,
@@ -652,6 +762,7 @@ impl Default for AppState {
             recurse_depth: -1,
             ext_filter: "".to_string(),
             notify_on_process: false,
+            deface_faces: false,
             ready_series: Vec::new(),
             selected_series: Vec::new(),
             base_url_mode: {
@@ -946,7 +1057,8 @@ impl AppState {
         let tx = match &self.tx { Some(t) => t.clone(), None => { let (t,_r)=mpsc::channel(); t } };
         let notify_flag = self.notify_on_process;
         let seed_clone = self.seed.clone();
-        enqueue_export_processing(export, tx, notify_flag, seed_clone);
+        let deface = self.deface_faces;
+        enqueue_export_processing(export, tx, notify_flag, seed_clone, deface);
     }
 
     // Handle an incoming message string (extracted from the UI update loop).
@@ -1946,6 +2058,22 @@ impl eframe::App for AppState {
                     ui.text_edit_singleline(&mut self.custom_base_url);
                 });
                 ui.checkbox(&mut self.skip_ssl, "Disable SSL verification (unsafe)");
+                // Deface faces on the anonymised output. The original pixel
+                // hash is preserved for duplicate detection.
+                if ui
+                    .checkbox(&mut self.deface_faces, "Deface faces (blank facial voxels)")
+                    .on_hover_text(
+                        "Reconstructs each series in 3D and blanks facial voxels. Duplicate \
+                         detection still uses the original (pre-deface) pixel hash.",
+                    )
+                    .changed()
+                {
+                    if let Some(shared) = &self.shared_deface {
+                        if let Ok(mut g) = shared.lock() {
+                            *g = self.deface_faces;
+                        }
+                    }
+                }
                 // Theme toggle
                 if ui.checkbox(&mut self.theme_dark, "Dark theme (toggle light/dark)").changed() {
                     let theme_str = if self.theme_dark { "dark" } else { "light" };
@@ -2515,6 +2643,10 @@ fn main() {
 
         let shared_seed = Arc::new(std::sync::Mutex::new(app.seed.clone()));
         app.shared_seed = Some(shared_seed.clone());
+        // Shared deface flag so the IPC (export "loaded") path uses the same
+        // setting as the manual trigger.
+        let shared_deface = Arc::new(std::sync::Mutex::new(app.deface_faces));
+        app.shared_deface = Some(shared_deface.clone());
 
         // Deferred token validation: run off the main thread with a short,
         // bounded timeout so a slow/unreachable server cannot block startup.
@@ -2540,6 +2672,7 @@ fn main() {
         let tx_clone = tx.clone();
         let export_dir_for_ipc = app.export_dir.clone();
         let shared_seed_for_ipc = shared_seed.clone();
+        let shared_deface_for_ipc = shared_deface.clone();
         let ipc_name_clone = ipc_name.clone();
         thread::spawn(move || {
             use std::io::ErrorKind;
@@ -2555,6 +2688,7 @@ fn main() {
                                 let tx_conn = tx_clone.clone();
                                 let export_conn = export_dir_for_ipc.clone();
                                 let shared_seed_conn = shared_seed_for_ipc.clone();
+                                let shared_deface_conn = shared_deface_for_ipc.clone();
                                 thread::spawn(move || {
                                     let _ = conn.write_all(b"ok");
                                     let mut buf = [0u8; 512];
@@ -2564,7 +2698,8 @@ fn main() {
                                     };
                                     if text == "loaded" {
                                         let current_seed = shared_seed_conn.lock().ok().and_then(|g| g.clone());
-                                        enqueue_export_processing(export_conn, tx_conn.clone(), false, current_seed);
+                                        let deface = shared_deface_conn.lock().map(|g| *g).unwrap_or(false);
+                                        enqueue_export_processing(export_conn, tx_conn.clone(), false, current_seed, deface);
                                         let _ = tx_conn.send("IPC:RECV:loaded (enqueued)".to_string());
                                     } else if !text.is_empty() {
                                         let _ = tx_conn.send(format!("IPC:RECV:{}", text));
@@ -2605,6 +2740,7 @@ fn main() {
                                                     let tx_conn = tx_clone.clone();
                                                     let export_conn = export_dir_for_ipc.clone();
                                                     let shared_seed_conn = shared_seed_for_ipc.clone();
+                                                    let shared_deface_conn = shared_deface_for_ipc.clone();
                                                     thread::spawn(move || {
                                                         let _ = conn.write_all(b"ok");
                                                         let mut buf = [0u8; 512];
@@ -2614,7 +2750,8 @@ fn main() {
                                                         };
                                                         if text == "loaded" {
                                                             let current_seed = shared_seed_conn.lock().ok().and_then(|g| g.clone());
-                                                            enqueue_export_processing(export_conn, tx_conn.clone(), false, current_seed);
+                                                            let deface = shared_deface_conn.lock().map(|g| *g).unwrap_or(false);
+                                                            enqueue_export_processing(export_conn, tx_conn.clone(), false, current_seed, deface);
                                                             let _ = tx_conn.send("IPC:RECV:loaded (enqueued)".to_string());
                                                         } else if !text.is_empty() {
                                                             let _ = tx_conn.send(format!("IPC:RECV:{}", text));

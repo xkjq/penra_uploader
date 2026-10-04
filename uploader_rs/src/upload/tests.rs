@@ -152,6 +152,130 @@ fn test_ready_meta_cache_fast_path() {
     assert!(get_cached_ready_meta(&f, size, mtime).is_none());
 }
 
+/// Write a small defaceable CT series (geometry + nose) into `dir`.
+fn write_defaceable_series(dir: &std::path::Path) {
+    use dicom_core::value::PrimitiveValue;
+    use dicom_object::{DefaultDicomObject, Tag};
+    let (rows, cols, nz) = (32usize, 32usize, 16usize);
+    let spacing = 2.0f64;
+    for z in 0..nz {
+        let instance = z as u16 + 1;
+        let sop = format!("1.2.826.0.1.3680043.10.55.{instance}");
+        let meta = FileMetaTableBuilder::new()
+            .media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.2")
+            .media_storage_sop_instance_uid(&sop)
+            .transfer_syntax(EXPLICIT_VR_LE_UID)
+            .build()
+            .unwrap();
+        let mut obj = DefaultDicomObject::new_empty_with_meta(meta);
+        let half_x = cols as f64 * spacing / 2.0;
+        let half_y = rows as f64 * spacing / 2.0;
+        let z_world = z as f64 * spacing - (nz as f64 * spacing) / 2.0;
+        let mut data = vec![-1000i16; rows * cols];
+        for y in 0..rows {
+            for x in 0..cols {
+                let wx = -half_x + x as f64 * spacing;
+                let wy = -half_y + y as f64 * spacing;
+                let e = (wx / 14.0).powi(2) + (wy / 14.0).powi(2) + (z_world / 18.0).powi(2);
+                let mut v = -1000i16;
+                if e <= 1.0 {
+                    v = 40;
+                }
+                if wy <= -14.0 && wy >= -18.0 && wx.abs() <= 2.0 && z_world.abs() <= 3.0 {
+                    v = 40;
+                }
+                data[y * cols + x] = v;
+            }
+        }
+        let _ = obj.put_str(Tag(0x0008, 0x0016), VR::UI, "1.2.840.10008.5.1.4.1.1.2");
+        let _ = obj.put_str(Tag(0x0008, 0x0018), VR::UI, &sop);
+        let _ = obj.put_str(Tag(0x0008, 0x0060), VR::CS, "CT");
+        let _ = obj.put_str(Tag(0x0020, 0x000D), VR::UI, "1.2.826.0.1.3680043.10.55.0");
+        let _ = obj.put_str(Tag(0x0020, 0x000E), VR::UI, "1.2.826.0.1.3680043.10.55.1");
+        let _ = obj.put_str(Tag(0x0020, 0x0013), VR::IS, &instance.to_string());
+        let _ = obj.put_str(
+            Tag(0x0020, 0x0032),
+            VR::DS,
+            &format!("{:.4}\\{:.4}\\{:.4}", -half_x, -half_y, z_world),
+        );
+        let _ = obj.put_str(Tag(0x0020, 0x0037), VR::DS, "1\\0\\0\\0\\1\\0");
+        let _ = obj.put_str(Tag(0x0028, 0x0030), VR::DS, &format!("{spacing}\\{spacing}"));
+        let _ = obj.put(dicom_object::mem::InMemElement::new(Tag(0x0028, 0x0002), VR::US, PrimitiveValue::new_u16(1)));
+        let _ = obj.put_str(Tag(0x0028, 0x0004), VR::CS, "MONOCHROME2");
+        let _ = obj.put(dicom_object::mem::InMemElement::new(Tag(0x0028, 0x0010), VR::US, PrimitiveValue::new_u16(rows as u16)));
+        let _ = obj.put(dicom_object::mem::InMemElement::new(Tag(0x0028, 0x0011), VR::US, PrimitiveValue::new_u16(cols as u16)));
+        let _ = obj.put(dicom_object::mem::InMemElement::new(Tag(0x0028, 0x0100), VR::US, PrimitiveValue::new_u16(16)));
+        let _ = obj.put(dicom_object::mem::InMemElement::new(Tag(0x0028, 0x0101), VR::US, PrimitiveValue::new_u16(16)));
+        let _ = obj.put(dicom_object::mem::InMemElement::new(Tag(0x0028, 0x0102), VR::US, PrimitiveValue::new_u16(15)));
+        let _ = obj.put(dicom_object::mem::InMemElement::new(Tag(0x0028, 0x0103), VR::US, PrimitiveValue::new_u16(1)));
+        let _ = obj.put_str(Tag(0x0028, 0x1052), VR::DS, "0");
+        let _ = obj.put_str(Tag(0x0028, 0x1053), VR::DS, "1");
+        let _ = obj.put_str(Tag(0x0018, 0x0088), VR::DS, &format!("{spacing}"));
+        let pixel: dicom_object::mem::InMemElement =
+            dicom_object::mem::InMemElement::new(Tag(0x7FE0, 0x0010), VR::OW, PrimitiveValue::I16(data.into()));
+        let _ = obj.put(pixel);
+        obj.write_to_file(dir.join(format!("slice_{instance:03}.dcm")))
+            .unwrap();
+    }
+}
+
+#[test]
+fn defacing_changes_pixels_but_keeps_original_cached_hash() {
+    let td = tempdir().unwrap();
+    let dir = td.path();
+    write_defaceable_series(dir);
+
+    let sample = dir.join("slice_009.dcm");
+    let original_hash = calculate_pixel_hash(&sample).expect("original pixel hash");
+    // Prime the cache as the anonymise step does before defacing.
+    cache_pixel_hash(&sample, &original_hash);
+
+    // Deface in place.
+    let opts = diface_rs::DefaceOptions {
+        subdir_by_series: false,
+        remove_original: false,
+        ..diface_rs::DefaceOptions::default()
+    };
+    let report = diface_rs::deface_dir_in_place(dir, &opts).expect("deface");
+    assert_eq!(report.series.len(), 1);
+    assert!(report.series[0].removed_voxels > 0);
+
+    // Pixels changed, so a fresh hash differs...
+    let new_hash = calculate_pixel_hash(&sample).expect("new pixel hash");
+    assert_ne!(original_hash, new_hash, "defacing must change the pixels");
+
+    // Recompress the defaced file to JPEG-LS (as the uploader does).
+    {
+        let mut obj = open_file(&sample).expect("open defaced");
+        let compressed = dicor_rs::compress_to_jpegls(&mut obj).expect("compress");
+        assert!(compressed, "defaced file should compress");
+        obj.write_to_file(&sample).expect("write compressed");
+        let re = open_file(&sample).expect("reopen");
+        assert_eq!(
+            re.meta().transfer_syntax().trim_end_matches(['\0', ' ']),
+            "1.2.840.10008.1.2.4.80",
+            "should be JPEG-LS after recompression"
+        );
+    }
+    // Recompression is lossless, so the defaced pixels hash is unchanged.
+    assert_eq!(
+        calculate_pixel_hash(&sample).expect("hash"),
+        new_hash,
+        "JPEG-LS recompression must be lossless"
+    );
+
+    // ...and after re-caching the original, the duplicate-detection hash is
+    // still the original pixels' hash.
+    cache_pixel_hash(&sample, &original_hash);
+    let cached = cached_pixel_hash(&sample).expect("cached hash");
+    assert_eq!(cached, original_hash);
+
+    // The ready-file upsert keeps the cached (original) hash too.
+    let obj = open_file(&sample).expect("open defaced");
+    let info = build_ready_info(&sample, &obj, cached.clone(), 0);
+    assert_eq!(info.hash, original_hash);
+}
+
 #[test]
 fn test_upload_chunk_parses_response() {
     let td = tempdir().unwrap();

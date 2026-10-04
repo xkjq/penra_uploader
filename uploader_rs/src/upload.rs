@@ -126,6 +126,14 @@ fn file_mtime_secs(md: &std::fs::Metadata) -> u64 {
         .unwrap_or(0)
 }
 
+/// Public wrapper returning the cached pixel hash for `path` if its size/mtime
+/// still match. Useful for verifying that a rewritten (e.g. defaced) file keeps
+/// its original hash.
+pub fn cached_pixel_hash(path: &Path) -> Option<String> {
+    let md = std::fs::metadata(path).ok()?;
+    get_cached_pixel_hash(path, md.len(), file_mtime_secs(&md))
+}
+
 fn get_cached_pixel_hash(path: &Path, size: u64, mtime: u64) -> Option<String> {
     let g = PIXEL_HASH_CACHE.lock().ok()?;
     g.get(&path_key(path)).and_then(|(s, m, h)| {
