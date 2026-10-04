@@ -1,0 +1,23 @@
+[package]
+name = "diface-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Facial anonymisation (defacing) for DICOM series"
+
+[lib]
+name = "diface_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "diface"
+path = "src/main.rs"
+
+[dependencies]
+dicom-object = "0.10"
+dicom-core = "0.10"
+dicom-dictionary-std = "0.10"
+dicom-pixeldata = { version = "0.10", features = ["charls"] }
+rayon = "1.7"
+
+[dev-dependencies]
+tempfile = "3"

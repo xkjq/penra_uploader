@@ -31,6 +31,9 @@ uploader_rs/anon/
 dicor-rs/target/
 dicor-rs/Cargo.lock
 
+# diface-rs build artifacts
+diface-rs/Cargo.lock
+
 # Cargo build artifacts (workspace-level)
 target/
 
