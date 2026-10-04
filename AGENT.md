@@ -66,6 +66,230 @@ Build & run
 - Compare with dicognito (from repo root): `PYTHONPATH=. .venv/bin/python scripts/compare_anonymizers.py test_dicoms`
 - Run Rust tests: `cd uploader/uploader_rs && cargo test`
 
+Facial anonymisation crate (diface-rs)
+- Root: uploader/diface-rs
+  - src/lib.rs        High-level API: `deface()`, `DefaceOptions`, reports
+  - src/backend.rs    `DefacingBackend` trait + `BackendKind` selector
+  - src/geometric.rs  Default geometric backend (head stats + preserve ellipsoid)
+  - src/geometry.rs   Vec3/percentile helpers (LPS patient coords)
+  - src/volume.rs     `Volume` + `Mask`
+  - src/series.rs     DICOM discovery, loading, defaced writing
+  - src/main.rs       `diface` CLI
+  - tests/            Synthetic-volume + end-to-end DICOM round-trip tests
+- Purpose: pixel-level removal of identifiable facial anatomy from multi-file
+  CT/MR series. Metadata is left untouched so it composes with dicor-rs.
+- Design: pluggable backends. Default `geometric` thresholds the volume, keeps
+  the largest connected component, estimates the head's principal (S-I) axis
+  and extents, then blanks foreground voxels anterior to a preserve ellipsoid
+  (biased posterior/superior) so brain is protected. Refuses masks above
+  `max_removed_fraction` (default 0.6).
+- Robustness: slices that disagree on ImageOrientationPatient are split into
+  orientation-consistent groups and the largest group is defaced (previously the
+  whole series was rejected). Verified on real data in ~/dicoms: CT head
+  (case 546) and six MR brain series (case 554) all give `mask match: OK`,
+  `wrong-fill: 0`, and 94-97% of removed voxels anterior of the head centre.
+- Debug helpers: `cargo run --example inspect_series -- <dir>` lists slice
+  geometry; `cargo run --example verify_defacing -- <orig> <defaced>` compares
+  the output against a freshly computed mask, reports anterior/posterior split
+  and renders ASCII axial previews.
+- Output pixel data: uncompressed Explicit VR Little Endian; run dicor-rs after
+  to compress/anonymise metadata.
+- Viewer integration: `--view` opens the defaced output in `diviz-rs`
+  (src/viewer.rs). Resolution order: `DIVACE_VIEWER` env override, `diviz-rs`
+  on PATH, then workspace build outputs (`diviz-rs/target/{debug,release}`).
+  Spawned as a subprocess, so the library keeps no GUI dependencies.
+- In-viewer defacing: diviz-rs depends on diface_rs and exposes a "🙈 Deface"
+  toolbar button. It builds a `diface_rs::Volume` in memory (build_deface_volume
+  in diviz-rs/src/lib.rs), runs the geometric backend, blanks the mask in a
+  copy of the active series, groups it as `<uid>-DEFACED`, and opens it in a
+  second viewport next to the original. Clicking again refreshes the copy
+  (always rebuilt from the base series, so the uid never gets double-suffixed).
+  MPR volumes are **per series** (`mpr_volumes: Vec<Option<MprVolume>>`), so
+  the original and the defaced copy each have their own volume and can be
+  viewed in MPR side by side. `refresh_mpr_volumes` rebuilds them all;
+  `mpr_series_for(viewport)` returns the viewport's *own* series (so a defaced
+  viewport uses the defaced volume and the source uses the original), and
+  `mpr_slice_for`/`mpr_index_for_point`/`viewport_anchor_point` resolve the
+  volume through that helper.
+- Viewport sync (per viewport): each `ViewportState` has `sync_group:
+  Option<u32>`. The toolbar "🔗 Sync" checkbox + group combo apply to the active
+  viewport; viewports sharing a group stay in lockstep, independent ones do not.
+  Each frame `autosync_active` detects which viewport was navigated
+  (per-viewport `last_navs` snapshots) and `sync_from` moves the other members
+  of its group to the matching patient-space position. Works for Stack (nearest
+  image by `dot(pos, normal)`) and MPR (nearest plane index along the patient
+  axis). Defacing auto-assigns the two panes to a new shared group.
+  Series/plane/mode changes re-baseline instead of propagating, and `last_navs`
+  is refreshed after every propagation to prevent echo. Synced cells show a
+  "🔗 Group N" badge.
+- MPR orientation & gantry tilt: `MprPlane::u_sign()`/`v_sign()` control the
+  image flip so planes follow the radiological convention (axial: anterior top;
+  coronal: superior top; sagittal: superior top, anterior left). `extract_plane`
+  flips by reversing the sample order. `MprVolume::sample_trilinear` samples
+  each slice using its own `ImagePositionPatient` and in-plane axes
+  (`slice_positions`/`slice_col_dirs`/`slice_row_dirs`), so a sheared stack
+  (CT gantry tilt, e.g. `case 546`) is de-tilted instead of assuming a
+  rectangular grid. The resample grid spacing per patient axis is the source
+  voxel's *projected extent* (sum of absolute edge projections), so a tilted
+  stack is neither oversampled (previously the Z step collapsed to the in-plane
+  pixel size) nor undersampled. Manual check:
+  `cargo run --example mpr_preview -- <dir> <plane>`.
+- Defacing axis assignment (`head_statistics` in diface-rs/src/geometric.rs):
+  raw PCA is unreliable on wide-FOV / partially segmented scans (a head CT that
+  also imaged neck/table has more in-plane than S-I variance), which rotated
+  case 546 by ~90 degrees. The axes are now assigned from the acquisition
+  geometry: `superior` = the slice axis when the stack is axial (`|dir[2]·Z| >
+  0.6`), otherwise the eigenvector most aligned with world Z; `anterior`/`left`
+  from the in-plane row/column axes, orthogonalised. Verified: case 546 now
+  76.6% anterior (was 36%), brain series 80-100% anterior. Diagnose with
+  `cargo run --example deface_debug -- <series_dir>` (prints foreground extents,
+  estimated axes, and anterior/posterior split).
+- Manual defacing controls (`GeometricParams`): `axis_override` (explicit unit
+  frame), `yaw_deg` (rotate about superior), `anterior_offset_mm` (cut depth),
+  and `extent_scale` (per-axis preserve-ellipsoid multipliers). Exposed as CLI
+  flags `--yaw/--depth/--extent` and as the diviz-rs toolbar **🎛 Align** panel
+  (`deface_alignment_ui`), which edits `DicomViewApp::deface_params` and
+  re-applies via `deface_active_series`.
+- Segmentation backend (`diface_rs::segmentation`): in-house head+brain
+  segmentation — threshold -> morphological open/close on a per-axis coarse grid
+  -> isolate the head (largest foreground component near the volume centre,
+  cropped to a head-sized sphere) -> estimate brain (CT: detect + morphologically
+  close the skull via `bone_hu`/`skull_close_radius`, grow soft tissue from an
+  interior seed bounded by it, tolerating small skull gaps; MR: intensity-band
+  grow) -> clamp to a brain-sized ellipsoid -> cut a single plane in front of the
+  brain. `SegBackendParams::region` selects `Face` (default; flat cut) or
+  `ExternalSoftTissue`/"deflesh" (remove everything **outside the cranial
+  vault**; keep region = **`cavity ∪ vault`**, so it never extends into the
+  brain or vault; non-CT fallback = closed cavity). Removal is gated anteriorly
+  by `SegBackendParams::deflesh_posterior_mm` (default 0 = external tissue
+  posterior of the brain centre is **kept**, preserving neck/back-of-head; set
+  `f64::INFINITY` / CLI `--deflesh-posterior all` to remove all external
+  tissue). CLI `--seg-region face|deflesh`; viewer **Region** selector +
+  **Keep back-of-head after** slider (`deface_deflesh_posterior_mm`).
+  `cut_reference` selects `BrainFront` (default) or `SkullFront`.
+  **Vault autosegmentation** (`vault_from_cavity`): the brain grow is re-run
+  without the ellipsoid clamp to produce `cavity` (brain + CSF to the inner
+  table); `vault` = the closed skull shell surrounding the cavity
+  (`vault_shell_radius`). This separates the calvarium from the facial skeleton
+  even when they fuse into one connected bone component — connectivity alone
+  (the old topmost-bone `component_of_extreme`) could not, which is why the
+  vault used to reach into the face. `Segmentation` now carries `cavity` and a
+  true `vault`; `vault_at`/`cavity_at` accessors; `SkullFront` cuts in front of
+  the vault's frontal bone (`most_anterior_vault`). Viewer `🗺 Areas` now draws
+  head(blue)/brain(green)/vault(orange)/cavity(cyan) — labels 1..4.
+  Note: `erode` treats out-of-bounds neighbours as foreground so morphological
+  closings never clip cells at the volume border.
+  Types:
+  `SegParams`, `Segmentation`, `segment()`, `SegBackendParams`,
+  `SegmentationBackend`; `BackendKind::Segmentation`; CLI `--backend
+  segmentation`; viewer Backend row (3-way). Tests: diface-rs/tests/
+  segmentation_tests.rs (skull-bounded phantom; `vault_is_a_shell_that_excludes_the_face`,
+  `deflesh_removes_external_tissue_and_keeps_brain` asserts 0 brain **and** 0 vault removed).
+- Head-stats stabilisation: `geometric::head_statistics_best` runs the
+  in-house segmentation and restricts the principal-axis point cloud to the
+  segmented head (via `head_filter`), falling back to the plain estimate if
+  segmentation fails. Both `GeometricBackend::compute_mask` and
+  `AtlasBackend::fit` use it, so wide-FOV CT (head + neck/table) no longer
+  skews the head frame. `head_statistics_masked` exposes the masked form.
+- Atlas backend (`diface_rs::atlas`): `Atlas` (self-describing `.dfatlas`
+  format, `to_bytes`/`from_bytes`, built-in `synthetic`), `AtlasBackend`
+  (9-DOF affine fitted from head stats, removes foreground in front of the
+  registered brain, never behind its centre), `AtlasParams`, `AtlasSpec`
+  (Synthetic/File/InMemory). Exposed via `BackendKind::Atlas`, CLI
+  `--backend atlas` / `--atlas <file>`, and the viewer **Backend** row +
+  **Load atlas…**. Registration is coarse (no true brain segmentation), so it
+  is a cross-check rather than the default.
+- Algorithms (`diface_rs::DefaceAlgorithm`): `Ellipsoid` (default),
+  `Plane` (single anterior plane), `CurvedFront` (parabolic cut that recedes
+  toward the vertex/laterally). Selected in `compute_mask` via `remove_at`;
+  CLI `--algorithm`; viewer **Algorithm** dropdown (live preview). On case 546
+  they remove 10.2% / 4.0% / 6.5% respectively. `apply_preset` never changes the
+  algorithm.
+- Presets (`diface_rs::DefacePreset`): `Conservative` / `Balanced` / `Thorough`,
+  applied via `GeometricParams::apply_preset` (keeps manual yaw/axis override).
+  `GeometricParams::default()` now equals `Balanced` (the old default
+  preserve_fraction 0.72 trimmed too much brain). `matching_preset()` reports
+  the active preset. CLI `--preset`; viewer **Preset** buttons live-update the
+  preview. Measured on case 546: conservative 3.7%, balanced 10.2%, thorough
+  14.5% of voxels removed.
+- Removal preview: `toggle_deface_preview`/`refresh_deface_preview` compute the
+  mask without writing and store a `DefacePreview` = 3D volume mask (`volume_flags`
+  + `dims`) plus per-image flags (`per_image`). **Stack** viewports look up
+  `per_image` for the displayed slice; **MPR** viewports use
+  `DefacePreview::plane_flags(plane, index)` (matching `MprVolume::extract_plane`
+  axis mapping + u/v flips) so the red overlay works in MPR too. Both tint via
+  `tint_removed` (`👁 Preview` toggle in the Align panel; live-updates as sliders
+  change). Cleared once the defaced copy is written.
+- MPR sagittal orientation: `MprPlane::Sagittal` uses `u_sign = +1` (u axis = +Y
+  posterior, unflipped) so **anterior is on the left** (standard radiological
+  convention), superior at the top. Covered by
+  `sagittal_puts_anterior_on_the_left`.
+  `🧭 Reset view` in the Align panel resets the active viewport's
+  zoom/rotation/pan and window/level and clears the preview.
+  `🗺 Areas` toggle (`deface_show_segmentation`) draws the in-house segmentation
+  in the overlay (head blue / brain green / vault orange / cavity cyan) via
+  `DefacePreview::volume_labels`/`per_image_labels`/`plane_labels` and
+  `tint_segmentation`.
+  Preview is on by default (`deface_preview_on`, `toggle_deface_preview` flips
+  the preference) but **only auto-computes while the Align panel is open**
+  (`deface_panel_open`); closing the panel clears the overlay. It refreshes each
+  frame and after `deface_active_series`.
+  The alignment controls map onto the Segmentation backend too (Depth/Preset ->
+  `SegBackendParams::brain_margin_mm`).
+- Uploader integration (uploader_rs):
+  - `diface_rs::deface_dir_in_place(dir, opts)` defaces each series found in a
+    directory **overwriting files in place** (names preserved), used after the
+    anonymise step when the "Deface faces" setting is on.
+  - After defacing, `/home/ross/penra_uploader/uploader_rs/src/main.rs`
+    recompresses each output to **JPEG-LS lossless** via
+    `dicor_rs::compress_to_jpegls` (defacing writes uncompressed), in parallel.
+    Recompression is lossless, so the defaced pixels' hash is unchanged.
+  - CRITICAL: duplicate detection must keep using the **original (pre-deface)**
+    pixel hash. The anonymise loop computes `calculate_pixel_hash_from_obj` on
+    the input object and records `(output_path, original_hash)`. After
+    deface+recompress, each output is re-cached with `cache_pixel_hash(path,
+    original_hash)` (re-stats the new size/mtime) and `request_scan` rebuilds
+    ready metadata; `upsert_ready_file_internal` prefers the cached hash, so the
+    defaced pixels never change the duplicate key. Tested by
+    `defacing_changes_pixels_but_keeps_original_cached_hash` in
+    uploader_rs/src/upload/tests.rs (also asserts the output is JPEG-LS after
+    recompression and that this is lossless).
+  - The flag is threaded via `QueueItem.deface` -> `enqueue_export_processing`,
+    kept in sync with the Settings checkbox through `AppState.shared_deface` for
+    the IPC ("loaded") path.
+- diviz-rs tests: `mod tests` in diviz-rs/src/lib.rs (~52 tests). Covers MPR
+  construction (incl. gantry tilt), defacing, viewport sync, geometry helpers,
+  file discovery, real on-disk DICOM decode, and headless `eframe` UI frames via
+  `run_headless_frame[_with]` (drives `App::ui` through `ctx.run_ui`). Coverage:
+  `cargo llvm-cov --lib` -> ~80% regions / 86% functions; the remainder is UI
+  interaction closures and the window-launching `run_viewer*` entry points.
+- Recent-folders history: `load_files(paths, record_recent, ctx)` only records a
+  recent folder when `record_recent` is true. User-initiated opens (Open
+  Files/Folder dialog, drag-and-drop, Recent menu) pass `true`;
+  **programmatic loads pass `false`** — CLI arguments, `diface --view`
+  (`run_viewer_with_files` sets `pending_load = Some((path_bufs, false))`) and
+  tests. `pending_load: Option<(Vec<PathBuf>, bool)>` carries the flag. Tested by
+  `programmatic_loads_do_not_touch_recent_history`.
+- Per-viewport controls are split into separate `egui::Area` overlays
+  (`viewport_controls_overlay` + `viewport_area`), each in its own position:
+  sync top-left, view mode + plane top-right, window/level + presets
+  bottom-right, series selector bottom-left, fit/zoom/rotate mid-left. The
+  Switching Stack <-> MPR keeps the current window/level preset (only changing
+  the series resets it). The window/level fields are hidden until the W/L overlay is double-clicked
+  (`wl_editor_open[idx]`). The image rect per viewport is recorded during the
+  draw pass in `viewport_image_rects`. The toolbar keeps only global controls
+  (open, viewport add/remove, series for the active viewport, and Deface).
+- Wheel scrolling: both the single- and multi-viewport paths go through
+  `wheel_step_slices`. It accumulates `smooth_scroll_delta` (egui sends a
+  decaying tail per notch) and advances at most one slice per call once
+  `WHEEL_SLICE_THRESHOLD` (48) is reached, then resets. A per-viewport
+  `wheel_owner` discards partial movement when the hovered cell changes.
+- Demo: `cargo run --example make_synthetic_series -- /tmp/demo_in` then
+  `cargo run --release -- --view /tmp/demo_in /tmp/demo_out`.
+- Build: `cd diface-rs && cargo build --release`; test: `cargo test`
+- Run: `cargo run --release -- [--recursive] [--dry-run] [--view] <INPUT> <OUTPUT>`
+- See diface-rs/README.md for options, limitations and backend extension.
+
 Next recommended work
 - CLI options: `--seed`, `--clear-text-vr` (configurable behaviour)
 - Add more unit tests: SR content checks, nested UID remap, date/time shift correctness
