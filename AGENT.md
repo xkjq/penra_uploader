@@ -224,8 +224,13 @@ Facial anonymisation crate (diface-rs)
   0 → 1 over `deflesh_smooth_mm`. The binary `remove` flags are unchanged, so the
   0 brain / 0 vault guarantee holds; `Mask::weight` (empty = binary) is consumed
   by `series::write_defaced_series` and `deface_volume`, which compute
-  `orig + (fill - orig) * w`. Test
-  `deflesh_smooth_feathers_the_boundary_without_changing_removal`.
+  `orig + (fill - orig) * w`. The **in-viewer** defaced copy applies the same
+  blend via `DefaceGeometry::removal_weight_native` (previously it hard-wrote the
+  fill and ignored the weight, so the slider looked inert in the viewer). The red
+  👁 Preview overlay stays binary on purpose (it shows *which* voxels are removed,
+  not the blend). Tests
+  `deflesh_smooth_feathers_the_boundary_without_changing_removal`,
+  `deflesh_smoothing_blends_the_in_viewer_defaced_copy`.
   Types:
   `SegParams`, `Segmentation`, `segment()`, `SegBackendParams`,
   `SegmentationBackend`; `BackendKind::Segmentation`; CLI `--backend

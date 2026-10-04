@@ -1176,6 +1176,27 @@ impl DefaceGeometry {
         }
         mask.is_removed(x, y, z)
     }
+
+    /// Removal strength for native voxel `(x, y, z)`: `1.0` for a fully removed
+    /// voxel (binary mask, or interior of a feathered one), `0.0` when kept, and
+    /// in between on a feathered boundary.
+    fn removal_weight_native(
+        &self,
+        x: usize,
+        y: usize,
+        z: usize,
+        mask: &diface_rs::volume::Mask,
+    ) -> f32 {
+        if x >= self.width || y >= self.height || z >= self.order.len() {
+            return 0.0;
+        }
+        let i = mask.idx(x, y, z);
+        if mask.remove[i] == 0 {
+            0.0
+        } else {
+            mask.weight_at(i)
+        }
+    }
 }
 
 /// A defacing removal preview for one series, usable in both Stack and MPR.
@@ -2376,8 +2397,16 @@ impl DicomViewApp {
                 for y in 0..height {
                     let row = y * width;
                     for x in 0..width {
-                        if geom.is_removed_native(x, y, z, &mask) && row + x < g.data.len() {
-                            g.data[row + x] = fill;
+                        if row + x >= g.data.len() {
+                            continue;
+                        }
+                        // Apply the feathered weight so the smooth option is
+                        // visible in the in-viewer defaced copy, matching the
+                        // file writer (`orig + (fill - orig) * w`).
+                        let w = geom.removal_weight_native(x, y, z, &mask);
+                        if w > 0.0 {
+                            let orig = g.data[row + x];
+                            g.data[row + x] = orig + (fill - orig) * w;
                         }
                     }
                 }
@@ -7090,6 +7119,64 @@ mod tests {
             });
             output.textures_delta.clear();
         }
+    }
+
+    #[test]
+    fn deflesh_smoothing_blends_the_in_viewer_defaced_copy() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_head();
+        app.viewports = vec![ViewportState::default()];
+        app.active_viewport = 0;
+        app.deface_backend = DefaceBackendSel::Segmentation;
+        app.deface_seg_region = diface_rs::MaskRegion::ExternalSoftTissue;
+
+        // Deface with no feather: every removed voxel is fully replaced.
+        app.deface_deflesh_smooth_mm = 0.0;
+        app.deface_active_series(&ctx);
+        let hard_uid = app
+            .series_groups
+            .iter()
+            .find(|g| g.uid.ends_with("-DEFACED"))
+            .unwrap()
+            .uid
+            .clone();
+        let hard = app
+            .images
+            .iter()
+            .filter(|i| i.series_uid == hard_uid)
+            .map(|i| match &i.raw_image {
+                RawImage::Gray16(g) => g.data.clone(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+
+        // Re-apply with a wide feather; the copy must differ (faded edge).
+        app.deface_deflesh_smooth_mm = 10.0;
+        app.deface_active_series(&ctx);
+        let soft = app
+            .images
+            .iter()
+            .filter(|i| i.series_uid == hard_uid)
+            .map(|i| match &i.raw_image {
+                RawImage::Gray16(g) => g.data.clone(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+
+        let differing = hard
+            .iter()
+            .zip(soft.iter())
+            .map(|(a, b)| {
+                a.iter()
+                    .zip(b.iter())
+                    .filter(|(x, y)| (*x - *y).abs() > f32::EPSILON)
+                    .count()
+            })
+            .sum::<usize>();
+        assert!(
+            differing > 0,
+            "the smooth option must change the in-viewer defaced copy"
+        );
     }
 
     #[test]
