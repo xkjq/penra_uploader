@@ -75,9 +75,15 @@ impl Atlas {
             rd_u32(16) as usize,
             rd_u32(20) as usize,
         ];
+        if dims.contains(&0) {
+            return Err("atlas dimensions must be non-zero".to_string());
+        }
         let spacing = [rd_f32(24) as f64, rd_f32(28) as f64, rd_f32(32) as f64];
         let origin = [rd_f32(36) as f64, rd_f32(40) as f64, rd_f32(44) as f64];
-        let n = dims[0] * dims[1] * dims[2];
+        let n = dims[0]
+            .checked_mul(dims[1])
+            .and_then(|xy| xy.checked_mul(dims[2]))
+            .ok_or_else(|| "atlas dimensions overflow".to_string())?;
         let body = &bytes[48..];
         if body.len() < n {
             return Err(format!(

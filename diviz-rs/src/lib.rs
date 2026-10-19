@@ -1036,6 +1036,12 @@ fn decode_single_file(path: &PathBuf) -> Result<LoadedImage, String> {
 
     let rows = pixel_data.rows() as usize;
     let cols = pixel_data.columns() as usize;
+    if rows == 0 || cols == 0 {
+        return Err("Invalid zero-sized image dimensions".to_string());
+    }
+    let num_pixels = rows
+        .checked_mul(cols)
+        .ok_or_else(|| "Image dimensions overflow".to_string())?;
     let bits = pixel_data.bits_allocated();
     let samples = pixel_data.samples_per_pixel();
     let signed = matches!(
@@ -1046,17 +1052,19 @@ fn decode_single_file(path: &PathBuf) -> Result<LoadedImage, String> {
 
     let raw_image = match (bits, samples) {
         (8, 1) => {
-            if bytes.len() < rows * cols {
+            if bytes.len() < num_pixels {
                 return Err("Pixel data buffer is too short".to_string());
             }
             RawImage::Gray8 {
-                data: bytes[..rows * cols].to_vec(),
+                data: bytes[..num_pixels].to_vec(),
                 width: cols,
                 height: rows,
             }
         }
         (16, 1) => {
-            let expected = rows * cols * 2;
+            let expected = num_pixels
+                .checked_mul(2)
+                .ok_or_else(|| "Pixel buffer size overflow".to_string())?;
             if bytes.len() < expected {
                 return Err(format!(
                     "Pixel data buffer too short: {} bytes, expected {}",
@@ -1066,7 +1074,7 @@ fn decode_single_file(path: &PathBuf) -> Result<LoadedImage, String> {
             }
             let data: Vec<f32> = bytes
                 .chunks_exact(2)
-                .take(rows * cols)
+                .take(num_pixels)
                 .map(|c| {
                     let raw_u16 = u16::from_le_bytes([c[0], c[1]]);
                     let raw_val = if signed {
@@ -1084,7 +1092,9 @@ fn decode_single_file(path: &PathBuf) -> Result<LoadedImage, String> {
             })
         }
         (8, 3) => {
-            let expected = rows * cols * 3;
+            let expected = num_pixels
+                .checked_mul(3)
+                .ok_or_else(|| "Pixel buffer size overflow".to_string())?;
             if bytes.len() < expected {
                 return Err("Pixel data buffer is too short".to_string());
             }
