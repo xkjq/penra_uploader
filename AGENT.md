@@ -75,6 +75,15 @@ Testing & validation
 
 Build & run
 - Build Rust: `cd uploader_rs && cargo build`
+- Windows exe icon: `uploader_rs/build.rs` embeds
+  `assets/generated/uploade-rs_icon.ico` via the `winresource` build-dependency
+  whenever the *target* OS is Windows (checked with `CARGO_CFG_TARGET_OS`, since
+  build scripts run on the host), so Explorer/taskbar/Alt-Tab show the app icon
+  instead of the default Rust/Cargo one. Regenerate the `.ico` from
+  `assets/uploade-rs_icon.png` with
+  `convert uploade-rs_icon.png -define icon:auto-resize=256,128,64,48,32,16 generated/uploade-rs_icon.ico`.
+  The runtime window icon (`main.rs` `viewport.icon`) is unchanged. The other
+  binaries (diviz-rs, divue, diface, diforge, launcher) do not embed an icon yet.
 - Run anonymiser: `./target/debug/uploader_rs --anon <input.dcm> <output.dcm>`
 - Compare with dicognito (from repo root): `PYTHONPATH=. .venv/bin/python scripts/compare_anonymizers.py test_dicoms`
 - Run Rust tests: `cd uploader_rs && cargo test`

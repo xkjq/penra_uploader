@@ -42,6 +42,10 @@ charls = { version = "0.4.2", features = ["static"] }
 tempfile = "3.6"
 httpmock = "0.6"
 
+# Embed the application icon into the Windows .exe (see build.rs).
+[build-dependencies]
+winresource = "0.1"
+
 # Pin the transitive `windows` crate used by wgpu-hal/gpu-allocator: 0.62.2
 # broke the Direct3D12 interface hierarchy they rely on. Remove once wgpu
 # ships a release compatible with windows 0.62.2+.
