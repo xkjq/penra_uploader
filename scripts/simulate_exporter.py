@@ -88,6 +88,11 @@ def send_ipc(ipc_name: str, message: bytes = b"loaded", timeout: float = 2.0) ->
     logger.info(f"Sending IPC to {ipc_name}")
     uid = os.getuid() if hasattr(os, "getuid") else None
     candidates = []
+    # Prefer XDG_RUNTIME_DIR and ~/.uploader (used by uploader_rs on Unix)
+    xdg_runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg_runtime:
+        candidates.append(os.path.join(xdg_runtime, ipc_name))
+    candidates.append(os.path.join(os.path.expanduser("~"), ".uploader", ipc_name))
     # abstract namespace (Linux)
     candidates.append("\0" + ipc_name)
     # common filesystem locations: temp dir, /tmp, /var/tmp, run user, cwd

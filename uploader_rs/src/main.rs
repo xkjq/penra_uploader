@@ -34,10 +34,51 @@ use tracing_subscriber::prelude::*;
 
 static FILTER_RELOADER: OnceCell<Box<dyn Fn(EnvFilter) -> Result<(), String> + Send + Sync>> = OnceCell::new();
 
+fn runtime_ipc_dir() -> PathBuf {
+    #[cfg(not(windows))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+        {
+            return xdg;
+        }
+        return upload::uploader_config_dir();
+    }
+    #[cfg(windows)]
+    {
+        upload::uploader_config_dir()
+    }
+}
+
+fn generate_random_seed() -> String {
+    let mut entropy = [0u8; 16];
+    #[cfg(unix)]
+    {
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let _ = f.read_exact(&mut entropy);
+        }
+    }
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let stack_addr = &entropy as *const _ as usize;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&entropy);
+    hasher.update(&t.to_le_bytes());
+    hasher.update(&pid.to_le_bytes());
+    hasher.update(&stack_addr.to_le_bytes());
+    let hash = hasher.finalize();
+    hex::encode(&hash.as_bytes()[..16])
+}
+
 // Local-socket IPC helpers (interprocess 2.x requires converting the name first).
 #[cfg(not(windows))]
 fn local_socket_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(name)
+    runtime_ipc_dir().join(name)
 }
 
 fn local_socket_name(name: &str) -> std::io::Result<Name<'static>> {
@@ -812,14 +853,7 @@ impl Default for AppState {
                 // Generate a unique session seed so all studies anonymized within this
                 // session share the same seed, keeping patient pseudonyms and date shifts
                 // consistent across the session without requiring user input.
-                use std::time::{SystemTime, UNIX_EPOCH};
-                let t = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-                let pid = std::process::id() as u128;
-                let raw = t.wrapping_add(pid.wrapping_mul(0x9e3779b97f4a7c15u128));
-                Some(format!("{:016x}", raw & 0xFFFF_FFFF_FFFF_FFFFu128))
+                Some(generate_random_seed())
             },
             shared_seed: None,
             shared_deface: None,
@@ -902,14 +936,7 @@ impl AppState {
     }
 
     fn generate_new_seed(&mut self) {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let t = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let pid = std::process::id() as u128;
-        let raw = t.wrapping_add(pid.wrapping_mul(0x9e3779b97f4a7c15u128));
-        let new_seed = Some(format!("{:016x}", raw & 0xFFFF_FFFF_FFFF_FFFFu128));
+        let new_seed = Some(generate_random_seed());
         self.update_seed(new_seed);
         self.last_msg = "Started new patient (generated new anonymization seed)".to_string();
         self.add_toast("Started new patient (anonymization seed updated)".to_string(), 4000);
@@ -1070,15 +1097,10 @@ impl AppState {
                                 if upload::save_api_token(t) {
                                     let _ = tx.send("Login successful".to_string());
                                     // validate token and fetch username
-                                    // Try header auth first; if it errors, fall back to posting JSON like the Python client.
-                                    let header_resp = client.post(&token_check).header("Authorization", format!("Bearer {}", t)).send();
-                                    let vc_res = match header_resp {
-                                        Ok(v) => Ok(v),
-                                        Err(e) => {
-                                            let _ = tx.send(format!("Header token_check failed (will try JSON body): {}", e));
-                                            client.post(&token_check).json(&serde_json::json!({"token": t})).send()
-                                        }
-                                    };
+                                    let vc_res = client
+                                        .post(&token_check)
+                                        .header("Authorization", format!("Bearer {}", t))
+                                        .send();
                                     match vc_res {
                                         Ok(vc) => {
                                             if vc.status().is_success() {
@@ -1197,7 +1219,7 @@ impl AppState {
                 self.sync_burned_in_confirmations();
                 self.last_msg = "Ready-to-upload refreshed".to_string();
                 upload::log_rpc_debug("Ready-to-upload refreshed (scan_written)");
-            } else if let Ok(txt) = std::fs::read_to_string(".last_scan.json") {
+            } else if let Ok(txt) = std::fs::read_to_string(upload::last_scan_path()) {
                 // fallback: try reading the file if cache not available
                 if let Ok(v) = serde_json::from_str::<Vec<SeriesInfo>>(&txt) {
                     self.ready_series = v;
@@ -1609,7 +1631,7 @@ impl eframe::App for AppState {
                                     Ok(new_series) => {
                                         if let Ok(json2) = serde_json::to_string(&new_series) {
                                             upload::store_last_scan(new_series.clone());
-                                            let _ = std::fs::write(".last_scan.json", &json2);
+                                            let _ = upload::write_last_scan_file(&json2);
                                             let _ = tx.send("scan_written".to_string());
                                         }
                                     }
@@ -1670,7 +1692,7 @@ impl eframe::App for AppState {
                                         let new_series = upload::snapshot_ready_series(&anon_dir);
                                         if let Ok(json2) = serde_json::to_string(&new_series) {
                                             upload::store_last_scan(new_series.clone());
-                                            let _ = std::fs::write(".last_scan.json", &json2);
+                                            let _ = upload::write_last_scan_file(&json2);
                                             let _ = tx.send("scan_written".to_string());
                                         }
                                         let _ = tx.send(format!("duplicates_cleared:{}", deleted));
@@ -1925,27 +1947,33 @@ impl eframe::App for AppState {
                                         if !series.duplicate_series_urls.is_empty() {
                                             let url = series.duplicate_series_urls.get(0).cloned().unwrap_or_default();
                                             if ui.small_button("View on server").clicked() {
-                                                if !url.is_empty() {
+                                                if url.starts_with("https://") || url.starts_with("http://") {
                                                     #[cfg(target_os = "windows")]
                                                     let _ = std::process::Command::new("explorer").arg(url.clone()).spawn();
                                                     #[cfg(target_os = "macos")]
                                                     let _ = std::process::Command::new("open").arg(url.clone()).spawn();
                                                     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                                                     let _ = std::process::Command::new("xdg-open").arg(url.clone()).spawn();
-                                                } else {
+                                                } else if url.is_empty() {
                                                     self.last_msg = "No duplicate URL available".to_string();
+                                                } else {
+                                                    self.last_msg = "Blocked unsafe duplicate URL scheme".to_string();
                                                 }
                                             }
                                         } else {
                                             let base = upload::base_site_url();
                                             let uploads = format!("{}/atlas/uploads", base.trim_end_matches('/'));
                                             if ui.small_button("Open uploads").clicked() {
-                                                #[cfg(target_os = "windows")]
-                                                let _ = std::process::Command::new("explorer").arg(uploads.clone()).spawn();
-                                                #[cfg(target_os = "macos")]
-                                                let _ = std::process::Command::new("open").arg(uploads.clone()).spawn();
-                                                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-                                                let _ = std::process::Command::new("xdg-open").arg(uploads.clone()).spawn();
+                                                if uploads.starts_with("https://") || uploads.starts_with("http://") {
+                                                    #[cfg(target_os = "windows")]
+                                                    let _ = std::process::Command::new("explorer").arg(uploads.clone()).spawn();
+                                                    #[cfg(target_os = "macos")]
+                                                    let _ = std::process::Command::new("open").arg(uploads.clone()).spawn();
+                                                    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+                                                    let _ = std::process::Command::new("xdg-open").arg(uploads.clone()).spawn();
+                                                } else {
+                                                    self.last_msg = "Blocked unsafe base URL scheme".to_string();
+                                                }
                                             }
                                         }
                                     });
@@ -2745,9 +2773,16 @@ fn main() {
             // socket and send a short 'loaded' notification, then exit.
             let user = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| format!("pid{}", std::process::id()));
             let ipc_name = format!("uploader_rs_{}", user);
-            let lock_path = std::env::temp_dir().join(format!("uploader_rs_{}.lock", user));
+            let lock_path = runtime_ipc_dir().join(format!("uploader_rs_{}.lock", user));
             // open (and keep) the lock file for the lifetime of the process
-            let lockfile = match std::fs::OpenOptions::new().create(true).write(true).open(&lock_path) {
+            let mut lock_opts = std::fs::OpenOptions::new();
+            lock_opts.create(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                lock_opts.mode(0o600);
+            }
+            let _lockfile = match lock_opts.open(&lock_path) {
                 Ok(f) => {
                     if let Err(_) = f.try_lock_exclusive() {
                         // lock failed -> another instance likely running; notify it and exit

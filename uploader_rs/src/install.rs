@@ -42,18 +42,19 @@ pub fn install_desktop_icon_and_file() {
 
     // Exec path: try current exe
     let exec_path = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok()).map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "uploader_rs".to_string());
+    let exec_escaped = exec_path.replace('\\', "\\\\").replace('"', "\\\"");
 
     let desktop_contents = format!(r#"[Desktop Entry]
 Version=1.0
 Type=Application
 Name=Uploader RS
 Comment=Upload and anonymize DICOM studies
-Exec={}
+Exec="{}"
 Icon=uploader_rs
 Terminal=false
 Categories=Utility;Graphics;
 StartupWMClass=uploader_rs
-"#, exec_path);
+"#, exec_escaped);
 
     if let Err(e) = fs::write(&desktop_dest, desktop_contents) {
         tracing::warn!("Failed to write .desktop file {}: {}", desktop_dest.display(), e);

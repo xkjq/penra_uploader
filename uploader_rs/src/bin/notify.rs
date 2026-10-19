@@ -8,6 +8,23 @@ use std::path::PathBuf;
 
 #[cfg(not(windows))]
 fn local_socket_path(name: &str) -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+    {
+        return xdg.join(name);
+    }
+    if let Some(home) = dirs::home_dir() {
+        let dir = home.join(".uploader");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            }
+            return dir.join(name);
+        }
+    }
     std::env::temp_dir().join(name)
 }
 

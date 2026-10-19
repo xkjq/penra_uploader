@@ -862,11 +862,48 @@ pub fn collect_files_recursive(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-fn config_file_path() -> PathBuf {
+pub fn uploader_config_dir() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let cfg = home.join(".uploader");
     let _ = std::fs::create_dir_all(&cfg);
-    cfg.join("config.json")
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o700));
+    }
+    cfg
+}
+
+fn write_private_file(path: &Path, contents: &str) -> bool {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true).mode(0o600);
+        if let Ok(mut f) = opts.open(path) {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            return f.write_all(contents.as_bytes()).is_ok();
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents).is_ok()
+    }
+}
+
+fn config_file_path() -> PathBuf {
+    uploader_config_dir().join("config.json")
+}
+
+pub fn last_scan_path() -> PathBuf {
+    uploader_config_dir().join("last_scan.json")
+}
+
+pub fn write_last_scan_file(json: &str) -> bool {
+    let p = last_scan_path();
+    write_private_file(&p, json)
 }
 
 pub fn load_base_url() -> Option<String> {
@@ -899,7 +936,7 @@ pub fn save_base_url(url: &str) -> bool {
         }
     }
     map.insert("base_url".to_string(), serde_json::Value::String(url.to_string()));
-    std::fs::write(p, serde_json::Value::Object(map).to_string()).is_ok()
+    write_private_file(&p, &serde_json::Value::Object(map).to_string())
 }
 
 pub fn load_skip_ssl() -> bool {
@@ -929,7 +966,7 @@ pub fn save_skip_ssl(skip: bool) -> bool {
         }
     }
     map.insert("skip_ssl".to_string(), serde_json::Value::Bool(skip));
-    std::fs::write(p, serde_json::Value::Object(map).to_string()).is_ok()
+    write_private_file(&p, &serde_json::Value::Object(map).to_string())
 }
 
 pub fn load_theme() -> Option<String> {
@@ -961,7 +998,7 @@ pub fn save_theme(theme: &str) -> bool {
         }
     }
     map.insert("theme".to_string(), serde_json::Value::String(theme.to_string()));
-    std::fs::write(p, serde_json::Value::Object(map).to_string()).is_ok()
+    write_private_file(&p, &serde_json::Value::Object(map).to_string())
 }
 
 pub fn load_parallelism() -> Option<usize> {
@@ -993,7 +1030,7 @@ pub fn save_parallelism(n: usize) -> bool {
         }
     }
     map.insert("parallelism".to_string(), serde_json::Value::Number(serde_json::Number::from(n as u64)));
-    std::fs::write(p, serde_json::Value::Object(map).to_string()).is_ok()
+    write_private_file(&p, &serde_json::Value::Object(map).to_string())
 }
 
 pub fn load_request_timeout_secs() -> u64 {
@@ -1028,14 +1065,11 @@ pub fn save_request_timeout_secs(timeout_secs: u64) -> bool {
         "request_timeout_secs".to_string(),
         serde_json::Value::Number(serde_json::Number::from(timeout_secs.max(MIN_REQUEST_TIMEOUT_SECS))),
     );
-    std::fs::write(p, serde_json::Value::Object(map).to_string()).is_ok()
+    write_private_file(&p, &serde_json::Value::Object(map).to_string())
 }
 
 fn token_file_path() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let cfg = home.join(".uploader");
-    let _ = std::fs::create_dir_all(&cfg);
-    cfg.join("api_token")
+    uploader_config_dir().join("api_token")
 }
 
 pub fn load_api_token() -> Option<String> {
@@ -1049,7 +1083,7 @@ pub fn load_api_token() -> Option<String> {
 
 pub fn save_api_token(token: &str) -> bool {
     let p = token_file_path();
-    std::fs::write(p, token).is_ok()
+    write_private_file(&p, token)
 }
 
 pub fn clear_api_token() -> bool {
@@ -1058,10 +1092,13 @@ pub fn clear_api_token() -> bool {
 }
 
 pub fn log_file_path() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let cfg = home.join(".uploader");
-    let _ = std::fs::create_dir_all(&cfg);
-    cfg.join("request_log.txt")
+    let p = uploader_config_dir().join("request_log.txt");
+    #[cfg(unix)]
+    if p.exists() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    }
+    p
 }
 
 pub fn log_rpc(msg: &str) {
@@ -1100,7 +1137,7 @@ pub fn save_log_level(level: &str) -> bool {
         }
     }
     map.insert("log_level".to_string(), serde_json::Value::String(level.to_string()));
-    std::fs::write(p, serde_json::Value::Object(map).to_string()).is_ok()
+    write_private_file(&p, &serde_json::Value::Object(map).to_string())
 }
 
 /// Emit an RPC-style log at a dynamic `Level`.
@@ -1158,15 +1195,10 @@ fn token_username_with_timeout(timeout_secs: Option<u64>) -> Option<String> {
                 return None;
             }
         };
-        // Try header auth first; if it errors (network/proxy/ssl issues), fall back to POSTing JSON like the Python client.
-        let header_resp = client.post(&token_check).header("Authorization", format!("Bearer {}", t)).send();
-        let resp = match header_resp {
-            Ok(r) => Ok(r),
-            Err(e) => {
-                log_rpc_debug(&format!("Header token_check failed (will try JSON body): {}", e));
-                client.post(&token_check).json(&serde_json::json!({"token": t})).send()
-            }
-        };
+        let resp = client
+            .post(&token_check)
+            .header("Authorization", format!("Bearer {}", t))
+            .send();
 
         if let Ok(r) = resp {
             let status = r.status();
@@ -1814,7 +1846,7 @@ pub fn request_scan(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<String>>
                         // store parsed series in-memory for quick UI pickup
                         store_last_scan(series.clone());
                         if let Ok(json) = serde_json::to_string(&series) {
-                            let _ = std::fs::write(".last_scan.json", json);
+                            let _ = write_last_scan_file(&json);
                             if let Some(ref s) = tx {
                                 let _ = s.send("scan_written".to_string());
                                 let _ = s.send("done".to_string());
