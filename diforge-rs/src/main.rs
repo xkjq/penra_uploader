@@ -387,11 +387,11 @@ impl Default for ReportApp {
                     // Helper to attempt initialization and log failures
                         let try_init = |aff: &str, dic: &str| -> Option<RawHunspell> {
                             eprintln!("[dbg] trying hunspell aff='{}' dic='{}'", aff, dic);
-                            match std::panic::catch_unwind(|| RawHunspell::new(aff, dic)) {
-                                Ok(hs) => Some(hs),
-                                Err(_) => {
+                            match RawHunspell::try_new(aff, dic) {
+                                Some(hs) => Some(hs),
+                                None => {
                                     eprintln!(
-                                        "[dbg] RawHunspell::new panicked for {} {}",
+                                        "[dbg] RawHunspell::try_new failed for {} {}",
                                         aff, dic
                                     );
                                     None
@@ -507,6 +507,7 @@ impl Default for ReportApp {
                 .map(|p| std::path::Path::new(p).exists())
                 .unwrap_or(false)
         );
+        #[cfg(feature = "hunspell")]
         eprintln!("[dbg] hunspell_present={}", app.hunspell.is_some());
 
         // Load persisted settings (if any) and apply

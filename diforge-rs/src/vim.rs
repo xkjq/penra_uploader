@@ -648,10 +648,11 @@ impl ReportBuffer {
                 cur += 1;
             }
             if line_start_byte < line_end_byte {
+                let line_start_char = self.report[..line_start_byte].chars().count();
                 self.push_undo_snapshot();
                 self.report
                     .replace_range(line_start_byte..line_end_byte, "");
-                self.caret_char_range = Some(line_start_byte..line_start_byte);
+                self.caret_char_range = Some(line_start_char..line_start_char);
             }
         }
     }
@@ -727,9 +728,10 @@ impl ReportBuffer {
             if ch == '0' && last_vim_count.is_none() {
                 // fall through to handle '0' as a motion
             } else {
+                const MAX_VIM_COUNT: usize = 10_000;
                 let d = ch.to_digit(10).unwrap() as usize;
                 if let Some(prev) = last_vim_count.take() {
-                    *last_vim_count = Some(prev * 10 + d);
+                    *last_vim_count = Some(prev.saturating_mul(10).saturating_add(d).min(MAX_VIM_COUNT));
                 } else {
                     *last_vim_count = Some(d);
                 }
