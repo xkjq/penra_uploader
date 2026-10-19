@@ -1,14 +1,2 @@
-typer
-#wxpython
 pydicom
 dicognito
-python-datauri
-requests
-pynng
-blake3
-loguru
-#dicom2jpg
-pyinstaller
-nicegui
-keyring
-pywin32 ; sys_platform == 'win32'
