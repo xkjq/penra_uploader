@@ -72,8 +72,11 @@ Run `diface --help` for all options:
 | `--depth` | Anterior/posterior shift of the cut (mm) | `0` |
 | `--extent` | Preserve-ellipsoid scale per axis, `A,L,S` | `1,1,1` |
 | `--seg-region` | Segmentation region: `face`, `deflesh` | `face` |
-| `--brain-protect` | Segmentation: safety band (mm) kept around the intracranial core | `2` |
-| `--deflesh-smooth` | Deflesh: feather the removal boundary by mm (`0` = hard cut) | `3` |
+| `--include-orbits` | Segmentation (face): also remove the orbital contents (eyes) | off |
+| `--include-ears` | Segmentation (face): also remove the ears | off |
+| `--no-vertex-strip` | Segmentation (face): keep the skull cap above the ears (default strips to the vertex) | off |
+| `--brain-protect` | Segmentation: safety band (mm) kept around the intracranial core (`0` = none) | `2` |
+| `--deflesh-smooth` | Deflesh: feather the removal boundary by mm (`0` = hard cut; recommended for anonymisation) | `0` |
 | `--deflesh-posterior` | Deflesh: keep external tissue posterior of brain centre + mm, or `all` | `0` |
 | `--fill` | `min`, `zero`, or a raw value | `min` |
 | `--min-slices` | Skip smaller series | `3` |
@@ -162,7 +165,51 @@ omits it). `Atlas::to_bytes`/`from_bytes` read/write the format, and the viewer'
 5. cut the mask. `SegBackendParams::region` selects what is removed:
    - `Face` (default) — a single plane in front of the frontal pole (the face
      only). `cut_reference` (`BrainFront` default / `SkullFront`) moves the plane
-     to the brain front or further forward, just ahead of the vault;
+     to the brain front or further forward, just ahead of the vault.
+     `include_orbits` (CLI `--include-orbits`) additionally removes an
+     orbit-level region in front of the brain, so the globes (eyes) are removed
+     even when a conservative margin leaves them behind the flat cut. The region
+     is derived from the segmented brain's patient-space bounding box and stops
+     in front of the anterior pole (with a small buffer), so it cannot reach the
+     inferior frontal lobes or the temporal fossa. It is guarded by the segmented
+     **brain** and by actual **bone** voxels (not the intracranial cavity or the
+     configurable safety margin), because the cavity grow can leak through the
+     optic canal into an orbit, and a coarse vault cell can contain the globe next
+     to the orbital rim; either would otherwise keep the globe. The orbit/ear
+     regions themselves do not remove brain or vault bone. `include_ears` (CLI
+     `--include-ears`) additionally removes external tissue at ear height outside
+     the protected core, lateral to the midline and back past the full auricle
+     (while staying in front of the occiput), so the ears (a strong recognition
+     cue) do not survive a flat face cut; the brain is never touched.
+     `include_zygoma` (CLI `--include-zygoma`) additionally removes the **zygoma**
+     — the cheekbone and zygomatic arch — plus the lateral skull base behind its
+     root. These sit lateral to the maxilla and orbit and *behind* the flat cut
+     plane, so the plane leaves the cheek prominence in place. The region runs
+     from below the orbital floor to the alveolar process and back past the
+     temporomandibular joint into the lateral skull base. Because the arch is
+     bone, the vault guard must not apply there: only the segmented brain and CSF
+     are protected, with a wider band (8 mm) than the other regions, because the
+     coarse brain grid can undershoot the lowest temporal gyri. The region also
+     stops below the orbital floor, so it stays under the inferior temporal lobes
+     instead of beside them — the skull base right under the temporal lobe and the
+     temporal lobe itself are never touched. The
+     **vertex strip** (default on; `--no-vertex-strip` disables it) additionally
+     removes the skull cap and overlying scalp toward the vertex. Its lower
+     boundary follows the brain's superior surface per column (detected from the
+     bone/soft-tissue transition), so it does not cut a straight slice through the
+     skull. This is the one face-mode option that deliberately removes vault bone;
+     brain/CSF are still never removed. Because the strip follows the bone, the
+     scalp and soft tissue over a stripped vault go with it: no skin shell is left
+     hanging over bare skull. Each segmentation region is built so its removed
+     area is one visually continuous region: tiny isolated removal specks are
+     pruned, kept tissue islands that border the removal (up to ~1024 voxels, and
+     never in a brain/vault cell) are filled, and thin kept sheets or fingers
+     embedded in the removal (under ~8 mm thick, e.g. the layer a cut leaves where
+     it crosses the scalp, or a bone lamella poking into the face) are dropped.
+     Only structures bounded by removal on both sides are dropped, so the defaced
+     area stays connected and the brain/vault are never touched. For
+     maximum removal in `Face` mode enable both, and use a conservative
+     `cut_reference` (`BrainFront`) with a small margin;
    - `ExternalSoftTissue` (**"Deflesh"**) — remove everything outside the
      **cranial vault**: scalp, face, table. The keep region is the
      **cavity ∪ vault**, so it stops at the outer table of the calvarium and
@@ -171,18 +218,23 @@ omits it). `Atlas::to_bytes`/`from_bytes` read/write the format, and the viewer'
      posterior of the brain centre is **kept**, so the back of the head and neck
      survive and only the face/scalp is stripped. Set `deflesh_posterior_mm` to
      `f64::INFINITY` (CLI `--deflesh-posterior all`) to remove all external
-     tissue. Measured 7.4% on case 546 CT (vs 1.8% for `Face`), 7.5% / 3.3% on
-     two MR brain series — **0 brain and 0 vault voxels removed** on all.
+     tissue. For the strongest in-house anonymisation also set
+     `brain_protect_mm = 0` (keep the cavity ∪ vault exactly, no scalp shell) and
+     `deflesh_smooth_mm = 0` (hard cut). Measured on case 546 CT: 1.9% for
+     `Face`, 16.7% for Deflesh-all with a 2 mm band, 19.5% with no band — **0
+     brain and 0 vault voxels removed** in all cases.
 
    `SegBackendParams::brain_margin_mm` widens the margin in front of the cut
    reference; `vault_shell_radius` sets the vault shell thickness (coarse voxels);
    `deflesh_posterior_mm` gates deflesh's posterior extent (keeps the neck);
-   `deflesh_smooth_mm` (default `3`, CLI `--deflesh-smooth`) **feathers** the
+   `deflesh_smooth_mm` (default `3` in the library/viewer, CLI default `0`)
+   **feathers** the
    removal boundary: removed voxels within that distance of the keep edge are
    blended toward the fill by a weight that ramps 0 → 1, so the defleshed surface
-   fades smoothly instead of ending in a hard wall. It does not change *which*
-   voxels are removed, so the 0 brain / 0 vault guarantee still holds (`0` = hard
-   cut).
+   fades smoothly instead of ending in a hard wall. Note the weight is **0 at the
+   keep edge**, so boundary voxels keep their original values; use `0` (hard cut)
+   for anonymisation. It does not change *which* voxels are removed, so the 0
+   brain / 0 vault guarantee still holds.
 
 This backend is deliberately conservative — it only removes tissue between the
 face and the brain, so on a tight-FOV head CT it removes a few percent
@@ -236,9 +288,13 @@ of the automatic head estimate. The panel shows **only the controls the active
 backend reads**:
 
 - **Geometric** – Preset, Algorithm, Yaw°, Depth mm, Extent A/L/S, Preserve,
-- **Segmentation** – Preset, Depth mm, Preserve, plus Region / Cut at / Safety
-  band (below); Yaw/Extent and the Algorithm dropdown are hidden because that
-  backend ignores them,
+- The viewer's default defacing backend is **Segmentation**; the uploader also
+  defaults to Segmentation.
+- **Segmentation** – Preset, Depth mm, Preserve, plus Region / Cut at /
+  **Include orbits** / **Include ears** / **Strip vertex bone** / Safety band
+  (below); Yaw/Extent and the Algorithm dropdown are hidden because that backend
+  ignores them. Deflesh also exposes **Remove all external tissue** and a boundary-feather
+  width (use `0` for a hard cut).
 - **Atlas** – no manual parameters (it uses its own registration); only
   **Load atlas…** and the template dimensions appear.
 
@@ -252,6 +308,9 @@ Common controls:
 - **Preserve** – overall preserve fraction (geometric sizing; segmentation margin),
 - **↺ Auto** resets, **✓ Re-apply** rebuilds the defaced copy from the base
   series with the current settings,
+- The **🙈 Deface** button opens this Align panel automatically and runs the
+  segmentation/mask work on a worker thread with a spinner and elapsed time, so
+  the window stays responsive.
 - **👁 Preview** is **on by default** and shows a live **red overlay** on the base
   series giving exactly which voxels would be removed, in both **Stack and MPR**
   views. It updates as the orientation/depth/extent sliders (and presets) change,
@@ -392,6 +451,13 @@ options.
   reformats, localisers saved under the same series) are split into
   orientation-consistent groups and the **largest group** is defaced; the rest
   are left as-is.
+- **Fail-closed coverage is not implemented yet (TODO).** Anything that cannot be
+  defaced is currently reported as a warning and left with its original pixels:
+  scouts/topograms and other small series below `--min-slices`, multi-frame
+  series, secondary-capture/photographic DICOM, SEG/RTSTRUCT objects, and the
+  non-largest orientation group. Callers must exclude those files from upload
+  until fail-closed handling is added; the uploader currently treats the
+  warnings as non-fatal.
 - Output pixel data is re-encoded **uncompressed** Explicit VR Little Endian.
   Run `dicor-rs` afterwards to compress (e.g. JPEG-LS) and to anonymise
   metadata.

@@ -163,8 +163,19 @@ struct DefaceConfig {
     backend: DefaceBackendChoice,
     /// Segmentation region: flat face cut or "deflesh" (external soft tissue).
     region: diface_rs::MaskRegion,
+    /// Segmentation (face): also remove the orbital contents (eyes).
+    include_orbits: bool,
+    /// Segmentation (face): also remove the ears.
+    include_ears: bool,
+    /// Segmentation (face): also remove the zygoma and lateral skull base.
+    include_zygoma: bool,
+    /// Segmentation (face): strip the skull cap above the ears to the vertex.
+    vertex_strip: bool,
     /// Segmentation safety band (mm) kept around the intracranial core.
     brain_protect_mm: f64,
+    /// Deflesh: remove all external tissue (not just anterior of the brain
+    /// centre), keeping only the intracranial contents and vault.
+    deflesh_all: bool,
     /// Deflesh: feather width (mm) for the removal boundary (0 = hard cut).
     deflesh_smooth_mm: f64,
 }
@@ -173,10 +184,19 @@ impl Default for DefaceConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            backend: DefaceBackendChoice::Geometric,
+            backend: DefaceBackendChoice::Segmentation,
             region: diface_rs::MaskRegion::Face,
+            include_orbits: true,
+            include_ears: true,
+            // Opt-in: it removes the cheekbone and lateral skull base, which is
+            // a bigger change than the face/ear defaults.
+            include_zygoma: false,
+            vertex_strip: true,
             brain_protect_mm: 2.0,
-            deflesh_smooth_mm: 3.0,
+            // Anonymisation default: a hard cut (the feather deliberately keeps
+            // part of the original signal at the boundary).
+            deflesh_all: true,
+            deflesh_smooth_mm: 0.0,
         }
     }
 }
@@ -193,7 +213,16 @@ impl DefaceConfig {
             DefaceBackendChoice::Segmentation => {
                 diface_rs::BackendKind::Segmentation(diface_rs::SegBackendParams {
                     region: self.region,
+                    include_orbits: self.include_orbits,
+                    include_ears: self.include_ears,
+                    include_zygoma: self.include_zygoma,
+                    vertex_strip: self.vertex_strip,
                     brain_protect_mm: self.brain_protect_mm,
+                    deflesh_posterior_mm: if self.deflesh_all {
+                        f64::INFINITY
+                    } else {
+                        0.0
+                    },
                     deflesh_smooth_mm: self.deflesh_smooth_mm,
                     ..diface_rs::SegBackendParams::default()
                 })
@@ -361,6 +390,14 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                     // anonymised files in place; we then re-cache each output
                     // with the ORIGINAL pixel hash so duplicate detection is
                     // unaffected by the (intentionally) changed pixels.
+                    //
+                    // TODO(fail-closed): this pass is currently fail-open. A
+                    // series that cannot be defaced (e.g. a scout/topogram,
+                    // multi-frame series, mixed-orientation group, secondary
+                    // capture/photo, SEG/RTSTRUCT) is reported as a warning and
+                    // its anonymised pixels remain uploadable. Before release we
+                    // must exclude every file that was not actually defaced (or
+                    // block the export) and surface that per file.
                     if deface_cfg.enabled {
                         let _ = tx.send("PROC:STEP:Defacing facial voxels".to_string());
                         let records = hash_records.lock().map(|g| g.clone()).unwrap_or_default();
@@ -2210,6 +2247,63 @@ impl eframe::App for AppState {
                                 .clicked();
                             self.deface_cfg.region = region;
                         });
+                        if self.deface_cfg.region == diface_rs::MaskRegion::Face {
+                            ui.horizontal(|ui| {
+                                deface_changed |= ui
+                                    .checkbox(
+                                        &mut self.deface_cfg.include_orbits,
+                                        "Include orbits (eyes)",
+                                    )
+                                    .on_hover_text(
+                                        "Also remove the orbital contents (the globes/eyes): the \
+                                         flat face cut can leave them behind it. The region stays \
+                                         in front of the brain, so it cannot reach the inferior \
+                                         frontal lobes or temporal fossa, and brain and \
+                                         cranial-vault bone are never removed",
+                                    )
+                                    .changed();
+                            });
+                            ui.horizontal(|ui| {
+                                deface_changed |= ui
+                                    .checkbox(
+                                        &mut self.deface_cfg.include_ears,
+                                        "Include ears",
+                                    )
+                                    .on_hover_text(
+                                        "Also remove the ears (and temporal scalp at their \
+                                         level): a flat face cut leaves the auricles, which are \
+                                         a strong facial-recognition cue. The occiput/nape are \
+                                         kept, and brain and cranial-vault bone are never removed",
+                                    )
+                                    .changed();
+                            });
+                            ui.horizontal(|ui| {
+                                deface_changed |= ui
+                                    .checkbox(
+                                        &mut self.deface_cfg.include_zygoma,
+                                        "Remove zygoma",
+                                    )
+                                    .on_hover_text(
+                                        "Also remove the cheekbone (zygoma) and zygomatic arch, \
+                                         extending into the lateral skull base behind them. The \
+                                         flat cut sits in front of the brain, so these sit \
+                                         behind it and survive; brain and CSF are never removed",
+                                    )
+                                    .changed();
+                            });
+                            ui.horizontal(|ui| {
+                                deface_changed |= ui
+                                    .checkbox(
+                                        &mut self.deface_cfg.vertex_strip,
+                                        "Strip vertex bone",
+                                    )
+                                    .on_hover_text(
+                                        "Strip the skull cap and scalp toward the vertex, following \
+                                         the brain surface per column. Brain/CSF are never removed",
+                                    )
+                                    .changed();
+                            });
+                        }
                         ui.horizontal(|ui| {
                             ui.label("Safety band:");
                             deface_changed |= ui
@@ -2229,6 +2323,20 @@ impl eframe::App for AppState {
                         });
                         if self.deface_cfg.region == diface_rs::MaskRegion::ExternalSoftTissue {
                             ui.horizontal(|ui| {
+                                deface_changed |= ui
+                                    .checkbox(
+                                        &mut self.deface_cfg.deflesh_all,
+                                        "Remove all external tissue (brain + vault only)",
+                                    )
+                                    .on_hover_text(
+                                        "Remove all scalp, face, ears, neck and facial bone, \
+                                         keeping only the intracranial contents and vault. \
+                                         Uncheck to keep external tissue posterior of the brain \
+                                         centre (back of the head/neck)",
+                                    )
+                                    .changed();
+                            });
+                            ui.horizontal(|ui| {
                                 ui.label("Smooth deflesh edge:");
                                 deface_changed |= ui
                                     .add(
@@ -2241,7 +2349,8 @@ impl eframe::App for AppState {
                                     )
                                     .on_hover_text(
                                         "Feather the removal boundary: the defleshed surface \
-                                         fades instead of ending in a hard cut (0 = hard edge)",
+                                         fades instead of ending in a hard cut. For anonymisation \
+                                         keep 0 (the feather retains some original signal)",
                                     )
                                     .changed();
                             });
