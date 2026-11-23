@@ -1,0 +1,220 @@
+name: Release
+
+# Build a Windows and Linux bundle and publish it as a GitHub Release.
+#
+# - Push a tag like `v0.1.0` to build and publish the release immediately.
+# - Run the workflow manually to produce downloadable artifacts without
+#   publishing; supply `tag` to also publish (as a draft) for that tag.
+#
+# The tag must match the `version` field in uploader_rs/Cargo.toml.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v0.1.0). Leave blank to only build artifacts.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      publish: ${{ steps.meta.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version and validate tag
+        id: meta
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' uploader_rs/Cargo.toml | head -n1)"
+          if [[ -z "$version" ]]; then
+            echo "::error::Could not read uploader_rs version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          tag=""
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF_NAME}"
+          elif [[ -n "${INPUT_TAG:-}" ]]; then
+            tag="${INPUT_TAG}"
+          fi
+
+          publish=false
+          if [[ -n "$tag" ]]; then
+            if [[ "${tag#v}" != "$version" ]]; then
+              echo "::error::Tag '$tag' does not match uploader_rs version '$version' (expected v$version). Bump Cargo.toml before tagging."
+              exit 1
+            fi
+            publish=true
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            os: windows-latest
+          - name: linux-x86_64
+            os: ubuntu-22.04
+    env:
+      # The repository pins nightly via rust-toolchain.toml, but the code uses
+      # no nightly features; build with stable for reproducible releases.
+      RUSTUP_TOOLCHAIN: stable
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            uploader_rs -> target
+            diviz-rs -> target
+            divue-rs -> target
+            diface-rs -> target
+            dicor-rs -> target
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config cmake libssl-dev \
+            libx11-dev libxi-dev libxcursor-dev libxrandr-dev libxinerama-dev \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+
+      - name: Build (Windows MSVC)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          RUSTFLAGS: "-C link-args=/DEFAULTLIB:Advapi32.lib"
+        run: |
+          set -euo pipefail
+          # Build the standalone binaries first, then the uploader (its build.rs
+          # also builds diviz/dicor/divue, but building explicitly keeps the
+          # release deterministic and independent of build-script caching).
+          cargo build --release --manifest-path diface-rs/Cargo.toml
+          cargo build --release --manifest-path diviz-rs/Cargo.toml
+          cargo build --release --manifest-path divue-rs/Cargo.toml
+          cargo build --release --manifest-path uploader_rs/Cargo.toml
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --manifest-path diface-rs/Cargo.toml
+          cargo build --release --manifest-path diviz-rs/Cargo.toml
+          cargo build --release --manifest-path divue-rs/Cargo.toml
+          cargo build --release --manifest-path uploader_rs/Cargo.toml
+
+      - name: Test (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release --manifest-path dicor-rs/Cargo.toml
+          cargo test --release --manifest-path diface-rs/Cargo.toml
+          cargo test --release --manifest-path diviz-rs/Cargo.toml
+          cargo test --release --manifest-path divue-rs/Cargo.toml
+          cargo test --release --manifest-path uploader_rs/Cargo.toml
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path pkg, release | Out-Null
+          Copy-Item uploader_rs\target\release\uploader_rs.exe pkg\
+          Copy-Item diviz-rs\target\release\diviz-rs.exe pkg\
+          Copy-Item divue-rs\target\release\divue.exe pkg\
+          Copy-Item diface-rs\target\release\diface.exe pkg\
+          Copy-Item uploader_rs\target\release\notify.exe pkg\
+          Copy-Item .github\release-README.txt pkg\README.txt
+          $archive = "uploader-$env:VERSION-${{ matrix.name }}.zip"
+          Compress-Archive -Path pkg\* -DestinationPath "release\$archive"
+          $hash = (Get-FileHash "release\$archive" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $archive" | Set-Content "release\SHA256SUMS-${{ matrix.name }}.txt"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pkg release
+          cp uploader_rs/target/release/uploader_rs pkg/
+          cp diviz-rs/target/release/diviz-rs pkg/
+          cp divue-rs/target/release/divue pkg/
+          cp diface-rs/target/release/diface pkg/
+          cp uploader_rs/target/release/notify pkg/
+          cp .github/release-README.txt pkg/README.txt
+          archive="uploader-${VERSION}-${{ matrix.name }}.tar.gz"
+          tar -czf "release/${archive}" -C pkg .
+          (cd release && sha256sum "${archive}" > "SHA256SUMS-${{ matrix.name }}.txt")
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: release/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: [validate, build]
+    if: needs.validate.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -lR release-assets
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate.outputs.tag }}
+          name: ${{ needs.validate.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          # Manual runs publish a draft; pushing a tag publishes immediately.
+          draft: ${{ github.event_name == 'workflow_dispatch' }}
+          prerelease: ${{ contains(needs.validate.outputs.tag, '-') }}
+          fail_on_unmatched_files: true
+          files: release-assets/*
