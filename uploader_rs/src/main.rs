@@ -2,7 +2,7 @@
 
 use eframe::{egui, NativeOptions};
 use egui::CentralPanel;
-use dicor_rs::{anonymize_file, anonymize_object};
+use dicor_rs::{anonymize_file, anonymize_object, anonymize_object_with_profile, AnonymizeProfile};
 mod upload;
 mod assets;
 mod install;
@@ -368,6 +368,18 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                     // ORIGINAL pixels' hash).
                     let hash_records: Arc<std::sync::Mutex<Vec<(PathBuf, Option<String>)>>> =
                         Arc::new(std::sync::Mutex::new(Vec::with_capacity(total)));
+                    // Share the platform profile across the batch so upload-time
+                    // and site checks use the same allow-list. Offline installs
+                    // fall back to the compiled profile.
+                    let fetched_profile = upload::fetch_anonymize_profile();
+                    if fetched_profile.is_none() {
+                        let _ = tx.send(
+                            "PROFILE:FALLBACK:Using the bundled de-identification profile"
+                                .to_string(),
+                        );
+                    }
+                    let default_profile = AnonymizeProfile::default();
+                    let anon_profile = fetched_profile.as_ref().unwrap_or(&default_profile);
                     dcm_files.par_iter().for_each(|p| {
                         let tx = tx.clone();
                         let processed_count = processed_count.clone();
@@ -407,7 +419,7 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                                 }
                             }
                         };
-                        match anonymize_object(obj, p, &anon_dir, true, false, false, seed.as_deref()) {
+                        match anonymize_object_with_profile(obj, p, &anon_dir, true, false, false, seed.as_deref(), anon_profile) {
                             Ok((out, anon_obj)) => {
                                 let _ = tx.send(format!("Anonymized: {}", out.display()));
                                 handle_ok(&out, &anon_obj, &tx);
@@ -417,7 +429,7 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                                     // Retry: the object was consumed, so re-open.
                                     match dicom_object::open_file(p)
                                         .map_err(|e2| format!("reopen failed: {}", e2))
-                                        .and_then(|obj2| anonymize_object(obj2, p, &anon_dir, true, false, true, seed.as_deref()))
+                                        .and_then(|obj2| anonymize_object_with_profile(obj2, p, &anon_dir, true, false, true, seed.as_deref(), anon_profile))
                                     {
                                         Ok((out, anon_obj)) => {
                                             let _ = tx.send(format!("Anonymized with burned-in flag: {}", out.display()));

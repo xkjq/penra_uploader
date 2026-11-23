@@ -1268,6 +1268,123 @@ fn token_username_with_timeout(timeout_secs: Option<u64>) -> Option<String> {
     None
 }
 
+#[derive(Debug, Deserialize)]
+struct SiteDicomProfile {
+    #[serde(default)]
+    clear_numeric: Option<Vec<String>>,
+    #[serde(default)]
+    keep_numeric: Option<Vec<String>>,
+    #[serde(default)]
+    remove_numeric: Option<Vec<String>>,
+    #[serde(default)]
+    remove_groups: Option<Vec<String>>,
+    #[serde(default)]
+    text_vrs: Option<Vec<String>>,
+    #[serde(default)]
+    remove_private_tags: Option<bool>,
+}
+
+fn parse_profile_tag(text: &str) -> Option<Tag> {
+    let inner = text.trim().trim_start_matches('(').trim_end_matches(')');
+    let (group, element) = inner.split_once(',')?;
+    Some(Tag(
+        u16::from_str_radix(group.trim(), 16).ok()?,
+        u16::from_str_radix(element.trim(), 16).ok()?,
+    ))
+}
+
+fn parse_profile_group(spec: &str) -> Option<(u16, u16)> {
+    let text = spec.trim();
+    if let Some((low, high)) = text.split_once('-') {
+        Some((
+            u16::from_str_radix(low.trim(), 16).ok()?,
+            u16::from_str_radix(high.trim(), 16).ok()?,
+        ))
+    } else {
+        let group = u16::from_str_radix(text, 16).ok()?;
+        Some((group, group))
+    }
+}
+
+fn parse_profile_vr(name: &str) -> Option<dicom_core::header::VR> {
+    use dicom_core::header::VR;
+    match name.trim().to_ascii_uppercase().as_str() {
+        "UT" => Some(VR::UT),
+        "LT" => Some(VR::LT),
+        "ST" => Some(VR::ST),
+        "SH" => Some(VR::SH),
+        "LO" => Some(VR::LO),
+        "PN" => Some(VR::PN),
+        "UC" => Some(VR::UC),
+        "UR" => Some(VR::UR),
+        "AE" => Some(VR::AE),
+        _ => None,
+    }
+}
+
+impl SiteDicomProfile {
+    fn into_anonymize_profile(self) -> dicor_rs::AnonymizeProfile {
+        let mut profile = dicor_rs::AnonymizeProfile::default();
+        if let Some(items) = self.clear_numeric {
+            profile.clear_tags = items.iter().filter_map(|s| parse_profile_tag(s)).collect();
+        }
+        if let Some(items) = self.keep_numeric {
+            profile.keep_tags = items.iter().filter_map(|s| parse_profile_tag(s)).collect();
+        }
+        if let Some(items) = self.remove_numeric {
+            profile.remove_tags = items.iter().filter_map(|s| parse_profile_tag(s)).collect();
+        }
+        if let Some(items) = self.remove_groups {
+            profile.remove_groups = items.iter().filter_map(|s| parse_profile_group(s)).collect();
+        }
+        if let Some(items) = self.text_vrs {
+            let parsed: Vec<dicom_core::header::VR> =
+                items.iter().filter_map(|s| parse_profile_vr(s)).collect();
+            if !parsed.is_empty() {
+                profile.text_vrs = parsed;
+            }
+        }
+        if let Some(flag) = self.remove_private_tags {
+            profile.remove_private = flag;
+        }
+        // The uploader writes its own pseudonyms; always retain them.
+        for tag in [Tag(0x0010, 0x0010), Tag(0x0010, 0x0020)] {
+            if !profile.keep_tags.contains(&tag) {
+                profile.keep_tags.push(tag);
+            }
+        }
+        profile
+    }
+}
+
+/// Fetch the platform's DICOM profile so upload and site checks share one policy.
+///
+/// Returns `None` when offline, unauthenticated, or the endpoint fails; callers
+/// then use the compiled default and log the fallback.
+pub fn fetch_anonymize_profile() -> Option<dicor_rs::AnonymizeProfile> {
+    // Tests (and local anonymisation workflows) must not depend on a reachable
+    // server or the developer's saved token.
+    if cfg!(test) {
+        return None;
+    }
+    let token = load_api_token()?;
+    // Short timeout: a slow/unreachable server must not stall an anonymise batch
+    // (the bundled profile is a safe fallback).
+    let client = make_client_with_timeout(Some(&token), Some(10)).ok()?;
+    let url = format!("{}/api/atlas/dicom_profile", base_site_url());
+    let response = client.get(&url).send().ok()?;
+    if !response.status().is_success() {
+        log_rpc_debug(&format!(
+            "Profile fetch failed: HTTP {} from {}",
+            response.status(),
+            url
+        ));
+        return None;
+    }
+    let parsed: SiteDicomProfile = response.json().ok()?;
+    Some(parsed.into_anonymize_profile())
+}
+
 pub fn make_client(token: Option<&str>) -> Result<Client, String> {
     make_client_with_timeout(token, None)
 }
@@ -2102,3 +2219,45 @@ pub fn split_series_by_tag(paths: &[PathBuf], tag_keyword: &str) -> Result<usize
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn parses_numeric_tags_and_groups() {
+        assert_eq!(parse_profile_tag("(0008,1030)"), Some(Tag(0x0008, 0x1030)));
+        assert_eq!(parse_profile_tag("(0011,0010)"), Some(Tag(0x0011, 0x0010)));
+        assert_eq!(parse_profile_tag("nonsense"), None);
+        assert_eq!(parse_profile_group("6000-60FF"), Some((0x6000, 0x60FF)));
+        assert_eq!(parse_profile_group("0070"), Some((0x0070, 0x0070)));
+    }
+
+    #[test]
+    fn builds_the_anonymize_profile_from_the_api_payload() {
+        let json = r#"{
+            "clear_numeric": ["(0010,0030)"],
+            "keep_numeric": ["(0008,1030)", "(0008,103E)"],
+            "remove_numeric": ["(0042,0011)"],
+            "remove_groups": ["6000-60FF", "0070"],
+            "text_vrs": ["LO", "SH", "PN"],
+            "remove_private_tags": true
+        }"#;
+        let parsed: SiteDicomProfile = serde_json::from_str(json).expect("parse");
+        let profile = parsed.into_anonymize_profile();
+
+        assert_eq!(profile.clear_tags, vec![Tag(0x0010, 0x0030)]);
+        assert!(profile.keep_tags.contains(&Tag(0x0008, 0x1030)));
+        assert!(profile.keep_tags.contains(&Tag(0x0010, 0x0010)));
+        assert_eq!(profile.remove_tags, vec![Tag(0x0042, 0x0011)]);
+        assert_eq!(profile.remove_groups, vec![(0x6000, 0x60FF), (0x0070, 0x0070)]);
+        assert_eq!(
+            profile.text_vrs,
+            vec![
+                dicom_core::header::VR::LO,
+                dicom_core::header::VR::SH,
+                dicom_core::header::VR::PN
+            ]
+        );
+    }
+}

@@ -39,9 +39,11 @@ fn device_and_software_tags_are_anonymised() {
     let out_bytes = std::fs::read(&res).expect("read out");
     let out_text = String::from_utf8_lossy(&out_bytes).to_lowercase();
 
-    // ManufacturerModelName (0008,1090) is preserved (but sanitized), the others should be removed
+    // The platform profile retains Manufacturer and ManufacturerModelName;
+    // device serial numbers and software versions are still removed.
+    assert!(out_text.contains("acme medical"), "expected manufacturer to be retained");
     assert!(out_text.contains("model x"), "expected model x to be preserved/sanitized");
-    for s in &["acme medical", "sn-12345", "v1.2.3"] {
+    for s in &["sn-12345", "v1.2.3"] {
         assert!(!out_text.contains(s), "found '{}' in anonymised output", s);
     }
 }

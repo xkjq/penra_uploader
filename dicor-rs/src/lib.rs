@@ -584,6 +584,66 @@ fn process_file<D: dicom_core::DataDictionary + Clone>(
     }
 }
 
+/// De-identification policy applied by the anonymiser.
+///
+/// The platform exposes the site profile at `GET /api/atlas/dicom_profile`
+/// (including numeric tag lists); the uploader fetches it so the upload-time
+/// pass and the site's compliance check cannot drift. Without a fetched profile
+/// the compiled default below is used (offline installs).
+#[derive(Clone, Debug)]
+pub struct AnonymizeProfile {
+    /// Blank the value (sequences are removed).
+    pub clear_tags: Vec<Tag>,
+    /// Delete the element outright.
+    pub remove_tags: Vec<Tag>,
+    /// Retain these text values verbatim (descriptions, coded terminology, …).
+    pub keep_tags: Vec<Tag>,
+    /// Text VRs that are blanked when not in `keep_tags`.
+    pub text_vrs: Vec<VR>,
+    /// Inclusive tag-group ranges to remove (`60xx` overlays, `0070` annotations).
+    pub remove_groups: Vec<(u16, u16)>,
+    /// Remove private tags unless the caller asked to preserve them.
+    pub remove_private: bool,
+}
+
+impl Default for AnonymizeProfile {
+    fn default() -> Self {
+        Self {
+            clear_tags: vec![
+                Tag(0x0008,0x0080), Tag(0x0008,0x0081),
+                Tag(0x0010,0x1040), Tag(0x0010,0x4000), Tag(0x0008,0x0092), Tag(0x0008,0x0090),
+                Tag(0x0008,0x1050), Tag(0x0008,0x1070), Tag(0x0008,0x0050), Tag(0x0020,0x0010),
+                Tag(0x0018,0x1000), Tag(0x0018,0x1004), Tag(0x0010,0x2000),
+                Tag(0x0010,0x1000), Tag(0x0010,0x1002), Tag(0x0008,0x0094),
+                Tag(0x0008,0x1010), Tag(0x0008,0x1040), Tag(0x0008,0x1048), Tag(0x0008,0x1060),
+                Tag(0x0008,0x1080), Tag(0x0008,0x1080), Tag(0x0008,0x2111), Tag(0x0010,0x1001),
+                Tag(0x0010,0x0040), Tag(0x0010,0x1010), Tag(0x0010,0x1020), Tag(0x0010,0x1030),
+                Tag(0x0010,0x1090), Tag(0x0010,0x2160), Tag(0x0010,0x2180), Tag(0x0010,0x21B0),
+                Tag(0x0020,0x4000), Tag(0x0040,0x0275),
+                Tag(0x0008,0x0082), // InstitutionCodeSequence
+                Tag(0x0010,0x0024), // IssuerOfPatientIDQualifiersSequence
+                Tag(0x0040,0x0031), // LocalEntity
+                Tag(0x0040,0x0032), // UniversalEntityID
+                Tag(0x0040,0x0033), // UniversalEntityIDType
+                Tag(0x0040,0xA730),
+            ],
+            remove_tags: vec![
+                Tag(0x0042,0x0011), // EncapsulatedDocument
+                Tag(0x0088,0x0200), // IconImageSequence
+            ],
+            keep_tags: vec![
+                Tag(0x0010,0x0010), Tag(0x0010,0x0020),
+                Tag(0x0008,0x1030), Tag(0x0008,0x103E), Tag(0x0008,0x1090), Tag(0x0018,0x1030),
+                Tag(0x0008,0x0070), // Manufacturer
+                Tag(0x0008,0x0100), Tag(0x0008,0x0102), Tag(0x0008,0x0103), Tag(0x0008,0x0104),
+            ],
+            text_vrs: vec![VR::UT, VR::LT, VR::ST, VR::SH, VR::LO, VR::PN, VR::UC, VR::UR, VR::AE],
+            remove_groups: vec![(0x6000, 0x60FF), (0x0070, 0x0070)],
+            remove_private: true,
+        }
+    }
+}
+
 pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, preserve_private: bool, permit_burned_in: bool, seed: Option<&str>) -> Result<PathBuf, String> {
     let obj: DefaultDicomObject = open_file(input).map_err(|e| format!("Failed to open DICOM: {}", e))?;
     let (out_path, _obj) = anonymize_object(obj, input, output_dir, remove_original, preserve_private, permit_burned_in, seed)?;
@@ -596,6 +656,29 @@ pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, pr
 /// compressed to JPEG-LS), so callers can read the resulting metadata without
 /// re-opening the file.
 pub fn anonymize_object(
+    obj: DefaultDicomObject,
+    input: &Path,
+    output_dir: &Path,
+    remove_original: bool,
+    preserve_private: bool,
+    permit_burned_in: bool,
+    seed: Option<&str>,
+) -> Result<(PathBuf, DefaultDicomObject), String> {
+    let profile = AnonymizeProfile::default();
+    anonymize_object_with_profile(
+        obj,
+        input,
+        output_dir,
+        remove_original,
+        preserve_private,
+        permit_burned_in,
+        seed,
+        &profile,
+    )
+}
+
+/// Anonymize with an explicit platform profile (see [`AnonymizeProfile`]).
+pub fn anonymize_object_with_profile(
     mut obj: DefaultDicomObject,
     input: &Path,
     output_dir: &Path,
@@ -603,6 +686,7 @@ pub fn anonymize_object(
     preserve_private: bool,
     permit_burned_in: bool,
     seed: Option<&str>,
+    profile: &AnonymizeProfile,
 ) -> Result<(PathBuf, DefaultDicomObject), String> {
     // Detect Burned In Annotation (0028,0301) and fail unless permitted.
     if let Ok(elem) = obj.element(Tag(0x0028, 0x0301)) {
@@ -642,8 +726,10 @@ pub fn anonymize_object(
         }
     }
     if !preserve_private {
-        for t in &private_tags {
-            let _ = obj.remove_element(*t);
+        if profile.remove_private {
+            for t in &private_tags {
+                let _ = obj.remove_element(*t);
+            }
         }
     } else {
         for t in &private_tags {
@@ -664,27 +750,13 @@ pub fn anonymize_object(
     let _ = obj.put_str(Tag(0x0010, 0x0010), VR::PN, &pn);
     let _ = obj.put_str(Tag(0x0010, 0x0020), VR::LO, &pid);
 
-    let clear_tags = vec![
-        Tag(0x0008,0x0080), Tag(0x0008,0x0081),
-        Tag(0x0010,0x1040), Tag(0x0010,0x4000), Tag(0x0008,0x0092), Tag(0x0008,0x0090),
-        Tag(0x0008,0x1050), Tag(0x0008,0x1070), Tag(0x0008,0x0050), Tag(0x0020,0x0010),
-        Tag(0x0018,0x1000), Tag(0x0018,0x1004), Tag(0x0010,0x2000),
-        Tag(0x0010,0x1000), Tag(0x0010,0x1002), Tag(0x0008,0x0094),
-        Tag(0x0008,0x1010), Tag(0x0008,0x1040), Tag(0x0008,0x1048), Tag(0x0008,0x1060),
-        Tag(0x0008,0x1080), Tag(0x0008,0x1080), Tag(0x0008,0x2111), Tag(0x0010,0x1001),
-        Tag(0x0010,0x0040), Tag(0x0010,0x1010), Tag(0x0010,0x1020), Tag(0x0010,0x1030),
-        Tag(0x0010,0x1090), Tag(0x0010,0x2160), Tag(0x0010,0x2180), Tag(0x0010,0x21B0),
-        Tag(0x0020,0x4000), Tag(0x0040,0x0275),
-        // Organisation Data Service (ODS) / institution identifiers. These can
-        // identify the issuing trust/GP practice even when InstitutionName is
-        // removed, so clear them explicitly (including nested sequence items).
-        Tag(0x0008,0x0082), // InstitutionCodeSequence
-        Tag(0x0010,0x0024), // IssuerOfPatientIDQualifiersSequence
-        Tag(0x0040,0x0031), // LocalEntity
-        Tag(0x0040,0x0032), // UniversalEntityID
-        Tag(0x0040,0x0033), // UniversalEntityIDType
-        Tag(0x0040,0xA730),
-    ];
+    let clear_tags = profile.clear_tags.clone();
+    let keep_tags = profile.keep_tags.clone();
+    let text_vrs = if profile.text_vrs.is_empty() {
+        AnonymizeProfile::default().text_vrs
+    } else {
+        profile.text_vrs.clone()
+    };
 
     let defaults: Vec<(Tag, VR, String)> = vec![(Tag(0x0008,0x1010), VR::SH, "ANON".to_string())];
 
@@ -715,11 +787,7 @@ pub fn anonymize_object(
 
     let date_tags = vec![Tag(0x0008,0x0020), Tag(0x0008,0x0021), Tag(0x0008,0x0022), Tag(0x0008,0x0023), Tag(0x0010,0x0030), Tag(0x0008,0x002A)];
 
-    let text_vrs = vec![VR::UT, VR::LT, VR::SH, VR::LO, VR::PN];
-    let mut vr_whitelist = vec![Tag(0x0010,0x0010), Tag(0x0010,0x0020)];
-    // Preserve these descriptive fields but sanitize their content for PHI
-    let preserve_text_tags = vec![Tag(0x0008,0x1030), Tag(0x0008,0x103E), Tag(0x0008,0x1090), Tag(0x0018,0x1030)];
-    for t in &preserve_text_tags { vr_whitelist.push(*t); }
+    let vr_whitelist = keep_tags;
 
     for tag in &clear_tags {
         if let Ok(elem) = obj.element(*tag) {
@@ -732,17 +800,24 @@ pub fn anonymize_object(
         }
     }
 
-    // Remove any overlay groups (60xx) and all annotation/presentation state groups (0x0070)
-    // to ensure burned-in overlay/annotation features are removed by default.
+    // Remove blocked groups (overlays 60xx, annotations 0070, …) and explicit
+    // remove tags from the profile.
     let mut dyn_remove: Vec<Tag> = Vec::new();
     for el in obj.iter() {
-        let t = el.tag();
-        if (t.0 >= 0x6000 && t.0 <= 0x60FF) || t.0 == 0x0070 {
-            dyn_remove.push(t);
+        let group = el.tag().0;
+        if profile
+            .remove_groups
+            .iter()
+            .any(|(low, high)| group >= *low && group <= *high)
+        {
+            dyn_remove.push(el.tag());
         }
     }
     for t in dyn_remove {
         let _ = obj.remove_element(t);
+    }
+    for t in &profile.remove_tags {
+        let _ = obj.remove_element(*t);
     }
 
     for (tag, vr, val) in &defaults {
