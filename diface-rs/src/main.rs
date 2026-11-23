@@ -27,10 +27,18 @@ OPTIONS:
     --atlas <FILE>                  Use an atlas brain mask file (.dfatlas)
     --seg-region <face|deflesh>     Segmentation region: face cut or deflesh
                                     (remove external soft tissue/bone)
+    --include-orbits                Segmentation (face): also remove the orbital
+                                    contents (eyes) in front of the brain
+    --include-ears                  Segmentation (face): also remove the ears
+                                    (external tissue at ear height)
+    --include-zygoma                Segmentation (face): also remove the zygoma
+                                    (cheekbone/arch) and the lateral skull base
+    --no-vertex-strip               Segmentation (face): keep the skull cap above
+                                    the ear level (default: strip it to the vertex)
     --brain-protect <MM>            Segmentation: safety band kept around the
                                     intracranial core (default: 2)
     --deflesh-smooth <MM>           Deflesh: feather the removal boundary by MM
-                                    (0 = hard cut; default: 3)
+                                    (0 = hard cut; default: 0 for anonymisation)
     --deflesh-posterior <MM|all>    Deflesh: keep external tissue posterior of
                                     brain centre + MM (0 = keep neck/back; all
                                     = remove all external tissue)
@@ -84,9 +92,13 @@ fn run() -> Result<(), String> {
     let mut backend_choice = "geometric".to_string();
     let mut atlas_path: Option<std::path::PathBuf> = None;
     let mut seg_region = diface_rs::MaskRegion::Face;
+    let mut include_orbits = false;
+    let mut include_ears = false;
+    let mut include_zygoma = false;
+    let mut vertex_strip = true;
     let mut deflesh_posterior_mm = 0.0f64;
     let mut brain_protect_mm = 2.0f64;
-    let mut deflesh_smooth_mm = 3.0f64;
+    let mut deflesh_smooth_mm = 0.0f64;
 
     let mut i = 0;
     while i < args.len() {
@@ -153,6 +165,10 @@ fn run() -> Result<(), String> {
                     other => return Err(format!("unknown --seg-region '{other}'")),
                 };
             }
+            "--include-orbits" => include_orbits = true,
+            "--include-ears" => include_ears = true,
+            "--include-zygoma" => include_zygoma = true,
+            "--no-vertex-strip" => vertex_strip = false,
             "--brain-protect" => {
                 let v = take_value(&mut i)?;
                 brain_protect_mm = v
@@ -167,12 +183,13 @@ fn run() -> Result<(), String> {
             }
             "--deflesh-posterior" => {
                 let v = take_value(&mut i)?;
-                deflesh_posterior_mm = if v.eq_ignore_ascii_case("all") || v.eq_ignore_ascii_case("inf") {
-                    f64::INFINITY
-                } else {
-                    v.parse::<f64>()
-                        .map_err(|_| format!("invalid --deflesh-posterior '{v}'"))?
-                };
+                deflesh_posterior_mm =
+                    if v.eq_ignore_ascii_case("all") || v.eq_ignore_ascii_case("inf") {
+                        f64::INFINITY
+                    } else {
+                        v.parse::<f64>()
+                            .map_err(|_| format!("invalid --deflesh-posterior '{v}'"))?
+                    };
             }
             "--threshold" => {
                 let v = take_value(&mut i)?;
@@ -281,6 +298,10 @@ fn run() -> Result<(), String> {
     } else if backend_choice == "segmentation" {
         BackendKind::Segmentation(diface_rs::SegBackendParams {
             region: seg_region,
+            include_orbits,
+            include_ears,
+            include_zygoma,
+            vertex_strip,
             brain_protect_mm,
             deflesh_posterior_mm,
             deflesh_smooth_mm,

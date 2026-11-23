@@ -77,12 +77,38 @@ impl Volume {
         p
     }
 
+    /// Coefficients of the linear form giving the patient coordinate along
+    /// `axis`: `world(x, y, z)[axis] == base + step[0] * x + step[1] * y +
+    /// step[2] * z`.
+    ///
+    /// Hot per-voxel loops use this to hoist the per-slice and per-row terms
+    /// instead of building a full world vector for every voxel.
+    #[inline]
+    pub fn world_axis_linear(&self, axis: usize) -> (f64, [f64; 3]) {
+        (
+            self.origin[axis],
+            [
+                self.dir[0][axis] * self.spacing[0],
+                self.dir[1][axis] * self.spacing[1],
+                self.dir[2][axis] * self.spacing[2],
+            ],
+        )
+    }
+
     /// Number of voxels whose rescaled value exceeds `threshold`.
     pub fn count_above(&self, threshold: f32) -> usize {
-        (0..self.nz())
-            .flat_map(|z| (0..self.ny()).flat_map(move |y| (0..self.nx()).map(move |x| (x, y, z))))
-            .filter(|&(x, y, z)| self.value(x, y, z) > threshold)
-            .count()
+        let nxy = self.nx() * self.ny();
+        let nz = self.nz();
+        let mut count = 0usize;
+        for z in 0..nz {
+            let (slope, intercept) = self.rescale[z];
+            let slice = &self.data[z * nxy..(z + 1) * nxy];
+            count += slice
+                .iter()
+                .filter(|&&raw| raw * slope + intercept > threshold)
+                .count();
+        }
+        count
     }
 
     /// Statistics over raw data: `(min, max)`.
@@ -192,5 +218,75 @@ impl Mask {
         let start = z * self.nx() * self.ny();
         let end = start + self.nx() * self.ny();
         self.remove[start..end].iter().filter(|&&v| v != 0).count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_volume() -> Volume {
+        let dims = [7usize, 5, 4];
+        let [nx, ny, nz] = dims;
+        let angle = 0.3f64;
+        let dir = [
+            [1.0, 0.0, 0.0],
+            [0.0, angle.cos(), angle.sin()],
+            [0.0, -angle.sin(), angle.cos()],
+        ];
+        Volume {
+            data: (0..nx * ny * nz).map(|i| (i as f32) * 7.0 - 90.0).collect(),
+            dims,
+            spacing: [0.7, 1.3, 2.5],
+            origin: [11.0, -4.0, 3.0],
+            dir,
+            rescale: (0..nz)
+                .map(|z| (1.0 + z as f32 * 0.1, z as f32 * 5.0))
+                .collect(),
+            modality: "CT".to_string(),
+        }
+    }
+
+    #[test]
+    fn count_above_matches_per_voxel_loop() {
+        let volume = sample_volume();
+        for threshold in [-200.0f32, -50.0, 0.0, 40.0, 400.0] {
+            let mut naive = 0usize;
+            for z in 0..volume.nz() {
+                for y in 0..volume.ny() {
+                    for x in 0..volume.nx() {
+                        if volume.value(x, y, z) > threshold {
+                            naive += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                volume.count_above(threshold),
+                naive,
+                "threshold {threshold}"
+            );
+        }
+    }
+
+    #[test]
+    fn world_axis_linear_matches_world() {
+        let volume = sample_volume();
+        for axis in 0..3 {
+            let (base, step) = volume.world_axis_linear(axis);
+            for z in 0..volume.nz() {
+                for y in 0..volume.ny() {
+                    for x in 0..volume.nx() {
+                        let expected = volume.world(x, y, z)[axis];
+                        let got =
+                            base + step[0] * x as f64 + step[1] * y as f64 + step[2] * z as f64;
+                        assert!(
+                            (got - expected).abs() < 1e-9,
+                            "axis {axis} at ({x},{y},{z}): {got} vs {expected}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

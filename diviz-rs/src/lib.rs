@@ -42,6 +42,11 @@ const CT_WL_PRESETS: &[(&str, f32, f32)] = &[
 /// whole mask + overlay would be rebuilt on each intermediate value.
 const DEFACE_PREVIEW_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
 
+/// Upper bound on how long a deferred preview update waits for the pointer to be
+/// released. Guards against a missed button-release event (e.g. a drag that ends
+/// outside the window) leaving the overlay stale.
+const DEFACE_PREVIEW_MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(1200);
+
 /// Wheel input (in egui points) required before advancing one slice. `smooth_scroll_delta`
 /// delivers a decaying tail after each physical notch, so stepping directly on every
 /// non-zero delta scrolls several slices per notch; accumulating to this threshold and
@@ -1524,6 +1529,39 @@ enum DefaceBackendSel {
     Segmentation,
 }
 
+/// Owned inputs for one defacing run (moved to the worker thread).
+struct DefaceTask {
+    base_uid: String,
+    defaced_uid: String,
+    geom: DefaceGeometry,
+    /// Source images cloned in `geom.order` sequence.
+    images: Vec<LoadedImage>,
+    backend: DefaceBackendSel,
+    params: diface_rs::SegBackendParams,
+    atlas: diface_rs::Atlas,
+    geometric: GeometricParams,
+    edits: BrushEdits,
+    /// Cached segmentation, when available.
+    seg: Option<diface_rs::Segmentation>,
+    seg_key: String,
+}
+
+/// Result of a defacing run, ready to be installed on the UI thread.
+struct DefaceComputed {
+    base_uid: String,
+    defaced_uid: String,
+    images: Vec<LoadedImage>,
+    removed: usize,
+    seg: Option<diface_rs::Segmentation>,
+    seg_key: String,
+}
+
+/// A running defacing computation.
+struct DefaceJob {
+    rx: mpsc::Receiver<Result<DefaceComputed, String>>,
+    started: std::time::Instant,
+}
+
 struct DicomViewApp {
     /// A queued load: the paths plus whether the open should be recorded in the
     /// recent-folders history. Programmatic loads (CLI arguments, `diface --view`,
@@ -1580,6 +1618,14 @@ struct DicomViewApp {
     deface_seg_region: diface_rs::MaskRegion,
     /// Segmentation: what the anterior cut is referenced to (brain or skull).
     deface_cut_reference: diface_rs::CutReference,
+    /// Segmentation: also remove the orbital contents (eyes) with the face cut.
+    deface_include_orbits: bool,
+    /// Segmentation: also remove the ears with the face cut.
+    deface_include_ears: bool,
+    /// Segmentation: also remove the zygoma and the lateral skull base.
+    deface_include_zygoma: bool,
+    /// Segmentation: strip the skull cap above the ears up to the vertex.
+    deface_vertex_strip: bool,
     /// Segmentation: safety band (mm) kept around the intracranial core.
     deface_brain_protect_mm: f64,
     /// Deflesh: keep external tissue posterior of brain centre + this (mm).
@@ -1606,6 +1652,8 @@ struct DicomViewApp {
     /// changing a defacing setting does not re-decode and re-convert every
     /// voxel on each drag frame. Keyed by the base series UID.
     deface_volume_cache: Option<(String, DefaceGeometry)>,
+    /// Background defacing computation (None when idle).
+    deface_job: Option<DefaceJob>,
     /// Cached segmentation for the active base series, keyed by the series UID.
     /// Shared by the segmentation mask and the Areas overlay so a slider drag
     /// segments once instead of on every frame.
@@ -1615,6 +1663,10 @@ struct DicomViewApp {
     deface_preview_dirty: bool,
     /// When the preview first became dirty, for the debounce timer.
     deface_preview_dirty_since: Option<std::time::Instant>,
+    /// The pending rebuild came from a brush stroke, which wants live feedback
+    /// even while the button is held. Control drags leave this `false` so the
+    /// rebuild waits for the release.
+    deface_preview_allow_drag: bool,
     /// Viewports whose inline window/level editor is open (toggled by
     /// double-clicking the W/L overlay).
     wl_editor_open: Vec<bool>,
@@ -1666,13 +1718,17 @@ impl DicomViewApp {
             loading: None,
             deface_message: None,
             deface_params: GeometricParams::default(),
-            deface_backend: DefaceBackendSel::Geometric,
+            deface_backend: DefaceBackendSel::Segmentation,
             deface_atlas: diface_rs::Atlas::synthetic([128, 160, 140], 1.0),
             deface_panel_open: false,
             deface_show_segmentation: false,
             deface_preview_on: true,
             deface_seg_region: diface_rs::MaskRegion::Face,
             deface_cut_reference: diface_rs::CutReference::BrainFront,
+            deface_include_orbits: false,
+            deface_include_ears: false,
+            deface_include_zygoma: false,
+            deface_vertex_strip: true,
             deface_brain_protect_mm: 2.0,
             deface_deflesh_posterior_mm: 0.0,
             deface_deflesh_smooth_mm: 3.0,
@@ -1683,9 +1739,11 @@ impl DicomViewApp {
             deface_brush_radius_mm: 12.0,
             deface_brush_slice_radius: 1,
             deface_volume_cache: None,
+            deface_job: None,
             deface_seg_cache: None,
             deface_preview_dirty: false,
             deface_preview_dirty_since: None,
+            deface_preview_allow_drag: false,
             wl_editor_open: Vec::new(),
             last_navs: Vec::new(),
         }
@@ -1702,6 +1760,8 @@ impl DicomViewApp {
         self.deface_volume_cache = None;
         self.deface_seg_cache = None;
         self.deface_preview = None;
+        // Abandon any in-flight defacing job: its inputs belong to the old images.
+        self.deface_job = None;
         // reset to a single default viewport
         self.viewports = vec![ViewportState::default()];
         self.active_viewport = 0;
@@ -2254,6 +2314,10 @@ impl DicomViewApp {
         diface_rs::SegBackendParams {
             region: self.deface_seg_region,
             cut_reference: self.deface_cut_reference,
+            include_orbits: self.deface_include_orbits,
+            include_ears: self.deface_include_ears,
+            include_zygoma: self.deface_include_zygoma,
+            vertex_strip: self.deface_vertex_strip,
             brain_margin_mm: margin,
             brain_protect_mm: self.deface_brain_protect_mm,
             deflesh_posterior_mm: self.deface_deflesh_posterior_mm,
@@ -2317,6 +2381,7 @@ impl DicomViewApp {
         // An explicit recompute supersedes any pending debounced one.
         self.deface_preview_dirty = false;
         self.deface_preview_dirty_since = None;
+        self.deface_preview_allow_drag = false;
         self.deface_preview_on = !self.deface_preview_on;
         if self.deface_preview_on {
             self.refresh_deface_preview(ctx);
@@ -2461,6 +2526,9 @@ impl DicomViewApp {
         }
         self.deface_preview_dirty = true;
         self.deface_preview_dirty_since = Some(std::time::Instant::now());
+        // Painting wants to show the stroke as it is drawn; a control drag must
+        // wait for the release instead.
+        self.deface_preview_allow_drag = true;
         if !self.deface_preview_on {
             self.deface_preview_on = true;
         }
@@ -2671,12 +2739,34 @@ impl DicomViewApp {
                     "Previewing {removed} voxels to remove (red overlay)"
                 ));
                 self.redraw_all_viewports(ctx);
+                // The refresh can run after this frame's draw pass (deferred
+                // updates), so present the new texture in a fresh frame.
+                ctx.request_repaint();
             }
             Err(e) => {
                 self.deface_preview = None;
                 self.deface_message = Some(e);
+                ctx.request_repaint();
             }
         }
+    }
+
+    /// Ask for the live preview to be rebuilt once the user stops adjusting a
+    /// control.
+    ///
+    /// Rebuilding the mask takes a few hundred milliseconds on a full series, so
+    /// recomputing on every slider tick would make the slider impossible to
+    /// adjust. Instead the change is only marked dirty here; the pass at the end
+    /// of the frame ([`Self::flush_pending_deface_preview`]) rebuilds the preview
+    /// after the drag settles.
+    fn request_deface_preview(&mut self, ctx: &egui::Context) {
+        if self.deface_preview.is_none() {
+            return;
+        }
+        self.deface_preview_dirty = true;
+        self.deface_preview_dirty_since = Some(std::time::Instant::now());
+        self.deface_preview_allow_drag = false;
+        ctx.request_repaint_after(DEFACE_PREVIEW_DEBOUNCE);
     }
 
     /// Recompute the preview if a parameter change has been idle for the debounce
@@ -2689,13 +2779,19 @@ impl DicomViewApp {
             self.deface_preview_dirty = false;
             return;
         };
-        if since.elapsed() < DEFACE_PREVIEW_DEBOUNCE {
-            // Still settling: keep the repaint scheduled.
+        let elapsed = since.elapsed();
+        let dragging = !self.deface_preview_allow_drag
+            && elapsed < DEFACE_PREVIEW_MAX_WAIT
+            && ctx.input(|i| i.pointer.any_down());
+        if elapsed < DEFACE_PREVIEW_DEBOUNCE || dragging || self.deface_job.is_some() {
+            // Still settling, still dragging, or a deface run is in flight: keep
+            // the repaint scheduled and rebuild once things settle.
             ctx.request_repaint_after(DEFACE_PREVIEW_DEBOUNCE);
             return;
         }
         self.deface_preview_dirty = false;
         self.deface_preview_dirty_since = None;
+        self.deface_preview_allow_drag = false;
         if self.deface_preview_on && self.deface_panel_open {
             self.refresh_deface_preview(ctx);
         }
@@ -2710,73 +2806,145 @@ impl DicomViewApp {
         self.active_viewport = saved;
     }
 
+    /// Deface the active stack in memory and show the result next to it.
+    ///
+    /// Synchronous variant, used by tests. The toolbar uses
+    /// `start_deface_active_series` to run the same work on a worker thread with a
+    /// progress indicator.
     fn deface_active_series(&mut self, ctx: &egui::Context) {
         self.deface_message = None;
-
-        let Some(group) = self.deface_base_group() else {
-            self.deface_message = Some("No active series to deface".to_string());
-            return;
-        };
-
-        let computed = self.deface_volume_for(&group).and_then(|geom| {
-            let mut mask = self.mask_for_geometry(&geom)?;
-            let edits = self.deface_edits.for_series(&group.uid);
-            Self::apply_manual_edits(&mut mask, edits);
-            Ok((geom, mask))
-        });
-        let (geom, mask) = match computed {
-            Ok(v) => v,
+        let task = match self.prepare_deface_task() {
+            Ok(t) => t,
             Err(e) => {
                 self.deface_message = Some(e);
                 return;
             }
         };
-        let order = geom.order.clone();
-
-        let fill = geom.volume.raw_min_max().0;
-        let removed = mask.count_removed();
-
-        let defaced_uid = format!("{}-DEFACED", group.uid);
-        let mut new_images: Vec<LoadedImage> = Vec::with_capacity(order.len());
-        for (z, &idx) in order.iter().enumerate() {
-            let Some(mut img) = self.images.get(idx).cloned() else {
-                continue;
-            };
-            let (width, height) = img.raw_image.dimensions();
-            if let RawImage::Gray16(g) = &mut img.raw_image {
-                for y in 0..height {
-                    let row = y * width;
-                    for x in 0..width {
-                        if row + x >= g.data.len() {
-                            continue;
-                        }
-                        // Apply the feathered weight so the smooth option is
-                        // visible in the in-viewer defaced copy, matching the
-                        // file writer (`orig + (fill - orig) * w`).
-                        let w = geom.removal_weight_native(x, y, z, &mask);
-                        if w > 0.0 {
-                            let orig = g.data[row + x];
-                            g.data[row + x] = orig + (fill - orig) * w;
-                        }
-                    }
-                }
-            }
-            img.series_uid = defaced_uid.clone();
-            img.series_label = format!("{} [defaced]", img.series_label);
-            img.filename = format!("defaced_{}", img.filename);
-            img.thumbnail = img
-                .default_wc_ww
-                .map(|(wc, ww)| make_thumbnail(&img.raw_image, 64, wc, ww));
-            new_images.push(img);
+        match compute_defaced(task) {
+            Ok(computed) => self.apply_defaced(computed, ctx),
+            Err(e) => self.deface_message = Some(e),
         }
-        if new_images.is_empty() {
-            self.deface_message = Some("Nothing to deface".to_string());
+    }
+
+    /// Start the defacing computation on a worker thread, opening the Align panel
+    /// so the settings are visible while it runs.
+    fn start_deface_active_series(&mut self, ctx: &egui::Context) {
+        if self.deface_job.is_some() {
+            self.deface_message = Some("Defacing is already running…".to_string());
             return;
         }
-        let defaced_count = new_images.len();
+        self.deface_message = None;
+        let task = match self.prepare_deface_task() {
+            Ok(t) => t,
+            Err(e) => {
+                self.deface_message = Some(e);
+                return;
+            }
+        };
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(compute_defaced(task));
+        });
+        self.deface_job = Some(DefaceJob {
+            rx,
+            started: std::time::Instant::now(),
+        });
+        ctx.request_repaint();
+    }
+
+    /// Gather owned inputs for the defacing worker.
+    fn prepare_deface_task(&mut self) -> Result<DefaceTask, String> {
+        let group = self
+            .deface_base_group()
+            .ok_or_else(|| "No active series to deface".to_string())?;
+        let geom = self.deface_volume_for(&group)?;
+        let params = self.seg_backend_params();
+        let seg_key = format!(
+            "{}x{}x{}:{}",
+            geom.volume.dims[0], geom.volume.dims[1], geom.volume.dims[2], geom.volume.modality
+        );
+        let seg = self
+            .deface_seg_cache
+            .as_ref()
+            .and_then(|(key, seg)| (key == &seg_key).then(|| seg.clone()));
+        let mut images = Vec::with_capacity(geom.order.len());
+        for &idx in &geom.order {
+            let img = self
+                .images
+                .get(idx)
+                .cloned()
+                .ok_or_else(|| "A source slice disappeared while defacing".to_string())?;
+            images.push(img);
+        }
+        let edits = self
+            .deface_edits
+            .for_series(&group.uid)
+            .cloned()
+            .unwrap_or_default();
+        Ok(DefaceTask {
+            base_uid: group.uid.clone(),
+            defaced_uid: format!("{}-DEFACED", group.uid),
+            geom,
+            images,
+            backend: self.deface_backend,
+            params,
+            atlas: self.deface_atlas.clone(),
+            geometric: self.deface_params.clone(),
+            edits,
+            seg,
+            seg_key,
+        })
+    }
+
+    /// Poll the worker; apply the result when it arrives.
+    fn poll_deface_job(&mut self, ctx: &egui::Context) {
+        let Some(job) = self.deface_job.take() else {
+            return;
+        };
+        match job.rx.try_recv() {
+            Ok(Ok(computed)) => self.apply_defaced(computed, ctx),
+            Ok(Err(e)) => self.deface_message = Some(e),
+            Err(mpsc::TryRecvError::Empty) => {
+                self.deface_job = Some(job);
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.deface_message = Some("Defacing worker stopped unexpectedly".to_string());
+            }
+        }
+    }
+
+    /// Modal progress indicator for the worker.
+    fn deface_loading_ui(&self, ctx: &egui::Context) {
+        let Some(job) = &self.deface_job else {
+            return;
+        };
+        egui::Window::new("Defacing…")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Computing the mask and defaced slices…");
+                });
+                ui.label(format!(
+                    "elapsed {:.1}s",
+                    job.started.elapsed().as_secs_f32()
+                ));
+            });
+    }
+
+    /// Register a completed defacing result and show the comparison viewports.
+    fn apply_defaced(&mut self, computed: DefaceComputed, ctx: &egui::Context) {
+        if let Some(seg) = computed.seg {
+            self.deface_seg_cache = Some((computed.seg_key, seg));
+        }
+        let defaced_count = computed.images.len();
+        let removed = computed.removed;
 
         // Register thumbnails for the series list.
-        for img in &new_images {
+        for img in &computed.images {
             if let Some((tw, th, rgba)) = img.thumbnail.as_ref() {
                 let color = egui::ColorImage::from_rgba_unmultiplied([*tw, *th], rgba);
                 let tex = ctx.load_texture(
@@ -2788,17 +2956,22 @@ impl DicomViewApp {
             }
         }
 
-        // Drop any previous defaced copy so repeated clicks refresh it rather
-        // than merging duplicate slices into one series.
-        let had_previous = self.series_groups.iter().any(|g| g.uid == defaced_uid);
+        // Drop any previous defaced copy so repeated runs refresh it rather than
+        // merging duplicate slices into one series.
+        let had_previous = self
+            .series_groups
+            .iter()
+            .any(|g| g.uid == computed.defaced_uid);
         if had_previous {
-            self.images.retain(|img| img.series_uid != defaced_uid);
+            self.images
+                .retain(|img| img.series_uid != computed.defaced_uid);
         }
 
-        self.images.extend(new_images);
+        self.images.extend(computed.images);
         self.rebuild_series_groups();
 
-        let orig_uid = group.uid.clone();
+        let orig_uid = computed.base_uid;
+        let defaced_uid = computed.defaced_uid;
         let orig_idx = self.series_groups.iter().position(|g| g.uid == orig_uid);
         let def_idx = self.series_groups.iter().position(|g| g.uid == defaced_uid);
         let (Some(orig_idx), Some(def_idx)) = (orig_idx, def_idx) else {
@@ -2887,9 +3060,7 @@ impl DicomViewApp {
                         .on_hover_text("In-house head/brain segmentation; cut in front of the brain");
                     if sel != self.deface_backend {
                         self.deface_backend = sel;
-                        if self.deface_preview.is_some() {
-                            self.refresh_deface_preview(ui.ctx());
-                        }
+                        self.request_deface_preview(ui.ctx());
                     }
                     if self.deface_backend == DefaceBackendSel::Segmentation {
                         ui.separator();
@@ -2908,29 +3079,40 @@ impl DicomViewApp {
                         );
                         if region != self.deface_seg_region {
                             self.deface_seg_region = region;
-                            if self.deface_preview.is_some() {
-                                self.refresh_deface_preview(ui.ctx());
-                            }
+                            self.request_deface_preview(ui.ctx());
                         }
                         if self.deface_seg_region == diface_rs::MaskRegion::ExternalSoftTissue {
                             ui.separator();
-                            ui.label("Keep back-of-head after");
-                            let mut back = self.deface_deflesh_posterior_mm;
-                            let slider = ui.add(
-                                egui::Slider::new(&mut back, 0.0..=80.0)
-                                    .suffix(" mm")
-                                    .clamping(egui::SliderClamping::Always),
-                            );
-                            if slider
+                            let mut all = self.deface_deflesh_posterior_mm.is_infinite();
+                            if ui
+                                .checkbox(&mut all, "Remove all external tissue")
                                 .on_hover_text(
-                                    "Keep external tissue posterior of brain centre + this \
-                                     distance (keeps the neck/back of the head)",
+                                    "Remove all scalp, face, ears, neck and facial bone, keeping \
+                                     only the intracranial contents and vault",
                                 )
                                 .changed()
                             {
-                                self.deface_deflesh_posterior_mm = back;
-                                if self.deface_preview.is_some() {
-                                    self.refresh_deface_preview(ui.ctx());
+                                self.deface_deflesh_posterior_mm =
+                                    if all { f64::INFINITY } else { 0.0 };
+                                self.request_deface_preview(ui.ctx());
+                            }
+                            if !all {
+                                ui.label("Keep back-of-head after");
+                                let mut back = self.deface_deflesh_posterior_mm;
+                                let slider = ui.add(
+                                    egui::Slider::new(&mut back, 0.0..=80.0)
+                                        .suffix(" mm")
+                                        .clamping(egui::SliderClamping::Always),
+                                );
+                                if slider
+                                    .on_hover_text(
+                                        "Keep external tissue posterior of brain centre + this \
+                                         distance (keeps the neck/back of the head)",
+                                    )
+                                    .changed()
+                                {
+                                    self.deface_deflesh_posterior_mm = back;
+                                    self.request_deface_preview(ui.ctx());
                                 }
                             }
                             ui.separator();
@@ -2945,14 +3127,13 @@ impl DicomViewApp {
                                 .on_hover_text(
                                     "Feather the removal boundary by this width: the defleshed \
                                      surface fades toward the fill instead of ending in a hard \
-                                     cut (0 = hard edge)",
+                                     cut. For anonymisation keep 0 (the feather retains some \
+                                     original signal)",
                                 )
                                 .changed()
                             {
                                 self.deface_deflesh_smooth_mm = smooth;
-                                if self.deface_preview.is_some() {
-                                    self.refresh_deface_preview(ui.ctx());
-                                }
+                                self.request_deface_preview(ui.ctx());
                             }
                         }
                         if self.deface_seg_region == diface_rs::MaskRegion::Face {
@@ -2976,9 +3157,64 @@ impl DicomViewApp {
                             );
                             if cut != self.deface_cut_reference {
                                 self.deface_cut_reference = cut;
-                                if self.deface_preview.is_some() {
-                                    self.refresh_deface_preview(ui.ctx());
-                                }
+                                self.request_deface_preview(ui.ctx());
+                            }
+                            ui.separator();
+                            let mut orbits = self.deface_include_orbits;
+                            if ui
+                                .checkbox(&mut orbits, "Include orbits")
+                                .on_hover_text(
+                                    "Also remove the orbital contents (the globes/eyes): the flat \
+                                     face cut can leave them behind it, so the orbits are removed \
+                                     as well. The region stays in front of the brain, so it cannot \
+                                     reach the inferior frontal lobes or temporal fossa, and brain \
+                                     and cranial-vault bone are never removed",
+                                )
+                                .changed()
+                            {
+                                self.deface_include_orbits = orbits;
+                                self.request_deface_preview(ui.ctx());
+                            }
+                            let mut ears = self.deface_include_ears;
+                            if ui
+                                .checkbox(&mut ears, "Include ears")
+                                .on_hover_text(
+                                    "Also remove the ears (and the temporal scalp at their \
+                                     level): a flat face cut leaves the auricles, which are a \
+                                     strong facial-recognition cue. The occiput/nape are kept, \
+                                     and brain and cranial-vault bone are never removed",
+                                )
+                                .changed()
+                            {
+                                self.deface_include_ears = ears;
+                                self.request_deface_preview(ui.ctx());
+                            }
+                            let mut zygoma = self.deface_include_zygoma;
+                            if ui
+                                .checkbox(&mut zygoma, "Remove zygoma")
+                                .on_hover_text(
+                                    "Also remove the cheekbone (zygoma) and zygomatic arch, \
+                                     extending into the lateral skull base behind them. The flat \
+                                     cut sits in front of the brain, so they sit behind it and \
+                                     survive; brain and CSF are never removed",
+                                )
+                                .changed()
+                            {
+                                self.deface_include_zygoma = zygoma;
+                                self.request_deface_preview(ui.ctx());
+                            }
+                            let mut vertex = self.deface_vertex_strip;
+                            if ui
+                                .checkbox(&mut vertex, "Strip vertex bone")
+                                .on_hover_text(
+                                    "Strip the skull cap and overlying scalp toward the vertex. The \
+                                     boundary follows the brain surface per column; brain/CSF are \
+                                     never removed",
+                                )
+                                .changed()
+                            {
+                                self.deface_vertex_strip = vertex;
+                                self.request_deface_preview(ui.ctx());
                             }
                         }
                         ui.separator();
@@ -2987,19 +3223,20 @@ impl DicomViewApp {
                         let slider = ui.add(
                             egui::Slider::new(&mut protect, 0.0..=20.0)
                                 .suffix(" mm")
+                                .step_by(0.5)
+                                .fixed_decimals(1)
                                 .clamping(egui::SliderClamping::Always),
                         );
                         if slider
                             .on_hover_text(
                                 "Hard band kept around the brain/vault; larger is safer and \
-                                 removes slightly less face",
+                                 removes slightly less face. The red preview updates when you \
+                                 release the slider",
                             )
                             .changed()
                         {
                             self.deface_brain_protect_mm = protect;
-                            if self.deface_preview.is_some() {
-                                self.refresh_deface_preview(ui.ctx());
-                            }
+                            self.request_deface_preview(ui.ctx());
                         }
                     }
                     // Atlas file loading is only relevant to the atlas backend.
@@ -3021,9 +3258,7 @@ impl DicomViewApp {
                                         self.deface_atlas = a;
                                         self.deface_message =
                                             Some(format!("Loaded atlas {}", path.display()));
-                                        if self.deface_preview.is_some() {
-                                            self.refresh_deface_preview(ui.ctx());
-                                        }
+                                        self.request_deface_preview(ui.ctx());
                                     }
                                     Err(e) => {
                                         self.deface_message = Some(format!("Atlas load failed: {e}"))
@@ -3060,9 +3295,7 @@ impl DicomViewApp {
                             });
                         if chosen != self.deface_params.algorithm {
                             self.deface_params.algorithm = chosen;
-                            if self.deface_preview.is_some() {
-                                self.refresh_deface_preview(ui.ctx());
-                            }
+                            self.request_deface_preview(ui.ctx());
                         }
                         ui.label(egui::RichText::new(chosen.description()).small().weak());
                     });
@@ -3089,9 +3322,7 @@ impl DicomViewApp {
                         if let Some(preset) = apply {
                             // Preserve manual orientation (yaw/axis override).
                             self.deface_params.apply_preset(preset);
-                            if self.deface_preview.is_some() {
-                                self.refresh_deface_preview(ui.ctx());
-                            }
+                            self.request_deface_preview(ui.ctx());
                         }
                     });
                 }
@@ -3181,14 +3412,17 @@ impl DicomViewApp {
                         .clicked();
                     if toggle {
                         self.toggle_deface_preview(ui.ctx());
-                    } else if changed && previewing {
+                    } else if changed {
                         // Coalesce live updates: mark dirty and recompute once the
                         // slider/drag settles, instead of on every intermediate
-                        // frame. `refresh_pending_deface_preview` (called at the
-                        // end of `update`) does the actual work.
-                        self.deface_preview_dirty = true;
-                        self.deface_preview_dirty_since = Some(std::time::Instant::now());
-                        ui.ctx().request_repaint_after(DEFACE_PREVIEW_DEBOUNCE);
+                        // frame. `flush_pending_deface_preview` (called at the top
+                        // of the frame) does the actual work.
+                        self.request_deface_preview(ui.ctx());
+                    }
+
+                    if self.deface_preview_dirty {
+                        ui.add(egui::Spinner::new().size(12.0))
+                            .on_hover_text("Updating the preview…");
                     }
 
                     if ui
@@ -3207,12 +3441,14 @@ impl DicomViewApp {
                     if ui.button("↺ Auto").on_hover_text("Reset defacing settings to automatic").clicked() {
                         self.deface_params = GeometricParams::default();
                         self.deface_cut_reference = diface_rs::CutReference::BrainFront;
+                        self.deface_include_orbits = false;
+                        self.deface_include_ears = false;
+                        self.deface_include_zygoma = false;
+                        self.deface_vertex_strip = true;
                         self.deface_brain_protect_mm = 2.0;
                         self.deface_deflesh_posterior_mm = 0.0;
                         self.deface_deflesh_smooth_mm = 3.0;
-                        if self.deface_preview.is_some() {
-                            self.refresh_deface_preview(ui.ctx());
-                        }
+                        self.request_deface_preview(ui.ctx());
                     }
                     if ui
                         .button("🧭 Reset view")
@@ -3283,9 +3519,7 @@ impl DicomViewApp {
                             .clicked()
                         {
                             self.deface_edits.per_series.clear();
-                            if self.deface_preview.is_some() {
-                                self.refresh_deface_preview(ui.ctx());
-                            }
+                            self.request_deface_preview(ui.ctx());
                         }
                         ui.label(
                             egui::RichText::new(format!("{count} painted"))
@@ -3605,11 +3839,11 @@ impl DicomViewApp {
             app.series_selector_ui(ui, idx, series_width);
         });
 
-        // ── Middle-left: fit / zoom / rotate (own position) ───────────────
+        // ── Top-left, under the sync controls: fit / zoom / rotate ────────
         let fit_width = 250.0_f32;
         let fit_pos = egui::pos2(
             cell_rect.left() + margin,
-            (cell_rect.center().y - row_h * 1.5).max(cell_rect.top() + 3.0 * row_h),
+            cell_rect.top() + margin + row_h + 12.0,
         );
         self.viewport_area(ui, ("vp_fit", idx), fit_pos, fit_width, |app, ui| {
             app.fit_zoom_rotate_ui(ui, idx);
@@ -4146,6 +4380,88 @@ impl DicomViewApp {
     }
 }
 
+/// Run a defacing job: compute the mask, apply manual edits, and produce the
+/// blanked copies. This is the part that runs on the worker thread.
+fn compute_defaced(task: DefaceTask) -> Result<DefaceComputed, String> {
+    let DefaceTask {
+        base_uid,
+        defaced_uid,
+        geom,
+        images,
+        backend,
+        params,
+        atlas,
+        geometric,
+        edits,
+        seg,
+        seg_key,
+    } = task;
+
+    let mut seg_out = None;
+    let mut mask = match backend {
+        DefaceBackendSel::Segmentation => {
+            let seg = match seg {
+                Some(s) => s,
+                None => diface_rs::segment(&geom.volume, &diface_rs::SegParams::default())?,
+            };
+            let mask = diface_rs::SegmentationBackend::new(params)
+                .compute_mask_from_segmentation(&geom.volume, &seg)?;
+            seg_out = Some(seg);
+            mask
+        }
+        DefaceBackendSel::Atlas => {
+            diface_rs::AtlasBackend::new(atlas, diface_rs::AtlasParams::default())
+                .compute_mask(&geom.volume)?
+        }
+        DefaceBackendSel::Geometric => {
+            GeometricBackend::new(geometric).compute_mask(&geom.volume)?
+        }
+    };
+    DicomViewApp::apply_manual_edits(&mut mask, Some(&edits));
+
+    let fill = geom.volume.raw_min_max().0;
+    let removed = mask.count_removed();
+    let mut new_images: Vec<LoadedImage> = Vec::with_capacity(images.len());
+    for (z, mut img) in images.into_iter().enumerate() {
+        let (width, height) = img.raw_image.dimensions();
+        if let RawImage::Gray16(g) = &mut img.raw_image {
+            for y in 0..height {
+                let row = y * width;
+                for x in 0..width {
+                    if row + x >= g.data.len() {
+                        continue;
+                    }
+                    // Apply the feathered weight so the smooth option is visible
+                    // in the in-viewer defaced copy, matching the file writer.
+                    let w = geom.removal_weight_native(x, y, z, &mask);
+                    if w > 0.0 {
+                        let orig = g.data[row + x];
+                        g.data[row + x] = orig + (fill - orig) * w;
+                    }
+                }
+            }
+        }
+        img.series_uid = defaced_uid.clone();
+        img.series_label = format!("{} [defaced]", img.series_label);
+        img.filename = format!("defaced_{}", img.filename);
+        img.thumbnail = img
+            .default_wc_ww
+            .map(|(wc, ww)| make_thumbnail(&img.raw_image, 64, wc, ww));
+        new_images.push(img);
+    }
+    if new_images.is_empty() {
+        return Err("Nothing to deface".to_string());
+    }
+    Ok(DefaceComputed {
+        base_uid,
+        defaced_uid,
+        images: new_images,
+        removed,
+        seg: seg_out,
+        seg_key,
+    })
+}
+
 impl eframe::App for DicomViewApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Process any pending file load (first frame, or after Open dialog)
@@ -4153,13 +4469,19 @@ impl eframe::App for DicomViewApp {
             self.load_files(paths, record_recent, ui.ctx());
         }
 
-        // ── Poll background loading thread ─────────────────────────────────
+        // ── Poll background loading / defacing threads ─────────────────────
         self.poll_loading(ui.ctx());
+        self.poll_deface_job(ui.ctx());
+        self.deface_loading_ui(ui.ctx());
 
         // Rebuild texture when window/level values change for active viewport
         if self.vp().wl_dirty {
             self.update_current_slice_view(ui.ctx());
         }
+
+        // Apply a pending (deferred) preview update *before* the viewports are
+        // drawn, so a settled slider change shows up in this very frame.
+        self.flush_pending_deface_preview(ui.ctx());
 
         // Drag-and-drop: detect hovered and dropped files
         ui.ctx().input(|i| {
@@ -4377,7 +4699,8 @@ impl eframe::App for DicomViewApp {
                         });
 
                     ui.separator();
-                    let can_deface = self.active_series_is_grayscale16();
+                    let can_deface =
+                        self.active_series_is_grayscale16() && self.deface_job.is_none();
                     if ui
                         .add_enabled(can_deface, egui::Button::new("🙈 Deface"))
                         .on_hover_text(
@@ -4386,7 +4709,10 @@ impl eframe::App for DicomViewApp {
                         )
                         .clicked()
                     {
-                        self.deface_active_series(ui.ctx());
+                        // Open the alignment controls so the active settings are
+                        // visible while the worker runs.
+                        self.deface_panel_open = true;
+                        self.start_deface_active_series(ui.ctx());
                     }
                     if ui
                         .toggle_value(&mut self.deface_panel_open, "🎛 Align")
@@ -5609,10 +5935,9 @@ impl eframe::App for DicomViewApp {
             self.refresh_deface_preview(ui.ctx());
             self.deface_preview_dirty = false;
             self.deface_preview_dirty_since = None;
+            self.deface_preview_allow_drag = false;
         }
 
-        // Apply a pending preview update once input has settled.
-        self.flush_pending_deface_preview(ui.ctx());
     }
 }
 
@@ -6192,6 +6517,8 @@ mod tests {
     #[test]
     fn deface_active_series_adds_comparison_viewport() {
         let mut app = DicomViewApp::new(None);
+        // This test uses the geometric yaw control.
+        app.deface_backend = DefaceBackendSel::Geometric;
         app.images = synthetic_head_series();
         app.rebuild_series_groups();
         assert_eq!(app.images.len(), 20);
@@ -7538,6 +7865,116 @@ mod tests {
     }
 
     #[test]
+    fn deface_preview_waits_for_the_drag_to_end() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_head();
+        app.viewports = vec![ViewportState::default()];
+        app.active_viewport = 0;
+        app.deface_panel_open = true;
+        app.deface_preview_on = true;
+        app.deface_preview = None;
+        app.refresh_deface_preview(&ctx);
+        assert!(app.deface_preview.is_some());
+
+        // A parameter edit only schedules the rebuild instead of recomputing on
+        // every slider tick.
+        app.request_deface_preview(&ctx);
+        assert!(app.deface_preview_dirty, "the edit is deferred");
+
+        // Even once the debounce window has passed, an update waits while the
+        // pointer is held down, so a paused drag does not freeze the UI.
+        app.deface_preview_dirty_since = Some(
+            std::time::Instant::now()
+                - DEFACE_PREVIEW_DEBOUNCE
+                - std::time::Duration::from_millis(1),
+        );
+        let mut raw = egui::RawInput::default();
+        raw.events.push(egui::Event::PointerButton {
+            pos: egui::pos2(4.0, 4.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        });
+        ctx.begin_pass(raw);
+        app.flush_pending_deface_preview(&ctx);
+        assert!(app.deface_preview_dirty, "still dragging");
+        ctx.end_pass().textures_delta.clear();
+
+        // Releasing the button lets the pending update flush.
+        let mut release = egui::RawInput::default();
+        release.events.push(egui::Event::PointerButton {
+            pos: egui::pos2(4.0, 4.0),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let removed = |app: &DicomViewApp| {
+            app.deface_preview
+                .as_ref()
+                .map(|p| p.volume_flags.iter().filter(|b| **b).count())
+                .unwrap_or(0)
+        };
+        let band_before = removed(&app);
+
+        ctx.begin_pass(release);
+        app.flush_pending_deface_preview(&ctx);
+        assert!(!app.deface_preview_dirty, "flushed after the drag");
+        assert!(app.deface_preview.is_some());
+        ctx.end_pass().textures_delta.clear();
+
+        // A settled safety-band change reaches the overlay (and shrinks it).
+        app.deface_brain_protect_mm = 20.0;
+        app.request_deface_preview(&ctx);
+        app.deface_preview_dirty_since =
+            Some(std::time::Instant::now() - DEFACE_PREVIEW_DEBOUNCE - std::time::Duration::from_millis(1));
+        app.flush_pending_deface_preview(&ctx);
+        let band_after = removed(&app);
+        assert!(
+            band_after < band_before,
+            "a wider safety band must shrink the preview ({band_after} vs {band_before})"
+        );
+    }
+
+    #[test]
+    fn deferred_safety_band_change_reaches_the_overlay_in_a_later_frame() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_head();
+        app.viewports = vec![ViewportState::default()];
+        app.active_viewport = 0;
+        app.deface_panel_open = true;
+        app.deface_preview_on = true;
+
+        let removed = |app: &DicomViewApp| {
+            app.deface_preview
+                .as_ref()
+                .map(|p| p.volume_flags.iter().filter(|b| **b).count())
+                .unwrap_or(0)
+        };
+
+        // The panel builds the preview on the first frame.
+        run_headless_frame(&mut app, &ctx);
+        assert!(app.deface_preview.is_some(), "preview built");
+        let before = removed(&app);
+
+        // A settled band change is deferred, then applied by a later frame
+        // (the flush runs before the viewports are drawn).
+        app.deface_brain_protect_mm = 20.0;
+        app.request_deface_preview(&ctx);
+        run_headless_frame(&mut app, &ctx);
+        assert!(app.deface_preview_dirty, "not applied in the same frame");
+        assert_eq!(removed(&app), before, "the old overlay is still shown");
+
+        std::thread::sleep(DEFACE_PREVIEW_DEBOUNCE + std::time::Duration::from_millis(40));
+        run_headless_frame(&mut app, &ctx);
+        assert!(!app.deface_preview_dirty, "applied once input settles");
+        assert!(
+            removed(&app) < before,
+            "a wider safety band must shrink the overlay ({} vs {before})",
+            removed(&app)
+        );
+    }
+
+    #[test]
     fn deflesh_region_removes_more_than_face() {
         let ctx = egui::Context::default();
         let mut app = app_with_head();
@@ -7545,6 +7982,9 @@ mod tests {
         app.active_viewport = 0;
         app.deface_backend = DefaceBackendSel::Segmentation;
 
+        // Compare the classic face cut; the optional vertex strip deliberately
+        // removes the whole superior skull cap and can exceed deflesh.
+        app.deface_vertex_strip = false;
         app.deface_seg_region = diface_rs::MaskRegion::Face;
         let face = active_deface_mask(&mut app);
         app.deface_seg_region = diface_rs::MaskRegion::ExternalSoftTissue;
@@ -7821,6 +8261,7 @@ mod tests {
     fn deface_algorithm_selection_and_preview() {
         let ctx = egui::Context::default();
         let mut app = app_with_head();
+        app.deface_backend = DefaceBackendSel::Geometric;
         app.viewports = vec![ViewportState::default()];
         app.active_viewport = 0;
         assert_eq!(app.deface_params.algorithm, DefaceAlgorithm::Ellipsoid);
@@ -7907,6 +8348,7 @@ mod tests {
         // Presets remove progressively less/more.
         let removed = |p: DefacePreset| {
             let mut a = app_with_head();
+            a.deface_backend = DefaceBackendSel::Geometric;
             a.deface_params.apply_preset(p);
             a.deface_active_series(&ctx);
             let idx = a.series_groups.iter().position(|g| g.uid.ends_with("-DEFACED")).unwrap();
@@ -7917,6 +8359,36 @@ mod tests {
             }
         };
         assert!(removed(DefacePreset::Conservative) < removed(DefacePreset::Thorough));
+    }
+
+    #[test]
+    fn deface_job_runs_in_background_and_applies() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_head();
+        app.deface_backend = DefaceBackendSel::Geometric;
+        app.start_deface_active_series(&ctx);
+        assert!(app.deface_job.is_some(), "job should be pending");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while app.deface_job.is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            app.poll_deface_job(&ctx);
+        }
+        assert!(app.deface_job.is_none(), "job should finish");
+        assert!(
+            app.series_groups.iter().any(|g| g.uid.ends_with("-DEFACED")),
+            "defaced series should be installed"
+        );
+    }
+
+    #[test]
+    fn defacing_defaults_to_segmentation() {
+        let app = DicomViewApp::new(None);
+        assert_eq!(
+            app.deface_backend,
+            DefaceBackendSel::Segmentation,
+            "segmentation should be the default defacing backend"
+        );
     }
 
     #[test]

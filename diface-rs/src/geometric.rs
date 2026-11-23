@@ -324,59 +324,53 @@ impl DefacingBackend for GeometricBackend {
         // Curved front: how far the cut recedes at the superior extremes (mm).
         let curve_recess = (semi[2] * 0.55).max(8.0);
 
-        let remove_at = |world: V3| -> bool {
-            let d = sub(world, center);
-            let a = dot(d, anterior);
-            match p.algorithm {
-                DefaceAlgorithm::Ellipsoid => {
+        // Projections of `world - centre` onto the head axes, as linear forms in
+        // the voxel indices. Evaluating three multiplies per voxel is much
+        // cheaper than building a world vector and taking three dot products.
+        let proj = [
+            Projection::new(volume, anterior, center),
+            Projection::new(volume, left, center),
+            Projection::new(volume, superior, center),
+        ];
+
+        let (mask, removed) = match p.algorithm {
+            DefaceAlgorithm::Ellipsoid => {
+                // Normalised ellipsoid test as `(a/sa)^2 + (l/sl)^2 + (s/ss)^2 > 1`
+                // using precomputed reciprocals.
+                let ia = 1.0 / semi[0];
+                let il = 1.0 / semi[1];
+                let is = 1.0 / semi[2];
+                fill_removal_mask(volume, threshold, proj, |a, l, s| {
                     if a <= p.anterior_plane_offset_mm {
                         return false;
                     }
-                    let l = dot(d, left);
-                    let s = dot(d, superior);
-                    let e = (a / semi[0]).powi(2) + (l / semi[1]).powi(2) + (s / semi[2]).powi(2);
-                    e > 1.0
-                }
-                DefaceAlgorithm::Plane => {
-                    // Remove everything anterior to a single plane, tilted by the
-                    // manual yaw (baked into the axes) and offset by Depth.
-                    a > cut_a + p.anterior_plane_offset_mm
-                }
-                DefaceAlgorithm::CurvedFront => {
-                    // The cut sits furthest forward at the mid-height and recedes
-                    // quadratically toward the top and bottom, following the
-                    // front of the brain.
-                    let s = dot(d, superior) / semi[2].max(1.0);
-                    let l = dot(d, left) / semi[1].max(1.0);
-                    let recess = curve_recess * (s * s + 0.35 * l * l).min(1.5);
-                    let plane = cut_a - recess;
-                    a > plane + p.anterior_plane_offset_mm
-                }
+                    let ea = a * ia;
+                    let el = l * il;
+                    let es = s * is;
+                    ea * ea + el * el + es * es > 1.0
+                })
+            }
+            DefaceAlgorithm::Plane => {
+                // Remove everything anterior to a single plane, tilted by the
+                // manual yaw (baked into the axes) and offset by Depth.
+                let plane = cut_a + p.anterior_plane_offset_mm;
+                fill_removal_mask(volume, threshold, proj, |a, _, _| a > plane)
+            }
+            DefaceAlgorithm::CurvedFront => {
+                // The cut sits furthest forward at the mid-height and recedes
+                // quadratically toward the top and bottom, following the front
+                // of the brain.
+                let il = 1.0 / semi[1].max(1.0);
+                let is = 1.0 / semi[2].max(1.0);
+                let offset = p.anterior_plane_offset_mm;
+                fill_removal_mask(volume, threshold, proj, move |a, l, s| {
+                    let sn = s * is;
+                    let ln = l * il;
+                    let recess = curve_recess * (sn * sn + 0.35 * ln * ln).min(1.5);
+                    a > cut_a - recess + offset
+                })
             }
         };
-
-        let mut mask = Mask::new(volume.dims);
-        let mut removed: usize = 0;
-
-        for z in 0..volume.nz() {
-            let base_z = add(
-                volume.origin,
-                scale(volume.dir[2], z as f64 * volume.spacing[2]),
-            );
-            for y in 0..volume.ny() {
-                let base_y = add(base_z, scale(volume.dir[1], y as f64 * volume.spacing[1]));
-                for x in 0..volume.nx() {
-                    if volume.value(x, y, z) <= threshold {
-                        continue;
-                    }
-                    let world = add(base_y, scale(volume.dir[0], x as f64 * volume.spacing[0]));
-                    if remove_at(world) {
-                        mask.set(x, y, z, true);
-                        removed += 1;
-                    }
-                }
-            }
-        }
 
         let max_removed = (p.max_removed_fraction * volume.len() as f64) as usize;
         if removed > max_removed {
@@ -391,6 +385,82 @@ impl DefacingBackend for GeometricBackend {
 
         Ok(mask)
     }
+}
+
+/// A linear projection of `world - centre` onto one head axis, written as
+/// `base + step[0]*x + step[1]*y + step[2]*z`.
+///
+/// Precomputing the coefficients lets the masking loop derive all three head
+/// coordinates with a couple of fused multiply-adds per voxel, instead of
+/// building a patient-space point and projecting it separately.
+#[derive(Clone, Copy, Debug)]
+struct Projection {
+    base: f64,
+    step: [f64; 3],
+}
+
+impl Projection {
+    fn new(volume: &Volume, axis: V3, center: V3) -> Self {
+        let mut base = 0.0;
+        let mut step = [0.0f64; 3];
+        for k in 0..3 {
+            base += (volume.origin[k] - center[k]) * axis[k];
+            step[k] = dot(volume.dir[k], axis) * volume.spacing[k];
+        }
+        Projection { base, step }
+    }
+}
+
+/// Fill a removal mask by testing every above-threshold voxel with `remove`,
+/// which receives the voxel's `(anterior, left, superior)` head coordinates
+/// relative to the preserve-ellipsoid centre.
+///
+/// The planes are walked in memory order (`z`, `y`, `x`) and the rescale is
+/// hoisted per slice, keeping the inner loop free of bounds-checked
+/// `Volume::value` calls.
+fn fill_removal_mask<F>(
+    volume: &Volume,
+    threshold: f32,
+    proj: [Projection; 3],
+    mut remove: F,
+) -> (Mask, usize)
+where
+    F: FnMut(f64, f64, f64) -> bool,
+{
+    let nx = volume.nx();
+    let ny = volume.ny();
+    let nxy = nx * ny;
+    let mut mask = Mask::new(volume.dims);
+    let mut removed = 0usize;
+
+    for z in 0..volume.nz() {
+        let (slope, intercept) = volume.rescale[z];
+        let row_z = z * nxy;
+        let za = proj[0].step[2] * z as f64;
+        let zl = proj[1].step[2] * z as f64;
+        let zs = proj[2].step[2] * z as f64;
+        for y in 0..ny {
+            let row = row_z + y * nx;
+            let ay = proj[0].base + za + proj[0].step[1] * y as f64;
+            let al = proj[1].base + zl + proj[1].step[1] * y as f64;
+            let asu = proj[2].base + zs + proj[2].step[1] * y as f64;
+            for x in 0..nx {
+                let i = row + x;
+                let raw = volume.data[i];
+                if raw * slope + intercept <= threshold {
+                    continue;
+                }
+                let a = ay + proj[0].step[0] * x as f64;
+                let l = al + proj[1].step[0] * x as f64;
+                let s = asu + proj[2].step[0] * x as f64;
+                if remove(a, l, s) {
+                    mask.remove[i] = 1;
+                    removed += 1;
+                }
+            }
+        }
+    }
+    (mask, removed)
 }
 
 /// Resolve the working head frame from the automatic estimate, an optional
@@ -550,9 +620,10 @@ pub fn head_statistics_best(
     };
     if let Ok(seg) = crate::segmentation::segment(volume, &seg_params) {
         if seg.head_count() > 0 {
-            let filter = crate::segmentation::head_filter(&seg, volume);
-            if let Some(stats) =
-                head_statistics_impl(volume, threshold, coarse_target, Some(&filter))
+            // The segmented head *is* the point cloud the masked estimate would
+            // rebuild voxel by voxel; derive the statistics from it directly
+            // instead of scanning the whole volume a second time.
+            if let Some(stats) = head_statistics_from_grid(volume, &seg.head, seg.dims, seg.stride)
             {
                 return Some(stats);
             }
@@ -717,9 +788,45 @@ fn head_statistics_impl(
         points.push(volume.world(x, y, z));
     }
 
+    stats_from_points(volume, &points)
+}
+
+/// Statistics from a coarse head-occupancy grid (e.g. the segmented head).
+///
+/// This avoids re-scanning the whole volume with a per-voxel head filter: the
+/// coarse cells already describe the head point cloud.
+pub fn head_statistics_from_grid(
+    volume: &Volume,
+    grid: &[u8],
+    cd: [usize; 3],
+    stride: [usize; 3],
+) -> Option<HeadStats> {
+    let dims = volume.dims;
+    let mut points: Vec<V3> = Vec::new();
+    for cz in 0..cd[2] {
+        for cy in 0..cd[1] {
+            let row = (cz * cd[1] + cy) * cd[0];
+            for cx in 0..cd[0] {
+                if grid[row + cx] == 0 {
+                    continue;
+                }
+                let x = (cx * stride[0]).min(dims[0] - 1);
+                let y = (cy * stride[1]).min(dims[1] - 1);
+                let z = (cz * stride[2]).min(dims[2] - 1);
+                points.push(volume.world(x, y, z));
+            }
+        }
+    }
+    if points.is_empty() {
+        return None;
+    }
+    stats_from_points(volume, &points)
+}
+
+fn stats_from_points(volume: &Volume, points: &[V3]) -> Option<HeadStats> {
     let n = points.len() as f64;
     let mut centroid = [0.0; 3];
-    for p in &points {
+    for p in points {
         centroid[0] += p[0];
         centroid[1] += p[1];
         centroid[2] += p[2];
@@ -728,7 +835,7 @@ fn head_statistics_impl(
 
     // Covariance and principal (superior-inferior) axis.
     let mut cov = [[0.0f64; 3]; 3];
-    for p in &points {
+    for p in points {
         let d = sub(*p, centroid);
         for r in 0..3 {
             for c in 0..3 {

@@ -18,7 +18,9 @@
 //! ```
 
 use crate::backend::DefacingBackend;
-use crate::geometry::{add, normalize, scale, sub, AXIS_ANTERIOR, AXIS_LEFT, AXIS_SUPERIOR, V3};
+use crate::geometry::{
+    add, dot, normalize, scale, sub, AXIS_ANTERIOR, AXIS_LEFT, AXIS_SUPERIOR, V3,
+};
 use crate::volume::{Mask, Volume};
 use std::path::PathBuf;
 
@@ -350,26 +352,6 @@ impl AtlasBackend {
 
         Ok(Affine { origin, step })
     }
-
-    /// Map a subject patient point back to atlas voxel coordinates.
-    fn atlas_coords(&self, affine: &Affine, p: V3) -> V3 {
-        // Solve the small 3x3 linear system step * [x,y,z] = p - origin.
-        let m = [
-            [affine.step[0][0], affine.step[1][0], affine.step[2][0]],
-            [affine.step[0][1], affine.step[1][1], affine.step[2][1]],
-            [affine.step[0][2], affine.step[1][2], affine.step[2][2]],
-        ];
-        let b = sub(p, affine.origin);
-        invert3(m)
-            .map(|inv| {
-                [
-                    inv[0][0] * b[0] + inv[0][1] * b[1] + inv[0][2] * b[2],
-                    inv[1][0] * b[0] + inv[1][1] * b[1] + inv[1][2] * b[2],
-                    inv[2][0] * b[0] + inv[2][1] * b[1] + inv[2][2] * b[2],
-                ]
-            })
-            .unwrap_or([f64::NAN; 3])
-    }
 }
 
 impl DefacingBackend for AtlasBackend {
@@ -427,29 +409,49 @@ impl DefacingBackend for AtlasBackend {
         // guarantees no posterior tissue (neck / occipital) is ever removed.
         let cut_y = (brain_min_y as f64 - margin_vox).min(brain_center_y);
 
+        // Map subject world points to atlas coordinates once: only the
+        // anterior-posterior atlas coordinate (`y`) is needed, and it is a
+        // linear function of the voxel indices. Inverting the affine per voxel
+        // would be by far the most expensive part of this loop.
+        let m = [
+            [affine.step[0][0], affine.step[1][0], affine.step[2][0]],
+            [affine.step[0][1], affine.step[1][1], affine.step[2][1]],
+            [affine.step[0][2], affine.step[1][2], affine.step[2][2]],
+        ];
+        let Some(inv) = invert3(m) else {
+            // Singular registration: nothing can be classified as facial.
+            return Ok(Mask::new(volume.dims));
+        };
+        let row = inv[1];
+        let mut c_base = 0.0;
+        let mut c_step = [0.0f64; 3];
+        for k in 0..3 {
+            c_base += row[k] * (volume.origin[k] - affine.origin[k]);
+            c_step[k] = dot(row, volume.dir[k]) * volume.spacing[k];
+        }
+
         // Remove only foreground voxels that map to *in front of* the registered
         // brain (more anterior than `cut_y`). Everything at or behind the cut is
         // kept, so the brain (and the whole posterior head/neck) is untouched.
+        let (nx, ny, nz) = (volume.nx(), volume.ny(), volume.nz());
+        let nxy = nx * ny;
         let mut mask = Mask::new(volume.dims);
         let mut removed = 0usize;
-        for z in 0..volume.nz() {
-            let base_z = add(
-                volume.origin,
-                scale(volume.dir[2], z as f64 * volume.spacing[2]),
-            );
-            for y in 0..volume.ny() {
-                let base_y = add(base_z, scale(volume.dir[1], y as f64 * volume.spacing[1]));
-                for x in 0..volume.nx() {
-                    if volume.value(x, y, z) <= threshold {
+        for z in 0..nz {
+            let (slope, intercept) = volume.rescale[z];
+            let row_z = z * nxy;
+            let c_z = c_base + c_step[2] * z as f64;
+            for y in 0..ny {
+                let row_y = row_z + y * nx;
+                let c_y = c_z + c_step[1] * y as f64;
+                for x in 0..nx {
+                    let i = row_y + x;
+                    if volume.data[i] * slope + intercept <= threshold {
                         continue;
                     }
-                    let world = add(base_y, scale(volume.dir[0], x as f64 * volume.spacing[0]));
-                    let c = self.atlas_coords(&affine, world);
-                    if c.iter().any(|v| v.is_nan()) {
-                        continue;
-                    }
-                    if c[1] < cut_y {
-                        mask.set(x, y, z, true);
+                    let c = c_y + c_step[0] * x as f64;
+                    if c < cut_y {
+                        mask.remove[i] = 1;
                         removed += 1;
                     }
                 }
