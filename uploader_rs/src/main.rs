@@ -820,6 +820,7 @@ struct AppState {
     uploaded_studies: HashSet<String>,
     duplicate_refresh_in_progress: bool,
     burned_in_series_confirmed: HashSet<String>,
+    descriptive_series_confirmed: HashSet<String>,
     /// None = individual states; Some(true) = all expanded; Some(false) = all collapsed
     studies_collapsed: Option<bool>,
 }
@@ -919,6 +920,7 @@ impl Default for AppState {
             uploaded_studies: HashSet::new(),
             duplicate_refresh_in_progress: false,
             burned_in_series_confirmed: HashSet::new(),
+            descriptive_series_confirmed: HashSet::new(),
             log_level: std::env::var("RUST_LOG").ok().or_else(|| upload::load_log_level()).unwrap_or_else(|| "info".to_string()),
             logo_tex: None,
         }
@@ -964,11 +966,40 @@ impl AppState {
             .retain(|series_uid| flagged.contains(series_uid));
     }
 
+    fn sync_descriptive_confirmations(&mut self) {
+        let flagged: HashSet<String> = self
+            .ready_series
+            .iter()
+            .filter(|s| s.descriptive_review_required)
+            .map(|s| s.series_uid.clone())
+            .collect();
+        self.descriptive_series_confirmed
+            .retain(|series_uid| flagged.contains(series_uid));
+    }
+
     fn unconfirmed_burned_in_series(&self) -> Vec<String> {
         let mut blocked: Vec<String> = Vec::new();
         for series in &self.ready_series {
             if series.burned_in_annotation_detected
                 && !self.burned_in_series_confirmed.contains(&series.series_uid)
+            {
+                let label = series
+                    .series_description
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| series.series_uid.clone());
+                blocked.push(label);
+            }
+        }
+        blocked
+    }
+
+    fn unconfirmed_descriptive_series(&self) -> Vec<String> {
+        let mut blocked: Vec<String> = Vec::new();
+        for series in &self.ready_series {
+            if series.descriptive_review_required
+                && !self.descriptive_series_confirmed.contains(&series.series_uid)
             {
                 let label = series
                     .series_description
@@ -1217,6 +1248,7 @@ impl AppState {
                 self.ready_series = v;
                 self.selected_series = vec![true; self.ready_series.len()];
                 self.sync_burned_in_confirmations();
+                self.sync_descriptive_confirmations();
                 self.last_msg = "Ready-to-upload refreshed".to_string();
                 upload::log_rpc_debug("Ready-to-upload refreshed (scan_written)");
             } else if let Ok(txt) = std::fs::read_to_string(upload::last_scan_path()) {
@@ -1225,6 +1257,7 @@ impl AppState {
                     self.ready_series = v;
                     self.selected_series = vec![true; self.ready_series.len()];
                     self.sync_burned_in_confirmations();
+                    self.sync_descriptive_confirmations();
                     self.last_msg = "Ready-to-upload refreshed".to_string();
                 }
             }
@@ -1570,14 +1603,26 @@ impl eframe::App for AppState {
                 ui.horizontal_wrapped(|ui| {
                     if !self.metadata_select_mode {
                         if ui.add(egui::Button::new("Upload anonymized files").fill(egui::Color32::from_rgb(0,150,60))).clicked() {
-                            let blocked = self.unconfirmed_burned_in_series();
-                            if !blocked.is_empty() {
+                            let blocked_burned_in = self.unconfirmed_burned_in_series();
+                            if !blocked_burned_in.is_empty() {
                                 self.last_msg = format!(
                                     "Upload blocked: {} series require Burned In Annotation confirmation",
-                                    blocked.len()
+                                    blocked_burned_in.len()
                                 );
                                 self.add_toast(
                                     "Confirm burned-in patient details have been removed for flagged series before uploading.".to_string(),
+                                    5000,
+                                );
+                                return;
+                            }
+                            let blocked_descriptive = self.unconfirmed_descriptive_series();
+                            if !blocked_descriptive.is_empty() {
+                                self.last_msg = format!(
+                                    "Upload blocked: {} series require descriptive metadata approval",
+                                    blocked_descriptive.len()
+                                );
+                                self.add_toast(
+                                    "Approve preserved descriptive fields for flagged series before uploading.".to_string(),
                                     5000,
                                 );
                                 return;
@@ -1928,6 +1973,12 @@ impl eframe::App for AppState {
                                                 "Burned-in flag",
                                             );
                                         }
+                                        if series.descriptive_review_required {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(196, 172, 96),
+                                                "Review descriptive fields",
+                                            );
+                                        }
                                         if !series.files.is_empty() {
                                             if series.duplicate_checked_files >= series.files.len() {
                                                 ui.colored_label(egui::Color32::from_rgb(46, 160, 67), "Checked");
@@ -2008,6 +2059,42 @@ impl eframe::App for AppState {
                                                 }
                                             }
                                         });
+                                    }
+                                    if series.descriptive_review_required {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(196, 172, 96),
+                                                "Warning: preserved descriptive metadata requires manual approval.",
+                                            );
+                                            let mut approved = self
+                                                .descriptive_series_confirmed
+                                                .contains(&series.series_uid);
+                                            if ui
+                                                .checkbox(
+                                                    &mut approved,
+                                                    "I approve this series for upload with preserved descriptive fields",
+                                                )
+                                                .changed()
+                                            {
+                                                if approved {
+                                                    self.descriptive_series_confirmed
+                                                        .insert(series.series_uid.clone());
+                                                } else {
+                                                    self.descriptive_series_confirmed
+                                                        .remove(&series.series_uid);
+                                                }
+                                            }
+                                        });
+                                        for (label, value) in [
+                                            ("StudyDescription", series.examination.as_deref()),
+                                            ("SeriesDescription", series.series_description.as_deref()),
+                                            ("ProtocolName", series.protocol_name.as_deref()),
+                                            ("ManufacturerModelName", series.manufacturer_model_name.as_deref()),
+                                        ] {
+                                            if let Some(v) = value.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                                                ui.label(format!("{label}: {v}"));
+                                            }
+                                        }
                                     }
                                     egui::CollapsingHeader::new(format!("Files ({})", series.files.len()))
                                         .default_open(false)

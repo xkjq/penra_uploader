@@ -134,7 +134,12 @@ def send_ipc(ipc_name: str, message: bytes = b"loaded", timeout: float = 2.0) ->
 def main():
     ap = argparse.ArgumentParser(description="Simulate exporting DICOM sets and notifying uploader")
     ap.add_argument("--source", default="test_dicoms", help="Directory containing example DICOM sets")
-    ap.add_argument("--export", default="/home/ross/uploader/uploader_rs/export", help="Uploader export folder to copy into")
+    default_export = os.environ.get("UPLOADER_EXPORT_DIR")
+    if not default_export:
+        default_export = "C:/uploader/export" if os.name == "nt" else "export"
+    ap.add_argument("--export", default=default_export,
+                    help="Uploader export folder to copy into (default: $UPLOADER_EXPORT_DIR, "
+                         "C:/uploader/export on Windows, ./export elsewhere)")
     ap.add_argument("--interval", type=float, default=5.0, help="Seconds to wait after notifying uploader before next set")
     ap.add_argument("--repeat", type=int, default=1, help="How many times to cycle through available sets (0 = infinite)")
     ap.add_argument("--clear", default=True, action="store_true", help="Clear export folder before copying each set")

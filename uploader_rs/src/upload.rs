@@ -57,9 +57,15 @@ pub struct ReadyFileInfo {
     pub modality: Option<String>,
     pub series_description: Option<String>,
     pub series_number: Option<String>,
+    #[serde(default)]
+    pub protocol_name: Option<String>,
+    #[serde(default)]
+    pub manufacturer_model_name: Option<String>,
     pub file_size: u64,
     #[serde(default)]
     pub burned_in_annotation_detected: bool,
+    #[serde(default)]
+    pub descriptive_review_required: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,10 +96,16 @@ pub struct SeriesInfo {
     pub modality: Option<String>,
     pub series_description: Option<String>,
     pub series_number: Option<String>,
+    #[serde(default)]
+    pub protocol_name: Option<String>,
+    #[serde(default)]
+    pub manufacturer_model_name: Option<String>,
     pub file_count: usize,
     pub total_bytes: u64,
     #[serde(default)]
     pub burned_in_annotation_detected: bool,
+    #[serde(default)]
+    pub descriptive_review_required: bool,
 }
 
 
@@ -207,6 +219,19 @@ fn build_ready_info(
         .and_then(|e| e.to_str().ok())
         .map(|s| s.to_string())
         .unwrap_or_else(|| "NO_SERIES".to_string());
+    let examination = read_dicom_string(obj, Tag(0x0008, 0x1030));
+    let series_description = read_dicom_string(obj, Tag(0x0008, 0x103E));
+    let protocol_name = read_dicom_string(obj, Tag(0x0018, 0x1030));
+    let manufacturer_model_name = read_dicom_string(obj, Tag(0x0008, 0x1090));
+    let descriptive_review_required = [
+        examination.as_ref(),
+        series_description.as_ref(),
+        protocol_name.as_ref(),
+        manufacturer_model_name.as_ref(),
+    ]
+    .iter()
+    .flatten()
+    .any(|s| !s.trim().is_empty());
     ReadyFileInfo {
         path: path.to_path_buf(),
         hash,
@@ -217,14 +242,17 @@ fn build_ready_info(
         is_duplicate: false,
         duplicate_series_urls: Vec::new(),
         patient_name: read_dicom_string(obj, Tag(0x0010, 0x0010)),
-        examination: read_dicom_string(obj, Tag(0x0008, 0x1030)),
+        examination,
         patient_id: read_dicom_string(obj, Tag(0x0010, 0x0020)),
         study_date: read_dicom_string(obj, Tag(0x0008, 0x0020)),
         modality: read_dicom_string(obj, Tag(0x0008, 0x0060)),
-        series_description: read_dicom_string(obj, Tag(0x0008, 0x103E)),
+        series_description,
         series_number: read_dicom_string(obj, Tag(0x0020, 0x0011)),
+        protocol_name,
+        manufacturer_model_name,
         file_size,
         burned_in_annotation_detected: detect_burned_in_annotation(obj),
+        descriptive_review_required,
     }
 }
 
@@ -431,8 +459,11 @@ fn build_series_from_ready_files(items: &[ReadyFileInfo]) -> Vec<SeriesInfo> {
         let mut modality = None;
         let mut series_description = None;
         let mut series_number = None;
+        let mut protocol_name = None;
+        let mut manufacturer_model_name = None;
         let mut study_uid = None;
         let mut burned_in_annotation_detected = false;
+        let mut descriptive_review_required = false;
 
         for rf in &files {
             entries.push(FileEntry {
@@ -470,10 +501,17 @@ fn build_series_from_ready_files(items: &[ReadyFileInfo]) -> Vec<SeriesInfo> {
             if series_number.is_none() {
                 series_number = rf.series_number.clone();
             }
+            if protocol_name.is_none() {
+                protocol_name = rf.protocol_name.clone();
+            }
+            if manufacturer_model_name.is_none() {
+                manufacturer_model_name = rf.manufacturer_model_name.clone();
+            }
             if study_uid.is_none() {
                 study_uid = rf.study_uid.clone();
             }
             burned_in_annotation_detected |= rf.burned_in_annotation_detected;
+            descriptive_review_required |= rf.descriptive_review_required;
         }
 
         out.push(SeriesInfo {
@@ -490,9 +528,12 @@ fn build_series_from_ready_files(items: &[ReadyFileInfo]) -> Vec<SeriesInfo> {
             modality,
             series_description,
             series_number,
+            protocol_name,
+            manufacturer_model_name,
             file_count: files.len(),
             total_bytes,
             burned_in_annotation_detected,
+            descriptive_review_required,
         });
     }
     out
@@ -1701,6 +1742,9 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
         let mut modality = None;
         let mut series_description = None;
         let mut series_number = None;
+        let mut protocol_name = None;
+        let mut manufacturer_model_name = None;
+        let mut descriptive_review_required = false;
         if let Some((first_path, _)) = items.get(0) {
             if let Ok(obj) = open_file(first_path) {
                 patient_name = obj.element(Tag(0x0010,0x0010)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
@@ -1710,6 +1754,17 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
                 modality = obj.element(Tag(0x0008,0x0060)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
                 series_description = obj.element(Tag(0x0008,0x103E)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
                 series_number = obj.element(Tag(0x0020,0x0011)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
+                protocol_name = obj.element(Tag(0x0018,0x1030)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
+                manufacturer_model_name = obj.element(Tag(0x0008,0x1090)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
+                descriptive_review_required = [
+                    examination.as_ref(),
+                    series_description.as_ref(),
+                    protocol_name.as_ref(),
+                    manufacturer_model_name.as_ref(),
+                ]
+                .iter()
+                .flatten()
+                .any(|s| !s.trim().is_empty());
             }
         }
 
@@ -1732,9 +1787,12 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
             modality,
             series_description,
             series_number,
+            protocol_name,
+            manufacturer_model_name,
             file_count: items.len(),
             total_bytes,
             burned_in_annotation_detected: false,
+            descriptive_review_required,
         });
     }
 
@@ -1819,9 +1877,12 @@ pub fn scan_for_upload_quick(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender
             modality: None,
             series_description: None,
             series_number: None,
+            protocol_name: None,
+            manufacturer_model_name: None,
             file_count: items.len(),
             total_bytes,
             burned_in_annotation_detected: false,
+            descriptive_review_required: false,
         });
     }
 

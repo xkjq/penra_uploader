@@ -46,9 +46,12 @@ fn handle_scan_written_parses_last_scan() {
         modality: None,
         series_description: None,
         series_number: None,
+        protocol_name: None,
+        manufacturer_model_name: None,
         file_count: 0,
         total_bytes: 0,
         burned_in_annotation_detected: false,
+        descriptive_review_required: false,
     }];
     let mut f = File::create(".last_scan.json").unwrap();
     let j = serde_json::to_string(&series).unwrap();

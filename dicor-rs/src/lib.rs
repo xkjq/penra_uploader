@@ -76,9 +76,14 @@ fn vr_is_safe_private(vr: VR) -> bool {
 fn sanitize_text_field(s: &str, orig_name: &str, orig_pid: &str, shift_days: i64) -> String {
     let mut out_tokens: Vec<String> = Vec::new();
     let name_lc = orig_name.trim().to_lowercase();
+    // Individual name parts (e.g. "Doe", "John"). Parts shorter than three
+    // characters (common in short surnames such as "Ng" or "Li") only match a
+    // whole token: matching them as substrings would erase ordinary clinical
+    // words like "lung" or "findings" from preserved descriptions. Longer
+    // parts are still matched as substrings (e.g. "Doe" in "Doe's").
     let name_parts: Vec<String> = name_lc
         .split(|c: char| !c.is_alphanumeric())
-        .filter(|p| p.len() >= 2 && *p != "anon")
+        .filter(|p| p.chars().count() >= 2 && *p != "anon")
         .map(|p| p.to_string())
         .collect();
     let pid_lc = orig_pid.trim().to_lowercase();
@@ -86,8 +91,14 @@ fn sanitize_text_field(s: &str, orig_name: &str, orig_pid: &str, shift_days: i64
         let t = tok.trim_matches(|c: char| !c.is_alphanumeric() && c != '@' && c != '.' && c != '-');
         if t.is_empty() { continue; }
         let tl = t.to_lowercase();
-        if !name_lc.is_empty() && name_lc != "anon" && tl.contains(&name_lc) { continue; }
-        if name_parts.iter().any(|part| tl.contains(part)) { continue; }
+        let matches_name_part = name_parts.iter().any(|part| {
+            if part.chars().count() >= 3 {
+                tl.contains(part)
+            } else {
+                tl == *part
+            }
+        });
+        if matches_name_part { continue; }
         if !pid_lc.is_empty() && tl.contains(&pid_lc) { continue; }
         if tl.contains('@') && tl.contains('.') { continue; }
         // check for 8-digit YYYYMMDD dates and replace with shifted date
@@ -650,8 +661,6 @@ pub fn anonymize_object(
         }
     }
 
-    let shift_days = shift_date_by_patient(&pat_name, seed);
-
     let _ = obj.put_str(Tag(0x0010, 0x0010), VR::PN, &pn);
     let _ = obj.put_str(Tag(0x0010, 0x0020), VR::LO, &pid);
 
@@ -665,6 +674,14 @@ pub fn anonymize_object(
         Tag(0x0010,0x0040), Tag(0x0010,0x1010), Tag(0x0010,0x1020), Tag(0x0010,0x1030),
         Tag(0x0010,0x1090), Tag(0x0010,0x2160), Tag(0x0010,0x2180), Tag(0x0010,0x21B0),
         Tag(0x0020,0x4000), Tag(0x0040,0x0275),
+        // Organisation Data Service (ODS) / institution identifiers. These can
+        // identify the issuing trust/GP practice even when InstitutionName is
+        // removed, so clear them explicitly (including nested sequence items).
+        Tag(0x0008,0x0082), // InstitutionCodeSequence
+        Tag(0x0010,0x0024), // IssuerOfPatientIDQualifiersSequence
+        Tag(0x0040,0x0031), // LocalEntity
+        Tag(0x0040,0x0032), // UniversalEntityID
+        Tag(0x0040,0x0033), // UniversalEntityIDType
         Tag(0x0040,0xA730),
     ];
 
@@ -730,21 +747,6 @@ pub fn anonymize_object(
     for (tag, vr, val) in &defaults {
         let _ = obj.put_str(*tag, *vr, val);
     }
-    for tag in &date_tags {
-        if let Ok(elem) = obj.element(*tag) {
-            if let Ok(s) = elem.to_str() {
-                if s.len() >= 8 {
-                    let date_part = &s[0..8];
-                    if let Ok(dt) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
-                        let shifted = dt + Duration::days(shift_days);
-                        let new = shifted.format("%Y%m%d").to_string();
-                        let _ = obj.put_str(*tag, VR::DA, &new);
-                    }
-                }
-            }
-        }
-    }
-
     if let Ok(_) = obj.element(Tag(0x0040,0xA730)) {
         let _ = obj.update_value(Tag(0x0040,0xA730), |v| {
             if let Some(items) = v.items_mut() {
@@ -777,44 +779,12 @@ pub fn anonymize_object(
         }
     }
 
+    // `process_file` shifts DA/DT/TM values and sanitizes whitelisted descriptive
+    // text fields exactly once for the top-level dataset. The extra date/time
+    // loops previously here re-shifted the same tags (2x at the top level while
+    // sequence items via `process_inmem_top` were shifted once), so they were
+    // removed to keep every tag shifted exactly once.
     process_file(&mut obj, &pat_name, preserve_private, seed, &clear_tags, &date_tags, &mut map, &text_vrs, &vr_whitelist);
-
-    // Sanitize preserved descriptive text fields for likely PHI tokens using original PatientName and PatientID
-    for tag in &preserve_text_tags {
-        if let Ok(el) = obj.element(*tag) {
-            if let Ok(s) = el.to_str() {
-                let s_owned = s.to_string();
-                let vr = el.vr();
-                let _ = el;
-                let cleaned = sanitize_text_field(&s_owned, &pat_name, &orig_patient_id, shift_days);
-                let _ = obj.put_str(*tag, vr, &cleaned);
-            }
-        }
-    }
-
-    // Ensure common time tags are shifted once (StudyTime, SeriesTime, etc.)
-    let time_tags = vec![Tag(0x0008,0x0030), Tag(0x0008,0x0031), Tag(0x0008,0x0032), Tag(0x0008,0x0033), Tag(0x0008,0x0034), Tag(0x0008,0x0035), Tag(0x0010,0x0032), Tag(0x0040,0xA122)];
-    for tag in time_tags {
-        if let Ok(elem) = obj.element(tag) {
-            if let Ok(s) = elem.to_str() {
-                let patterns = ["%H%M%S", "%H%M", "%H:%M:%S"];
-                let mut parsed: Option<NaiveTime> = None;
-                for p in &patterns {
-                    if let Ok(tm) = NaiveTime::parse_from_str(&s, p) {
-                        parsed = Some(tm);
-                        break;
-                    }
-                }
-                if let Some(tm) = parsed {
-                    let minutes = minute_offset_by_patient(&pat_name, seed);
-                    let shifted_time = tm + Duration::minutes(minutes);
-                    let secs = shifted_time.num_seconds_from_midnight();
-                    let new = NaiveTime::from_num_seconds_from_midnight_opt(secs, 0).map(|t| t.format("%H%M%S").to_string()).unwrap_or_else(|| s.to_string());
-                    let _ = obj.put_str(tag, VR::TM, &new);
-                }
-            }
-        }
-    }
 
     // Indicate that the dataset has been de-identified and that re-identification is
     // not supported (irreversible anonymization).

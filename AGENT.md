@@ -29,7 +29,7 @@ Important paths
   - diface-rs/                (facial defacing; see below)
   - diviz-rs/                 (DICOM viewer; in-viewer defacing)
   - dicor-rs/                 (metadata anonymisation / compression)
-  - divue-rs/, diforge-rs/, launcher/, dicom_viewer/
+  - divue-rs/, diforge-rs/, dicom_viewer/
 - Real validation data lives outside the repo in `~/dicoms` (case 546 CT,
   case 554 MR x6, case_811 MR x4, case/series_2079-2081).
 - Toolchain: nightly (`rust-toolchain.toml`).
@@ -83,10 +83,21 @@ Build & run
   `assets/uploade-rs_icon.png` with
   `convert uploade-rs_icon.png -define icon:auto-resize=256,128,64,48,32,16 generated/uploade-rs_icon.ico`.
   The runtime window icon (`main.rs` `viewport.icon`) is unchanged. The other
-  binaries (diviz-rs, divue, diface, diforge, launcher) do not embed an icon yet.
+  binaries (diviz-rs, divue, diface, diforge) do not embed an icon yet.
 - Run anonymiser: `./target/debug/uploader_rs --anon <input.dcm> <output.dcm>`
 - Compare with dicognito (from repo root): `PYTHONPATH=. .venv/bin/python scripts/compare_anonymizers.py test_dicoms`
 - Run Rust tests: `cd uploader_rs && cargo test`
+- Cut a release: bump the `version` in `uploader_rs/Cargo.toml`, commit, then
+  `git tag vX.Y.Z && git push origin vX.Y.Z`. `.github/workflows/release.yml`
+  validates the tag, builds Windows/Linux bundles (uploader, diviz-rs, divue,
+  diface, notify), runs the Linux test suite, and publishes the GitHub Release.
+  Running the workflow manually builds artifacts; supplying `tag` also publishes
+  a draft release.
+- ODS code checks (NHS organisation identifiers):
+  - Fetch: `python scripts/fetch_ods_codes.py --output ~/.uploader/ods_codes.txt`
+    (ORD API; `--source dse` uses the Data Search and Export CSV reports).
+  - Audit anonymised files: `python scripts/check_ods_codes.py --codes ~/.uploader/ods_codes.txt <dir>`
+    (reports surviving codes and ODS-bearing tags; exits 1 on findings).
 
 Facial anonymisation crate (diface-rs)
 - Root: penra_uploader/diface-rs
@@ -341,7 +352,7 @@ Facial anonymisation crate (diface-rs)
   - `diface_rs::deface_dir_in_place(dir, opts)` defaces each series found in a
     directory **overwriting files in place** (names preserved), used after the
     anonymise step when the "Deface faces" setting is on.
-  - After defacing, `/home/ross/penra_uploader/uploader_rs/src/main.rs`
+  - After defacing, `uploader_rs/src/main.rs`
     recompresses each output to **JPEG-LS lossless** via
     `dicor_rs::compress_to_jpegls` (defacing writes uncompressed), in parallel.
     Recompression is lossless, so the defaced pixels' hash is unchanged.
@@ -412,14 +423,14 @@ Current status
   - The viewer Align panel exposes segmentation **Cut at** and **Safety band**.
   - The uploader Settings panel exposes backend/region/safety band/deflesh
     smooth via `DefaceConfig`.
-  - `.github/workflows/build-windows.yml` builds and uploads the `diface.exe`
-    CLI artifact alongside diviz/dicor/divue/uploader.
+  - `.github/workflows/release.yml` builds Windows and Linux bundles
+    (uploader/diviz/divue/diface/notify) and publishes them on `v*` tags.
 
 Next recommended work (defacing)
-- Packaging: `build.py` (PyInstaller) is Python-only and never bundled the Rust
-  binaries; if a single shippable bundle is wanted, collect `uploader_rs`,
-  `diviz-rs`, `divue` and `diface` together (the launcher/uploader currently
-  resolve `diviz-rs` on PATH then via workspace `target/{debug,release}`).
+- Packaging: `.github/workflows/release.yml` builds the Rust binaries
+  individually and bundles `uploader_rs`, `diviz-rs`, `divue` and `diface`
+  together; the uploader resolves `diviz-rs` next to itself, then on PATH, then
+  via workspace `target/{debug,release}`.
 - Validation: keep re-running `seg_debug` / `deface_debug` over `~/dicoms` as new
   MR series arrive; MR has no detectable skull, so `vault` is empty and
   `SkullFront`/deflesh fall back to the brain/closed-cavity path.

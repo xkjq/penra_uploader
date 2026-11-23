@@ -5,7 +5,7 @@ This extraction creates two standalone Rust crates from the original uploader pr
 ## Crates
 
 ### 1. `dicom_viewer` 
-Located at: `/home/ross/penra_uploader/dicom_viewer`
+Located at: `dicom_viewer/`
 
 A library for reading DICOM metadata from files.
 
@@ -44,7 +44,7 @@ for (key, value) in metadata {
 ---
 
 ### 2. `divue-rs` (DICOM Viewer - Rust)
-Located at: `/home/ross/penra_uploader/divue-rs`
+Located at: `divue-rs/`
 
 A GUI application (and library) for viewing and comparing DICOM metadata from multiple files using egui.
 

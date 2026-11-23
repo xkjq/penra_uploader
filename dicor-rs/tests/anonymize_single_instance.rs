@@ -215,3 +215,67 @@ fn dates_and_times_get_anonymized_when_both_are_present() {
     let md = std::fs::metadata(&res).expect("stat out");
     assert!(md.len() > 64);
 }
+
+#[test]
+fn dates_and_times_are_shifted_exactly_once() {
+    // Regression test: date/time tags used to be shifted twice at the dataset
+    // root (once in `process_file` and again in the extra date/time loops).
+    // For PatientName "Doe^John" and seed "test-seed" the patient shift is
+    // +3241 days / +517 minutes.
+    let tmp = tempdir().expect("tempdir");
+    let in_path = tmp.path().join("in.dcm");
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let mut obj = InMemDicomObject::new_empty();
+    let _ = obj.put_str(Tag(0x0010, 0x0010), VR::PN, "Doe^John");
+    let _ = obj.put_str(Tag(0x0010, 0x0020), VR::LO, "PAT123");
+    let _ = obj.put_str(Tag(0x0008, 0x0016), VR::UI, "1.2.840.10008.5.1.4.1.1.1");
+    let _ = obj.put_str(Tag(0x0008, 0x0018), VR::UI, "2.25.6667");
+    let _ = obj.put_str(Tag(0x0008, 0x0020), VR::DA, "20200101"); // StudyDate
+    let _ = obj.put_str(Tag(0x0008, 0x0030), VR::TM, "080000"); // StudyTime
+    let _ = obj.put_str(Tag(0x0008, 0x103E), VR::LO, "Follow up 20200101 done"); // SeriesDescription
+
+    let file_obj = obj.with_meta(FileMetaTableBuilder::new().transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN).media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.1").media_storage_sop_instance_uid("2.25.6667")).unwrap();
+    file_obj.write_to_file(&in_path).unwrap();
+
+    let res = anonymize_file(&in_path, &out_dir, false, false, false, Some("test-seed")).expect("anonymize");
+    let out = open_file(&res).expect("open output");
+
+    let date = out.element(Tag(0x0008, 0x0020)).unwrap().to_str().unwrap().to_string();
+    let time = out.element(Tag(0x0008, 0x0030)).unwrap().to_str().unwrap().to_string();
+    let description = out.element(Tag(0x0008, 0x103E)).unwrap().to_str().unwrap().to_string();
+
+    assert_eq!(date, "20281115", "StudyDate should be shifted exactly once");
+    assert_eq!(time, "163700", "StudyTime should be shifted exactly once");
+    assert_eq!(
+        description, "Follow up 20281115 done",
+        "dates inside preserved free text should be shifted exactly once"
+    );
+}
+
+#[test]
+fn short_patient_name_parts_do_not_erase_ordinary_words() {
+    // A two-letter name fragment such as "Ng" must only match a whole token,
+    // otherwise words like "lung"/"findings" (which contain "ng") are deleted
+    // from preserved descriptions.
+    let tmp = tempdir().expect("tempdir");
+    let in_path = tmp.path().join("in.dcm");
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let mut obj = InMemDicomObject::new_empty();
+    let _ = obj.put_str(Tag(0x0010, 0x0010), VR::PN, "Ng");
+    let _ = obj.put_str(Tag(0x0010, 0x0020), VR::LO, "PAT123");
+    let _ = obj.put_str(Tag(0x0008, 0x0016), VR::UI, "1.2.840.10008.5.1.4.1.1.1");
+    let _ = obj.put_str(Tag(0x0008, 0x0018), VR::UI, "2.25.6668");
+    let _ = obj.put_str(Tag(0x0008, 0x103E), VR::LO, "lung findings are normal");
+
+    let file_obj = obj.with_meta(FileMetaTableBuilder::new().transfer_syntax(uids::EXPLICIT_VR_LITTLE_ENDIAN).media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.1").media_storage_sop_instance_uid("2.25.6668")).unwrap();
+    file_obj.write_to_file(&in_path).unwrap();
+
+    let res = anonymize_file(&in_path, &out_dir, false, false, false, None).expect("anonymize");
+    let out = open_file(&res).expect("open output");
+    let description = out.element(Tag(0x0008, 0x103E)).unwrap().to_str().unwrap().to_string();
+    assert_eq!(description, "lung findings are normal");
+}

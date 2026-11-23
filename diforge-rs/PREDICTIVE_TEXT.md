@@ -59,9 +59,9 @@ Tradeoffs & recommendations:
 - Keep everything local by default to avoid PHI/exposure risks; if server syncing is desired, require explicit encryption and consent.
 
 Files to add or update (suggested):
-- /home/ross/penra_uploader/diforge-rs/src/ — suggestion service and background worker module.
-- /home/ross/penra_uploader/diforge-rs/src/editor_integration.rs — small adapter to call suggestion API from the editor.
-- /home/ross/penra_uploader/diforge-rs/PREDICTIVE_TEXT.md — this design summary.
+- `diforge-rs/src/` — suggestion service and background worker module.
+- `diforge-rs/src/editor_integration.rs` — small adapter to call suggestion API from the editor.
+- `diforge-rs/PREDICTIVE_TEXT.md` — this design summary.
 
 Next steps I can take:
 - Locate the editor code and open the exact integration points, then implement a prototype n-gram suggestion service and basic UI integration.
