@@ -60,7 +60,7 @@ Tags & behavior (summary)
 - UIDs (remapped): Instance Creator UID `(0008,0014)`, SOP Instance UID `(0008,0018)`, Referenced SOP `(0008,1155)`, Study/Series UIDs `(0020,000D)/(0020,000E)`, Frame of Reference UIDs, SR UIDREFs, Storage Media File-set UID `(0088,0140)`, and other UI VRs recursively.
 - Dates/times (shifted): Study/Series dates `(0008,0020..0023)`, Patient Birth Date/Time `(0010,0030)/(0010,0032)`, DT/DA inside sequences, and TM values rotated by offset.
 - Pseudonymized: `PatientName` `(0010,0010)`, `PatientID` `(0010,0020)`.
-- Cleared/removed: Accession Number `(0008,0050)`, Institution Name/Address, Referring Physician data, Study/Series descriptions, Device Serial Number, StudyID `(0020,0010)`, OtherPatientIDs/Names, demographics (Sex, Age, Size, Weight, Ethnic Group, Occupation), Protocol Name, Image Comments, RequestAttributesSequence `(0040,0275)` removed, and other tags in `clear_tags`.
+- Cleared/removed: MedicalAlerts `(0010,2000)`, PlateID `(0018,1004)`, Accession Number `(0008,0050)`, Institution Name/Address, Referring Physician data, Study/Series descriptions, Device Serial Number, StudyID `(0020,0010)`, OtherPatientIDs/Names, demographics (Sex, Age, Size, Weight, Ethnic Group, Occupation), Protocol Name, Image Comments, RequestAttributesSequence `(0040,0275)` removed, and other tags in `clear_tags`.
 - SR Content Sequence `(0040,A730)`: scrubbed (structure preserved; PHI fields cleared/remapped/shifted).
 
 Implementation notes
