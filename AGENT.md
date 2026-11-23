@@ -48,7 +48,7 @@ High-level design (Rust anonymiser)
 - Clearing rules:
   - Remove private-group tags (odd group)
   - `clear_tags` list: conservative set of free-text and demographic tags removed/cleared
-  - Blanket-clear textual VRs (UT, LT, SH, LO, PN) except whitelist for `PatientName` and `PatientID`
+  - Blanket-clear the profile's text VRs (UT, LT, ST, SH, LO, PN, UC, UR, AE) except the `keep_tags` allow-list (descriptions, protocol, manufacturer/model, coded terminology, pseudonyms)
   - For SQ elements in `clear_tags`, remove the sequence rather than writing empty strings
 - SR handling:
   - Do not remove Content Sequence `(0040,A730)` globally; instead recurse items and:
@@ -60,8 +60,10 @@ Tags & behavior (summary)
 - UIDs (remapped): Instance Creator UID `(0008,0014)`, SOP Instance UID `(0008,0018)`, Referenced SOP `(0008,1155)`, Study/Series UIDs `(0020,000D)/(0020,000E)`, Frame of Reference UIDs, SR UIDREFs, Storage Media File-set UID `(0088,0140)`, and other UI VRs recursively.
 - Dates/times (shifted): Study/Series dates `(0008,0020..0023)`, Patient Birth Date/Time `(0010,0030)/(0010,0032)`, DT/DA inside sequences, and TM values rotated by offset.
 - Pseudonymized: `PatientName` `(0010,0010)`, `PatientID` `(0010,0020)`.
-- Cleared/removed: MedicalAlerts `(0010,2000)`, PlateID `(0018,1004)`, Accession Number `(0008,0050)`, Institution Name/Address, Referring Physician data, Study/Series descriptions, Device Serial Number, StudyID `(0020,0010)`, OtherPatientIDs/Names, demographics (Sex, Age, Size, Weight, Ethnic Group, Occupation), Protocol Name, Image Comments, RequestAttributesSequence `(0040,0275)` removed, and other tags in `clear_tags`.
+- Cleared/removed: MedicalAlerts `(0010,2000)`, PlateID `(0018,1004)`, Accession Number `(0008,0050)`, Institution Name/Address/ODS sequences, Referring Physician data, Device Serial Number, StudyID `(0020,0010)`, OtherPatientIDs/Names, Patient Size/Weight/Ethnic Group/Occupation, Image Comments, RequestAttributesSequence `(0040,0275)` removed, EncapsulatedDocument/IconImageSequence removed, and other tags in `clear_tags`.
+- Retained (site allow-list): Study/Series Description, Protocol Name, Manufacturer and Model, Patient Sex/Age, and coded terminology (CodeValue/CodeMeaning/CodingSchemeDesignator/Version). Retained text is audited for ODS/NHS identifiers and blanked if one is found.
 - SR Content Sequence `(0040,A730)`: scrubbed (structure preserved; PHI fields cleared/remapped/shifted).
+- Policy source: at the start of each anonymise batch the uploader fetches `GET /api/atlas/dicom_profile` (Bearer token) and applies the exported numeric keep/clear/remove lists, text VRs and blocked groups. Offline / unauthenticated / endpoint errors fall back to the compiled `AnonymizeProfile::default()` (message `PROFILE:FALLBACK`); keep that default aligned with the site profile.
 
 Implementation notes
 - Uses `dicom-object` / `dicom-core` 0.10 (also `dicom-pixeldata` 0.10 with
