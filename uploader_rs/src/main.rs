@@ -380,11 +380,38 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                     }
                     let default_profile = AnonymizeProfile::default();
                     let anon_profile = fetched_profile.as_ref().unwrap_or(&default_profile);
+                    // Unique retained values that are not on the site's value
+                    // whitelist; the site will flag them until a reviewer
+                    // approves them. Report a summary to the UI.
+                    let unverified_seen: Arc<std::sync::Mutex<HashSet<String>>> =
+                        Arc::new(std::sync::Mutex::new(HashSet::new()));
                     dcm_files.par_iter().for_each(|p| {
                         let tx = tx.clone();
                         let processed_count = processed_count.clone();
                         let seed = seed_clone.clone();
                         let hash_records = hash_records.clone();
+                        let unverified_seen = unverified_seen.clone();
+                        let report_unverified = |obj: &dicom_object::DefaultDicomObject| {
+                            let unverified =
+                                dicor_rs::unverified_retained_values(obj, anon_profile);
+                            if unverified.is_empty() {
+                                return;
+                            }
+                            if let Ok(mut seen) = unverified_seen.lock() {
+                                for (tag, value) in unverified {
+                                    let key = format!(
+                                        "{:04X},{:04X}|{}",
+                                        tag.0, tag.1, value
+                                    );
+                                    if seen.insert(key.clone()) {
+                                        let _ = tx.send(format!(
+                                            "PROFILE:UNVERIFIED:{}",
+                                            key
+                                        ));
+                                    }
+                                }
+                            }
+                        };
                         // Open each input once, hash its pixels, then anonymize the
                         // same in-memory object. Compression is lossless, so the
                         // input digest equals the output's, and the anonymized
@@ -422,6 +449,7 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                         match anonymize_object_with_profile(obj, p, &anon_dir, true, false, false, seed.as_deref(), anon_profile) {
                             Ok((out, anon_obj)) => {
                                 let _ = tx.send(format!("Anonymized: {}", out.display()));
+                                report_unverified(&anon_obj);
                                 handle_ok(&out, &anon_obj, &tx);
                             }
                             Err(e) => {
@@ -434,6 +462,7 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                                         Ok((out, anon_obj)) => {
                                             let _ = tx.send(format!("Anonymized with burned-in flag: {}", out.display()));
                                             let _ = tx.send("Detected Burned In Annotation=YES. This series will require confirmation before upload.".to_string());
+                                            report_unverified(&anon_obj);
                                             handle_ok(&out, &anon_obj, &tx);
                                         }
                                         Err(e2) => {
@@ -457,6 +486,15 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                             let _ = tx.send(format!("PROC:PROG:{}", prog));
                         }
                     });
+
+                    if let Ok(seen) = unverified_seen.lock() {
+                        if !seen.is_empty() {
+                            let _ = tx.send(format!(
+                                "PROFILE:UNVERIFIED_COUNT:{}",
+                                seen.len()
+                            ));
+                        }
+                    }
 
                     // ── Defacing pass ─────────────────────────────────────
                     // Runs after anonymisation because it needs whole series
@@ -1345,6 +1383,23 @@ impl AppState {
                 }
                 return;
             }
+        }
+        if let Some(count) = m
+            .strip_prefix("PROFILE:UNVERIFIED_COUNT:")
+            .and_then(|value| value.parse::<usize>().ok())
+        {
+            if count > 0 {
+                self.last_msg = format!(
+                    "{} descriptive value(s) need review on the site",
+                    count
+                );
+                self.add_toast(self.last_msg.clone(), 8000);
+            }
+            return;
+        }
+        if m.starts_with("PROFILE:UNVERIFIED:") {
+            upload::log_rpc_debug(m);
+            return;
         }
         if m == "DUPCHECK:START" {
             self.duplicate_refresh_in_progress = true;

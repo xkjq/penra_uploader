@@ -60,3 +60,29 @@ fn profile_overrides_keep_clear_and_remove() {
     // Explicit remove tag is gone.
     assert!(out.element(Tag(0x0042, 0x0011)).is_err());
 }
+
+#[test]
+fn reports_retained_values_that_are_not_whitelisted() {
+    let mut obj = InMemDicomObject::new_empty();
+    let _ = obj.put_str(Tag(0x0008, 0x1030), VR::LO, "CT Head");
+    let _ = obj.put_str(Tag(0x0008, 0x103E), VR::LO, "CT Abdomen");
+    let _ = obj.put_str(Tag(0x0008, 0x0070), VR::LO, "Acme");
+
+    let mut profile = AnonymizeProfile::default();
+    profile.keep_tags = vec![
+        Tag(0x0008, 0x1030),
+        Tag(0x0008, 0x103E),
+        Tag(0x0008, 0x0070),
+    ];
+    profile.allowed_values = vec![
+        (Tag(0x0008, 0x103E), "ct abdomen".to_string()),
+        (Tag(0x0008, 0x0070), "ACME".to_string()),
+    ];
+
+    let unverified = dicor_rs::unverified_retained_values(&obj, &profile);
+
+    assert_eq!(
+        unverified,
+        vec![(Tag(0x0008, 0x1030), "CT Head".to_string())]
+    );
+}

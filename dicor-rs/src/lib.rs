@@ -604,6 +604,10 @@ pub struct AnonymizeProfile {
     pub remove_groups: Vec<(u16, u16)>,
     /// Remove private tags unless the caller asked to preserve them.
     pub remove_private: bool,
+    /// Exact retained values approved by the platform (tag, value). Values in
+    /// `keep_tags` that are not listed here are reported by
+    /// [`unverified_retained_values`] for local review.
+    pub allowed_values: Vec<(Tag, String)>,
 }
 
 impl Default for AnonymizeProfile {
@@ -642,8 +646,64 @@ impl Default for AnonymizeProfile {
             text_vrs: vec![VR::UT, VR::LT, VR::ST, VR::SH, VR::LO, VR::PN, VR::UC, VR::UR, VR::AE],
             remove_groups: vec![(0x6000, 0x60FF), (0x0070, 0x0070)],
             remove_private: true,
+            allowed_values: Vec::new(),
         }
     }
+}
+
+fn normalise_retained_value(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+fn walk_unverified_retained<D: dicom_core::DataDictionary + Clone>(
+    dataset: &dicom_object::InMemDicomObject<D>,
+    profile: &AnonymizeProfile,
+    out: &mut Vec<(Tag, String)>,
+) {
+    for element in dataset.iter() {
+        if let Some(items) = element.value().items() {
+            for item in items {
+                walk_unverified_retained(item, profile, out);
+            }
+            continue;
+        }
+        let tag = element.tag();
+        if !profile.keep_tags.contains(&tag) {
+            continue;
+        }
+        let Ok(text) = element.to_str() else {
+            continue;
+        };
+        let normalised = normalise_retained_value(&text);
+        if normalised.is_empty() {
+            continue;
+        }
+        let allowed = profile
+            .allowed_values
+            .iter()
+            .any(|(allowed_tag, value)| {
+                *allowed_tag == tag && normalise_retained_value(value) == normalised
+            });
+        if !allowed {
+            out.push((tag, text.trim().to_string()));
+        }
+    }
+}
+
+/// Retained descriptive values that are not on the profile's value whitelist.
+///
+/// The site keeps these values but flags the record; the uploader reports them
+/// so the operator knows review will be required. Returns unique (tag, value)
+/// pairs in tag order.
+pub fn unverified_retained_values<D: dicom_core::DataDictionary + Clone>(
+    dataset: &dicom_object::InMemDicomObject<D>,
+    profile: &AnonymizeProfile,
+) -> Vec<(Tag, String)> {
+    let mut out = Vec::new();
+    walk_unverified_retained(dataset, profile, &mut out);
+    out.sort_by_key(|(tag, _)| (tag.0, tag.1));
+    out.dedup();
+    out
 }
 
 pub fn anonymize_file(input: &Path, output_dir: &Path, remove_original: bool, preserve_private: bool, permit_burned_in: bool, seed: Option<&str>) -> Result<PathBuf, String> {
