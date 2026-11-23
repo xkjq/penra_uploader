@@ -1725,13 +1725,16 @@ impl DicomViewApp {
             deface_preview_on: true,
             deface_seg_region: diface_rs::MaskRegion::Face,
             deface_cut_reference: diface_rs::CutReference::BrainFront,
-            deface_include_orbits: false,
-            deface_include_ears: false,
+            deface_include_orbits: true,
+            deface_include_ears: true,
             deface_include_zygoma: false,
             deface_vertex_strip: true,
             deface_brain_protect_mm: 2.0,
-            deface_deflesh_posterior_mm: 0.0,
-            deface_deflesh_smooth_mm: 3.0,
+            // Match the uploader's anonymisation defaults so the viewer preview
+            // shows what an upload will get: all external tissue removed and a
+            // hard deflesh edge (a feather keeps original signal).
+            deface_deflesh_posterior_mm: f64::INFINITY,
+            deface_deflesh_smooth_mm: 0.0,
             deface_preview: None,
             deface_edits: ManualEdits::default(),
             deface_brush_on: false,
@@ -2309,7 +2312,9 @@ impl DicomViewApp {
         //  - Depth (`anterior_offset_mm`) reduces the safety margin in front of
         //    the brain (positive == removes more face).
         //  - Preset/preserve fraction widens the margin (more brain-safe).
-        let margin = (12.0 - p.anterior_offset_mm - (p.preserve_fraction - 0.82) * 40.0)
+        // Base 10 mm matches `SegBackendParams::default()` (what the uploader
+        // uses), so the default preview cuts where an upload will.
+        let margin = (10.0 - p.anterior_offset_mm - (p.preserve_fraction - 0.82) * 40.0)
             .clamp(0.0, 40.0);
         diface_rs::SegBackendParams {
             region: self.deface_seg_region,
@@ -2349,9 +2354,12 @@ impl DicomViewApp {
     ///
     /// For the segmentation backend, a cached [`diface_rs::Segmentation`] is
     /// reused when possible: only the cut plane depends on the live settings, so
-    /// dragging a slider must not re-run the (expensive) segmentation.
+    /// dragging a slider must not re-run the (expensive) segmentation. `key`
+    /// must identify the base series (its UID): the segmentation depends on the
+    /// pixels, not just the matrix size and modality.
     fn mask_for_geometry(
         &mut self,
+        key: &str,
         geom: &DefaceGeometry,
     ) -> Result<diface_rs::volume::Mask, String> {
         match self.deface_backend {
@@ -2362,11 +2370,7 @@ impl DicomViewApp {
             .compute_mask(&geom.volume)?),
             DefaceBackendSel::Segmentation => {
                 let params = self.seg_backend_params();
-                let key = format!(
-                    "{}x{}x{}:{}",
-                    geom.volume.dims[0], geom.volume.dims[1], geom.volume.dims[2], geom.volume.modality
-                );
-                let seg = self.segmentation_for(&geom.volume, &key)?;
+                let seg = self.segmentation_for(&geom.volume, key)?;
                 Ok(diface_rs::SegmentationBackend::new(params)
                     .compute_mask_from_segmentation(&geom.volume, &seg)?)
             }
@@ -2650,7 +2654,7 @@ impl DicomViewApp {
             return;
         };
         let computed = self.deface_volume_for(&group).and_then(|geom| {
-            let mut mask = self.mask_for_geometry(&geom)?;
+            let mut mask = self.mask_for_geometry(&group.uid, &geom)?;
             let edits = self.deface_edits.for_series(&group.uid);
             Self::apply_manual_edits(&mut mask, edits);
             Ok((geom, mask))
@@ -2684,14 +2688,7 @@ impl DicomViewApp {
                 // cached segmentation when available so the Areas overlay does
                 // not segment the volume a second time.
                 let (volume_labels, per_image_labels) = if self.deface_show_segmentation {
-                    let key = format!(
-                        "{}x{}x{}:{}",
-                        geom.volume.dims[0],
-                        geom.volume.dims[1],
-                        geom.volume.dims[2],
-                        geom.volume.modality
-                    );
-                    match self.segmentation_for(&geom.volume, &key) {
+                    match self.segmentation_for(&geom.volume, &group.uid) {
                         Ok(seg) => {
                             let mut vl = vec![0u8; n * nz];
                             let mut pil: HashMap<usize, Vec<u8>> = HashMap::new();
@@ -2808,9 +2805,10 @@ impl DicomViewApp {
 
     /// Deface the active stack in memory and show the result next to it.
     ///
-    /// Synchronous variant, used by tests. The toolbar uses
+    /// Synchronous variant, used by tests. The toolbar and Re-apply button use
     /// `start_deface_active_series` to run the same work on a worker thread with a
     /// progress indicator.
+    #[cfg(test)]
     fn deface_active_series(&mut self, ctx: &egui::Context) {
         self.deface_message = None;
         let task = match self.prepare_deface_task() {
@@ -2859,10 +2857,9 @@ impl DicomViewApp {
             .ok_or_else(|| "No active series to deface".to_string())?;
         let geom = self.deface_volume_for(&group)?;
         let params = self.seg_backend_params();
-        let seg_key = format!(
-            "{}x{}x{}:{}",
-            geom.volume.dims[0], geom.volume.dims[1], geom.volume.dims[2], geom.volume.modality
-        );
+        // Key the cached segmentation by the base series UID: two series can
+        // share a matrix and modality but have different pixels.
+        let seg_key = group.uid.clone();
         let seg = self
             .deface_seg_cache
             .as_ref()
@@ -3441,13 +3438,13 @@ impl DicomViewApp {
                     if ui.button("↺ Auto").on_hover_text("Reset defacing settings to automatic").clicked() {
                         self.deface_params = GeometricParams::default();
                         self.deface_cut_reference = diface_rs::CutReference::BrainFront;
-                        self.deface_include_orbits = false;
-                        self.deface_include_ears = false;
+                        self.deface_include_orbits = true;
+                        self.deface_include_ears = true;
                         self.deface_include_zygoma = false;
                         self.deface_vertex_strip = true;
                         self.deface_brain_protect_mm = 2.0;
-                        self.deface_deflesh_posterior_mm = 0.0;
-                        self.deface_deflesh_smooth_mm = 3.0;
+                        self.deface_deflesh_posterior_mm = f64::INFINITY;
+                        self.deface_deflesh_smooth_mm = 0.0;
                         self.request_deface_preview(ui.ctx());
                     }
                     if ui
@@ -3470,11 +3467,16 @@ impl DicomViewApp {
                         self.redraw_all_viewports(ui.ctx());
                     }
                     if ui
-                        .button("✓ Re-apply")
+                        .add_enabled(
+                            self.deface_job.is_none(),
+                            egui::Button::new("✓ Re-apply"),
+                        )
                         .on_hover_text("Rebuild the defaced copy with these settings")
                         .clicked()
                     {
-                        self.deface_active_series(ui.ctx());
+                        // Use the worker like the toolbar button so re-applying
+                        // after a slider/brush change does not freeze the UI.
+                        self.start_deface_active_series(ui.ctx());
                     }
                 });
 
@@ -7806,7 +7808,7 @@ mod tests {
     fn active_deface_mask(app: &mut DicomViewApp) -> diface_rs::volume::Mask {
         let group = app.series_groups[0].clone();
         let geom = app.deface_volume_for(&group).expect("geometry");
-        let mut mask = app.mask_for_geometry(&geom).expect("mask");
+        let mut mask = app.mask_for_geometry(&group.uid, &geom).expect("mask");
         let edits = app.deface_edits.for_series(&group.uid);
         DicomViewApp::apply_manual_edits(&mut mask, edits);
         mask
@@ -7823,6 +7825,10 @@ mod tests {
         let _ = active_deface_mask(&mut app);
         let vol_key = app.deface_volume_cache.as_ref().unwrap().0.clone();
         let seg_key = app.deface_seg_cache.as_ref().unwrap().0.clone();
+        assert_eq!(
+            seg_key, app.series_groups[0].uid,
+            "the segmentation cache must be keyed by the base series UID"
+        );
 
         // Changing a setting reuses them (keys unchanged, no rebuild).
         app.deface_brain_protect_mm = 6.0;
@@ -8388,6 +8394,19 @@ mod tests {
             app.deface_backend,
             DefaceBackendSel::Segmentation,
             "segmentation should be the default defacing backend"
+        );
+        // These must match the uploader's DefaceConfig::default() so the viewer
+        // preview shows what an upload will get.
+        assert!(app.deface_include_orbits);
+        assert!(app.deface_include_ears);
+        assert!(!app.deface_include_zygoma);
+        assert!(app.deface_vertex_strip);
+        assert!(app.deface_deflesh_posterior_mm.is_infinite());
+        assert_eq!(app.deface_deflesh_smooth_mm, 0.0);
+        assert_eq!(
+            app.seg_backend_params().brain_margin_mm,
+            10.0,
+            "the default cut margin must match SegBackendParams::default()"
         );
     }
 

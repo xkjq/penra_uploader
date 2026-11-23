@@ -22,27 +22,45 @@ fn make_minimal_dcm(path: &std::path::Path, sop_instance: &str, patient: &str) {
 
 #[test]
 fn deface_config_maps_to_backend_options() {
-    // Default: disabled, geometric, defacing in place.
+    // Default: disabled, segmentation, anonymisation defaults (orbits/ears and
+    // vertex strip on, deflesh-all, hard deflesh edge), defacing in place.
     let cfg = DefaceConfig::default();
     assert!(!cfg.enabled);
+    assert_eq!(cfg.backend, DefaceBackendChoice::Segmentation);
+    assert!(cfg.include_orbits);
+    assert!(cfg.include_ears);
+    assert!(!cfg.include_zygoma);
+    assert!(cfg.vertex_strip);
+    assert!(cfg.deflesh_all);
+    assert_eq!(cfg.deflesh_smooth_mm, 0.0);
     let opts = cfg.to_options();
-    assert!(matches!(opts.backend, diface_rs::BackendKind::Geometric(_)));
+    assert!(matches!(opts.backend, diface_rs::BackendKind::Segmentation(_)));
     assert!(!opts.subdir_by_series, "defacing must overwrite in place");
     assert!(!opts.remove_original);
     assert_eq!(opts.min_slices, 3);
 
-    // Segmentation carries the region and the safety band.
+    // Segmentation carries the region, the safety band and every flag.
     let cfg = DefaceConfig {
         enabled: true,
         backend: DefaceBackendChoice::Segmentation,
         region: diface_rs::MaskRegion::ExternalSoftTissue,
+        include_orbits: true,
+        include_ears: false,
+        include_zygoma: true,
+        vertex_strip: false,
         brain_protect_mm: 7.5,
+        deflesh_all: false,
         deflesh_smooth_mm: 5.0,
     };
     match cfg.to_options().backend {
         diface_rs::BackendKind::Segmentation(p) => {
             assert_eq!(p.region, diface_rs::MaskRegion::ExternalSoftTissue);
+            assert!(p.include_orbits);
+            assert!(!p.include_ears);
+            assert!(p.include_zygoma);
+            assert!(!p.vertex_strip);
             assert!((p.brain_protect_mm - 7.5).abs() < 1e-9);
+            assert_eq!(p.deflesh_posterior_mm, 0.0);
             assert!((p.deflesh_smooth_mm - 5.0).abs() < 1e-9);
         }
         _ => panic!("expected a segmentation backend"),
@@ -173,4 +191,71 @@ fn test_multiple_files_and_repeated_exports() {
     }
 
     assert!(anon_count >= 4, "expected at least 4 anonymized events, got {}", anon_count);
+}
+
+#[test]
+fn undefaced_files_are_moved_out_of_the_upload_directory() {
+    let tmp = tempdir().expect("tempdir");
+    let anon = tmp.path().join("anon");
+    std::fs::create_dir_all(anon.join("nested")).unwrap();
+    let kept = anon.join("keep.dcm");
+    let skipped = anon.join("skip.dcm");
+    let nested = anon.join("nested").join("skip2.dcm");
+    std::fs::write(&kept, b"keep").unwrap();
+    std::fs::write(&skipped, b"skip").unwrap();
+    std::fs::write(&nested, b"skip2").unwrap();
+
+    let (dir, moved, errors) =
+        quarantine_undefaced_files(&anon, &[skipped.clone(), nested.clone()]);
+
+    assert!(errors.is_empty(), "unexpected quarantine errors: {errors:?}");
+    assert_eq!(moved, 2);
+    assert!(kept.exists(), "defaced files must stay in the upload directory");
+    assert!(!skipped.exists(), "skipped file must leave the upload directory");
+    assert!(!nested.exists(), "skipped nested file must leave the upload directory");
+    let quarantined = dir.join("skip.dcm");
+    assert!(quarantined.exists(), "skipped file moved to quarantine");
+    assert!(dir.join("nested").join("skip2.dcm").exists());
+    let manifest = std::fs::read_to_string(dir.join("skipped.txt")).unwrap();
+    assert!(manifest.contains("skip.dcm"));
+    assert!(manifest.contains("skip2.dcm"));
+}
+
+#[test]
+fn descriptive_review_requires_explicit_confirmation_per_series() {
+    let mk = |uid: &str, flagged: bool| SeriesInfo {
+        series_uid: uid.to_string(),
+        files: vec![],
+        duplicate_series_urls: vec![],
+        study_uid: None,
+        loaded_order: 0,
+        duplicate_checked_files: 0,
+        patient_name: None,
+        examination: None,
+        patient_id: None,
+        study_date: None,
+        modality: None,
+        series_description: None,
+        series_number: None,
+        protocol_name: None,
+        manufacturer_model_name: None,
+        file_count: 0,
+        total_bytes: 0,
+        burned_in_annotation_detected: false,
+        descriptive_review_required: flagged,
+    };
+    let mut app = AppState::default();
+    app.ready_series = vec![mk("S1", true), mk("S2", false)];
+    assert_eq!(
+        app.unconfirmed_descriptive_series(),
+        vec!["S1".to_string()]
+    );
+
+    app.descriptive_series_confirmed.insert("S1".to_string());
+    assert!(app.unconfirmed_descriptive_series().is_empty());
+
+    // A series that is no longer flagged loses its stale approval.
+    app.ready_series[0].descriptive_review_required = false;
+    app.sync_descriptive_confirmations();
+    assert!(app.descriptive_series_confirmed.is_empty());
 }

@@ -234,6 +234,10 @@ fn deface_dir_in_place_overwrites_files_preserving_names() {
     let report = deface_dir_in_place(&input, &DefaceOptions::default()).unwrap();
     assert_eq!(report.series.len(), 1);
     assert!(report.series[0].removed_voxels > 0);
+    assert!(
+        report.skipped_files.is_empty(),
+        "every file was defaced, so none should be reported as skipped"
+    );
 
     // Same files still exist (names preserved).
     let after: Vec<PathBuf> = collect_dicom_files(&input, false).unwrap();
@@ -308,4 +312,90 @@ fn mixed_orientation_series_uses_largest_consistent_group() {
     let backend = GeometricBackend::new(GeometricParams::default());
     let mask = backend.compute_mask(&volume).unwrap();
     assert!(mask.count_removed() > 0);
+}
+
+#[test]
+fn in_place_reports_files_from_the_non_largest_orientation_group() {
+    use diface_rs::{deface_dir_in_place, DefaceOptions};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("in");
+    std::fs::create_dir_all(&input).unwrap();
+    let series_uid = "1.2.826.0.1.3680043.10.99.52";
+    let study_uid = "1.2.826.0.1.3680043.10.99.50";
+    let spacing = 2.0f64;
+
+    for z in 0..10u16 {
+        write_slice_oriented(
+            &input,
+            series_uid,
+            study_uid,
+            z + 1,
+            z as f64 * spacing - 10.0,
+            spacing,
+            32,
+            32,
+            "1\\0\\0\\0\\1\\0",
+        );
+    }
+    let mut odd = Vec::new();
+    for i in 0..2u16 {
+        odd.push(write_slice_oriented(
+            &input,
+            series_uid,
+            study_uid,
+            100 + i,
+            0.0,
+            spacing,
+            32,
+            32,
+            "1\\0\\0\\0\\0\\1",
+        ));
+    }
+
+    let report = deface_dir_in_place(&input, &DefaceOptions::default()).unwrap();
+    assert_eq!(report.series.len(), 1);
+    let mut skipped = report.skipped_files.clone();
+    skipped.sort();
+    odd.sort();
+    assert_eq!(
+        skipped, odd,
+        "the non-largest orientation group must be reported as skipped"
+    );
+}
+
+#[test]
+fn in_place_reports_a_series_below_min_slices() {
+    use diface_rs::{deface_dir_in_place, DefaceOptions};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("in");
+    std::fs::create_dir_all(&input).unwrap();
+    let series_uid = "1.2.826.0.1.3680043.10.99.62";
+    let study_uid = "1.2.826.0.1.3680043.10.99.60";
+    let spacing = 2.0f64;
+
+    let mut files = Vec::new();
+    for z in 0..2u16 {
+        files.push(write_slice(
+            &input,
+            series_uid,
+            study_uid,
+            z + 1,
+            z as f64 * spacing,
+            spacing,
+            32,
+            32,
+        ));
+    }
+
+    let report = deface_dir_in_place(&input, &DefaceOptions::default()).unwrap();
+    assert!(report.series.is_empty(), "a 2-slice series is not defaced");
+    let mut skipped = report.skipped_files.clone();
+    skipped.sort();
+    files.sort();
+    assert_eq!(
+        skipped, files,
+        "every slice of a skipped series must be reported"
+    );
 }

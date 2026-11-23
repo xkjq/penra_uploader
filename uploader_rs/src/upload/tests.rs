@@ -309,4 +309,51 @@ fn test_upload_chunk_parses_response() {
     assert!(!out.saw_timeout);
 }
 
+#[test]
+fn descriptive_review_ignores_manufacturer_model_alone() {
+    let td = tempdir().unwrap();
+    let path = td.path().join("model.dcm");
+
+    let write = |series_description: Option<&str>| {
+        let mut obj = InMemDicomObject::new_empty();
+        let _ = obj.put_str(Tag(0x0008, 0x0016), VR::UI, "1.2.840.10008.5.1.4.1.1.1");
+        let _ = obj.put_str(Tag(0x0008, 0x0018), VR::UI, "2.25.8888");
+        let _ = obj.put_str(Tag(0x0010, 0x0010), VR::PN, "ANON-test");
+        let _ = obj.put_str(Tag(0x0020, 0x000E), VR::UI, "1.2.3.4.5");
+        let _ = obj.put_str(Tag(0x0008, 0x1090), VR::LO, "Ingenia Ambition X");
+        if let Some(desc) = series_description {
+            let _ = obj.put_str(Tag(0x0008, 0x103E), VR::LO, desc);
+        }
+        let file_obj = obj
+            .with_meta(
+                FileMetaTableBuilder::new()
+                    .transfer_syntax(EXPLICIT_VR_LE_UID)
+                    .media_storage_sop_class_uid("1.2.840.10008.5.1.4.1.1.1")
+                    .media_storage_sop_instance_uid("2.25.8888"),
+            )
+            .expect("with_meta");
+        file_obj.write_to_file(&path).expect("write dcm");
+    };
+
+    write(None);
+    let obj = dicom_object::open_file(&path).expect("open dcm");
+    let info = build_ready_info(&path, &obj, String::new(), 0);
+    assert_eq!(
+        info.manufacturer_model_name.as_deref(),
+        Some("Ingenia Ambition X")
+    );
+    assert!(
+        !info.descriptive_review_required,
+        "a scanner model alone must not require descriptive approval"
+    );
+
+    write(Some("T1W_TSE"));
+    let obj = dicom_object::open_file(&path).expect("open dcm");
+    let info = build_ready_info(&path, &obj, String::new(), 0);
+    assert!(
+        info.descriptive_review_required,
+        "a preserved series description still requires approval"
+    );
+}
+
 

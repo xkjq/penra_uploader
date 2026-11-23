@@ -207,6 +207,18 @@ fn evict_ready_meta(path: &Path) {
     }
 }
 
+/// Whether preserved free text should be reviewed before upload.
+///
+/// `ManufacturerModelName` is deliberately excluded: it names the scanner model,
+/// not a person, and including it would flag effectively every series (and train
+/// users to approve without reading).
+fn needs_descriptive_review(fields: [Option<&str>; 3]) -> bool {
+    fields
+        .into_iter()
+        .flatten()
+        .any(|s| !s.trim().is_empty())
+}
+
 fn build_ready_info(
     path: &Path,
     obj: &dicom_object::DefaultDicomObject,
@@ -223,15 +235,11 @@ fn build_ready_info(
     let series_description = read_dicom_string(obj, Tag(0x0008, 0x103E));
     let protocol_name = read_dicom_string(obj, Tag(0x0018, 0x1030));
     let manufacturer_model_name = read_dicom_string(obj, Tag(0x0008, 0x1090));
-    let descriptive_review_required = [
-        examination.as_ref(),
-        series_description.as_ref(),
-        protocol_name.as_ref(),
-        manufacturer_model_name.as_ref(),
-    ]
-    .iter()
-    .flatten()
-    .any(|s| !s.trim().is_empty());
+    let descriptive_review_required = needs_descriptive_review([
+        examination.as_deref(),
+        series_description.as_deref(),
+        protocol_name.as_deref(),
+    ]);
     ReadyFileInfo {
         path: path.to_path_buf(),
         hash,
@@ -1756,15 +1764,11 @@ pub fn scan_for_upload(anon_dir: &Path, tx: Option<std::sync::mpsc::Sender<Strin
                 series_number = obj.element(Tag(0x0020,0x0011)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
                 protocol_name = obj.element(Tag(0x0018,0x1030)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
                 manufacturer_model_name = obj.element(Tag(0x0008,0x1090)).ok().and_then(|e| e.to_str().ok()).map(|s| s.to_string());
-                descriptive_review_required = [
-                    examination.as_ref(),
-                    series_description.as_ref(),
-                    protocol_name.as_ref(),
-                    manufacturer_model_name.as_ref(),
-                ]
-                .iter()
-                .flatten()
-                .any(|s| !s.trim().is_empty());
+                descriptive_review_required = needs_descriptive_review([
+                    examination.as_deref(),
+                    series_description.as_deref(),
+                    protocol_name.as_deref(),
+                ]);
             }
         }
 

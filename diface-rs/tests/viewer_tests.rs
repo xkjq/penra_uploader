@@ -64,6 +64,7 @@ fn collect_output_files_filters_and_dedups() {
             },
         ],
         warnings: Vec::new(),
+        ..DefaceReport::default()
     };
 
     let files = collect_output_files(&report);

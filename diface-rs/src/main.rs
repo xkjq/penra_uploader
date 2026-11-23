@@ -363,6 +363,16 @@ fn run() -> Result<(), String> {
         );
     }
 
+    if !report.skipped_files.is_empty() {
+        eprintln!(
+            "warning: {} file(s) were not defaced; exclude them from any upload:",
+            report.skipped_files.len()
+        );
+        for f in &report.skipped_files {
+            eprintln!("  {}", f.display());
+        }
+    }
+
     if view {
         if opts.dry_run {
             eprintln!("warning: --view has no output to show in --dry-run mode");

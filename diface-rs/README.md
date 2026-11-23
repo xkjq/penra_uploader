@@ -74,6 +74,7 @@ Run `diface --help` for all options:
 | `--seg-region` | Segmentation region: `face`, `deflesh` | `face` |
 | `--include-orbits` | Segmentation (face): also remove the orbital contents (eyes) | off |
 | `--include-ears` | Segmentation (face): also remove the ears | off |
+| `--include-zygoma` | Segmentation (face): also remove the zygoma (cheekbone/arch) and lateral skull base | off |
 | `--no-vertex-strip` | Segmentation (face): keep the skull cap above the ears (default strips to the vertex) | off |
 | `--brain-protect` | Segmentation: safety band (mm) kept around the intracranial core (`0` = none) | `2` |
 | `--deflesh-smooth` | Deflesh: feather the removal boundary by mm (`0` = hard cut; recommended for anonymisation) | `0` |
@@ -219,17 +220,20 @@ omits it). `Atlas::to_bytes`/`from_bytes` read/write the format, and the viewer'
      survive and only the face/scalp is stripped. Set `deflesh_posterior_mm` to
      `f64::INFINITY` (CLI `--deflesh-posterior all`) to remove all external
      tissue. For the strongest in-house anonymisation also set
-     `brain_protect_mm = 0` (keep the cavity ∪ vault exactly, no scalp shell) and
-     `deflesh_smooth_mm = 0` (hard cut). Measured on case 546 CT: 1.9% for
-     `Face`, 16.7% for Deflesh-all with a 2 mm band, 19.5% with no band — **0
-     brain and 0 vault voxels removed** in all cases.
+     `brain_protect_mm = 0` (keep the cavity ∪ vault plus a one-cell guard around
+     the brain/cavity, no scalp shell) and `deflesh_smooth_mm = 0` (hard cut).
+     The one-cell guard is always applied: a small margin that rounds to zero on
+     a thick-slice axis still cannot expose the brain. Measured on case 546 CT:
+     1.9% for `Face`, 16.7% for Deflesh-all with a 2 mm band, 19.5% with no band
+     (before the one-cell guard) — **0 brain and 0 vault voxels removed** in all
+     cases.
 
    `SegBackendParams::brain_margin_mm` widens the margin in front of the cut
    reference; `vault_shell_radius` sets the vault shell thickness (coarse voxels);
    `deflesh_posterior_mm` gates deflesh's posterior extent (keeps the neck);
-   `deflesh_smooth_mm` (default `3` in the library/viewer, CLI default `0`)
-   **feathers** the
-   removal boundary: removed voxels within that distance of the keep edge are
+   `deflesh_smooth_mm` (default `3` in the library; CLI, viewer and uploader
+   default `0`) **feathers** the removal boundary: removed voxels within that
+   distance of the keep edge are
    blended toward the fill by a weight that ramps 0 → 1, so the defleshed surface
    fades smoothly instead of ending in a hard wall. Note the weight is **0 at the
    keep edge**, so boundary voxels keep their original values; use `0` (hard cut)
@@ -289,12 +293,14 @@ backend reads**:
 
 - **Geometric** – Preset, Algorithm, Yaw°, Depth mm, Extent A/L/S, Preserve,
 - The viewer's default defacing backend is **Segmentation**; the uploader also
-  defaults to Segmentation.
+  defaults to Segmentation, with the same anonymisation options (orbits/ears on,
+  vertex strip on, deflesh-all, hard deflesh edge), so the preview matches an
+  upload by default. The standalone CLI stays conservative (orbits/ears off).
 - **Segmentation** – Preset, Depth mm, Preserve, plus Region / Cut at /
-  **Include orbits** / **Include ears** / **Strip vertex bone** / Safety band
-  (below); Yaw/Extent and the Algorithm dropdown are hidden because that backend
-  ignores them. Deflesh also exposes **Remove all external tissue** and a boundary-feather
-  width (use `0` for a hard cut).
+  **Include orbits** / **Include ears** / **Remove zygoma** / **Strip vertex
+  bone** / Safety band (below); Yaw/Extent and the Algorithm dropdown are hidden
+  because that backend ignores them. Deflesh also exposes **Remove all external
+  tissue** and a boundary-feather width (use `0` for a hard cut).
 - **Atlas** – no manual parameters (it uses its own registration); only
   **Load atlas…** and the template dimensions appear.
 
@@ -310,7 +316,7 @@ Common controls:
   series with the current settings,
 - The **🙈 Deface** button opens this Align panel automatically and runs the
   segmentation/mask work on a worker thread with a spinner and elapsed time, so
-  the window stays responsive.
+  the window stays responsive. **✓ Re-apply** uses the same worker path.
 - **👁 Preview** is **on by default** and shows a live **red overlay** on the base
   series giving exactly which voxels would be removed, in both **Stack and MPR**
   views. It updates as the orientation/depth/extent sliders (and presets) change,
@@ -451,13 +457,14 @@ options.
   reformats, localisers saved under the same series) are split into
   orientation-consistent groups and the **largest group** is defaced; the rest
   are left as-is.
-- **Fail-closed coverage is not implemented yet (TODO).** Anything that cannot be
-  defaced is currently reported as a warning and left with its original pixels:
-  scouts/topograms and other small series below `--min-slices`, multi-frame
-  series, secondary-capture/photographic DICOM, SEG/RTSTRUCT objects, and the
-  non-largest orientation group. Callers must exclude those files from upload
-  until fail-closed handling is added; the uploader currently treats the
-  warnings as non-fatal.
+- **Skipped files are reported.** `DefaceReport::skipped_files` lists every
+  input file that was not defaced: series below `--min-slices` (scouts/topograms,
+  secondary-capture/photographic DICOM, SEG/RTSTRUCT objects), multi-frame or
+  other load failures, the non-largest orientation group, and partially written
+  series. **Callers must exclude these files from upload** when fail-closed
+  behaviour is required. The uploader does this automatically: it moves them to
+  `<root>/defacing_failed` (with a `skipped.txt` manifest) before scanning for
+  upload, and quarantines every anonymised file if the deface pass itself errors.
 - Output pixel data is re-encoded **uncompressed** Explicit VR Little Endian.
   Run `dicor-rs` afterwards to compress (e.g. JPEG-LS) and to anonymise
   metadata.

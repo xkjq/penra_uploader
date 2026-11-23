@@ -132,6 +132,22 @@ pub struct DefaceReport {
     pub series: Vec<SeriesReport>,
     /// Non-fatal problems (skipped files/series, etc.).
     pub warnings: Vec<String>,
+    /// Input files that were **not** defaced: series below `min_slices`, series
+    /// that failed to load or mask, slices dropped from a mixed-orientation
+    /// series, and series whose output could not be written.
+    ///
+    /// This exists so a fail-closed pipeline can exclude exactly these files
+    /// from upload instead of letting undefaced pixels through. Empty when every
+    /// discovered file was processed.
+    pub skipped_files: Vec<PathBuf>,
+}
+
+impl DefaceReport {
+    /// Record the files of a series that was not defaced. Duplicates are removed
+    /// before the report is returned.
+    fn note_skipped(&mut self, files: impl IntoIterator<Item = PathBuf>) {
+        self.skipped_files.extend(files);
+    }
 }
 
 /// Compute a removal mask for a volume with the given backend.
@@ -161,6 +177,7 @@ pub fn deface(input: &Path, output: &Path, opts: &DefaceOptions) -> Result<Defac
                 group.files.len(),
                 opts.min_slices
             ));
+            report.note_skipped(group.files.iter().cloned());
             continue;
         }
 
@@ -168,14 +185,27 @@ pub fn deface(input: &Path, output: &Path, opts: &DefaceOptions) -> Result<Defac
             Ok(v) => v,
             Err(e) => {
                 report.warnings.push(format!("series {}: {}", group.uid, e));
+                report.note_skipped(group.files.iter().cloned());
                 continue;
             }
         };
+        // `load_series` defaces only the largest orientation-consistent group;
+        // every file outside it was left untouched.
+        let used: std::collections::HashSet<&Path> =
+            entries.iter().map(|e| e.path.as_path()).collect();
+        report.note_skipped(
+            group
+                .files
+                .iter()
+                .filter(|f| !used.contains(f.as_path()))
+                .cloned(),
+        );
 
         let mask = match backend.compute_mask(&volume) {
             Ok(m) => m,
             Err(e) => {
                 report.warnings.push(format!("series {}: {}", group.uid, e));
+                report.note_skipped(entries.iter().map(|e| e.path.clone()));
                 continue;
             }
         };
@@ -205,6 +235,7 @@ pub fn deface(input: &Path, output: &Path, opts: &DefaceOptions) -> Result<Defac
                             n,
                             entries.len()
                         ));
+                        report.note_skipped(entries.iter().map(|e| e.path.clone()));
                     }
                     if opts.remove_original {
                         for e in &entries {
@@ -215,6 +246,7 @@ pub fn deface(input: &Path, output: &Path, opts: &DefaceOptions) -> Result<Defac
                 }
                 Err(e) => {
                     report.warnings.push(format!("series {}: {}", group.uid, e));
+                    report.note_skipped(entries.iter().map(|e| e.path.clone()));
                     None
                 }
             }
@@ -233,6 +265,9 @@ pub fn deface(input: &Path, output: &Path, opts: &DefaceOptions) -> Result<Defac
         });
     }
 
+    report.skipped_files.sort();
+    report.skipped_files.dedup();
+
     if report.series.is_empty() && report.warnings.is_empty() {
         return Err("no processable series found".to_string());
     }
@@ -247,7 +282,9 @@ pub fn deface(input: &Path, output: &Path, opts: &DefaceOptions) -> Result<Defac
 /// keep any per-path bookkeeping (such as a cached pixel hash of the original
 /// pixels) keyed by output path.
 ///
-/// Returns a report describing each processed series.
+/// Returns a report describing each processed series. Files that were not
+/// defaced are listed in [`DefaceReport::skipped_files`] so a fail-closed caller
+/// can exclude them from upload.
 pub fn deface_dir_in_place(dir: &Path, opts: &DefaceOptions) -> Result<DefaceReport, String> {
     let files = series::collect_dicom_files(dir, opts.recursive)?;
     if files.is_empty() {
@@ -266,6 +303,7 @@ pub fn deface_dir_in_place(dir: &Path, opts: &DefaceOptions) -> Result<DefaceRep
                 group.files.len(),
                 opts.min_slices
             ));
+            report.note_skipped(group.files.iter().cloned());
             continue;
         }
 
@@ -273,14 +311,27 @@ pub fn deface_dir_in_place(dir: &Path, opts: &DefaceOptions) -> Result<DefaceRep
             Ok(v) => v,
             Err(e) => {
                 report.warnings.push(format!("series {}: {}", group.uid, e));
+                report.note_skipped(group.files.iter().cloned());
                 continue;
             }
         };
+        // `load_series` defaces only the largest orientation-consistent group;
+        // every file outside it was left untouched.
+        let used: std::collections::HashSet<&Path> =
+            entries.iter().map(|e| e.path.as_path()).collect();
+        report.note_skipped(
+            group
+                .files
+                .iter()
+                .filter(|f| !used.contains(f.as_path()))
+                .cloned(),
+        );
 
         let mask = match backend.compute_mask(&volume) {
             Ok(m) => m,
             Err(e) => {
                 report.warnings.push(format!("series {}: {}", group.uid, e));
+                report.note_skipped(entries.iter().map(|e| e.path.clone()));
                 continue;
             }
         };
@@ -320,6 +371,10 @@ pub fn deface_dir_in_place(dir: &Path, opts: &DefaceOptions) -> Result<DefaceRep
                     .first()
                     .and_then(|e| e.path.parent())
                     .map(Path::to_path_buf);
+            } else {
+                // Fail closed: a partially written series cannot be treated as
+                // defaced, so the caller must exclude all of its files.
+                report.note_skipped(entries.iter().map(|e| e.path.clone()));
             }
         }
 
@@ -335,6 +390,9 @@ pub fn deface_dir_in_place(dir: &Path, opts: &DefaceOptions) -> Result<DefaceRep
             output_dir,
         });
     }
+
+    report.skipped_files.sort();
+    report.skipped_files.dedup();
 
     if report.series.is_empty() && report.warnings.is_empty() {
         return Err("no processable series found".to_string());

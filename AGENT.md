@@ -113,14 +113,15 @@ Facial anonymisation crate (diface-rs)
   - src/viewer.rs      `--view` launcher for diviz-rs
   - src/main.rs        `diface` CLI
   - tests/             Synthetic-volume + end-to-end DICOM round-trip tests
-                       (37 tests across geometric/segmentation/atlas/series/viewer)
+                       (52 tests across geometric/segmentation/atlas/series/viewer)
 - Purpose: pixel-level removal of identifiable facial anatomy from multi-file
   CT/MR series. Metadata is left untouched so it composes with dicor-rs.
-- Design: pluggable backends. Default `geometric` thresholds the volume, keeps
+- Design: pluggable backends. `geometric` thresholds the volume, keeps
   the largest connected component, estimates the head's principal (S-I) axis
   and extents, then blanks foreground voxels anterior to a preserve ellipsoid
-  (biased posterior/superior) so brain is protected. Refuses masks above
-  `max_removed_fraction` (default 0.6).
+  (biased posterior/superior) so brain is protected. The viewer and uploader
+  default to `segmentation`; the standalone `diface` CLI defaults to `geometric`.
+  Refuses masks above `max_removed_fraction` (default 0.6).
 - Robustness: slices that disagree on ImageOrientationPatient are split into
   orientation-consistent groups and the largest group is defaced (previously the
   whole series was rejected). Verified on real data in ~/dicoms: CT head
@@ -142,10 +143,13 @@ Facial anonymisation crate (diface-rs)
   Spawned as a subprocess, so the library keeps no GUI dependencies.
 - In-viewer defacing: diviz-rs depends on diface_rs and exposes a "🙈 Deface"
   toolbar button. It builds a `diface_rs::Volume` in memory (build_deface_volume
-  in diviz-rs/src/lib.rs), runs the geometric backend, blanks the mask in a
-  copy of the active series, groups it as `<uid>-DEFACED`, and opens it in a
-  second viewport next to the original. Clicking again refreshes the copy
-  (always rebuilt from the base series, so the uid never gets double-suffixed).
+  in diviz-rs/src/lib.rs), runs the selected backend (default **segmentation**)
+  on a worker thread with a spinner and elapsed time so the window stays
+  responsive, blanks the mask in a copy of the active series, groups it as
+  `<uid>-DEFACED`, and opens it in a second viewport next to the original.
+  Clicking again (or the Align panel's **✓ Re-apply**) refreshes the copy through
+  the same worker path (always rebuilt from the base series, so the uid never
+  gets double-suffixed).
   `build_deface_volume` mirrors `diface_rs::series::load_series`: it requires
   identical dimensions, groups slices by `ImageOrientationPatient` (1e-3) and
   defaces only the **largest** orientation-consistent group, so a mixed series
@@ -236,19 +240,16 @@ Facial anonymisation crate (diface-rs)
   `SegBackendParams`, and the ambiguous `DefaceOptions.brain_protect_mm` was
   removed (it was never read). `seg_debug --protect MM` exercises it.
   Deflesh **boundary feathering**: `SegBackendParams::deflesh_smooth_mm`
-  (default 3, CLI `--deflesh-smooth`, viewer **Smooth** slider,
-  uploader `DefaceConfig::deflesh_smooth_mm`) blends the defleshed edge instead
-  of a hard wall. `feather_boundary` runs a 6-connected multi-source BFS from the
-  removed/kept boundary (seeded from kept neighbours, the volume border, and the
-  coarse `core` keep cells) and writes a per-voxel `Mask::weight` that ramps
-  0 → 1 over `deflesh_smooth_mm`. The binary `remove` flags are unchanged, so the
-  0 brain / 0 vault guarantee holds; `Mask::weight` (empty = binary) is consumed
-  by `series::write_defaced_series` and `deface_volume`, which compute
-  `orig + (fill - orig) * w`. The **in-viewer** defaced copy applies the same
-  blend via `DefaceGeometry::removal_weight_native` (previously it hard-wrote the
-  fill and ignored the weight, so the slider looked inert in the viewer). The red
-  👁 Preview overlay stays binary on purpose (it shows *which* voxels are removed,
-  not the blend). Tests
+  (library default 3; CLI, viewer and uploader default 0 for anonymisation)
+  blends the defleshed edge instead of a hard wall. `feather_boundary` runs a
+  6-connected multi-source BFS from the removed/kept boundary (seeded from kept
+  neighbours, the volume border, and the coarse `core` keep cells) and writes a
+  per-voxel `Mask::weight` that ramps 0 → 1 over `deflesh_smooth_mm`. Because the
+  weight is 0 at the keep edge, a feather deliberately retains some original
+  signal there, so the anonymisation paths use a hard cut. The in-viewer defaced
+  copy applies the same blend via `DefaceGeometry::removal_weight_native`; the
+  red 👁 Preview overlay stays binary on purpose (it shows *which* voxels are
+  removed, not the blend). Tests:
   `deflesh_smooth_feathers_the_boundary_without_changing_removal`,
   `deflesh_smoothing_blends_the_in_viewer_defaced_copy`.
   Types:
@@ -258,6 +259,14 @@ Facial anonymisation crate (diface-rs)
   segmentation_tests.rs (skull-bounded phantom; `vault_is_a_shell_that_excludes_the_face`,
   `deflesh_removes_external_tissue_and_keeps_brain` asserts 0 brain **and** 0 vault removed,
   `brain_protect_band_shrinks_removal_and_spares_the_core`).
+  `Face` mode also has optional extensions, exposed on `SegBackendParams` and in
+  the CLI/viewer/uploader: `include_orbits` (globes), `include_ears`,
+  `include_zygoma` (cheekbone/arch + lateral skull base) and `vertex_strip`
+  (default on; strips the skull cap/scalp above the ears, following the per-column
+  brain surface). `protected_core` always pads the brain/cavity seed by at least
+  one coarse cell per axis, so a `brain_protect_mm` value that rounds to zero on a
+  thick-slice axis still keeps a one-cell guard (the vault/band itself stays
+  tight, avoiding a scalp shell).
 - Head-stats stabilisation: `geometric::head_statistics_best` runs the
   in-house segmentation and restricts the principal-axis point cloud to the
   segmented head (via `head_filter`), falling back to the plain estimate if
@@ -356,6 +365,18 @@ Facial anonymisation crate (diface-rs)
     recompresses each output to **JPEG-LS lossless** via
     `dicor_rs::compress_to_jpegls` (defacing writes uncompressed), in parallel.
     Recompression is lossless, so the defaced pixels' hash is unchanged.
+  - Fail-closed: `DefaceReport::skipped_files` names every file that was not
+    defaced (series below `min_slices`, mixed-orientation leftovers, load/mask
+    errors, partial writes). The uploader moves those to `<root>/defacing_failed`
+    (a sibling of `<root>/anon`), writes a `skipped.txt` manifest and logs each
+    file, so they are never uploaded. If the deface pass itself errors, every
+    anonymised file is quarantined. Tested by
+    `undefaced_files_are_moved_out_of_the_upload_directory`.
+  - Retained descriptive fields (`StudyDescription`, `SeriesDescription`,
+    `ProtocolName`) require per-series approval before upload;
+    `ManufacturerModelName` is displayed but deliberately does not trigger review.
+    A bulk "Approve all flagged descriptive fields" button is offered. Tested by
+    `descriptive_review_ignores_manufacturer_model_alone`.
   - CRITICAL: duplicate detection must keep using the **original (pre-deface)**
     pixel hash. The anonymise loop computes `calculate_pixel_hash_from_obj` on
     the input object and records `(output_path, original_hash)`. After
@@ -367,15 +388,18 @@ Facial anonymisation crate (diface-rs)
     uploader_rs/src/upload/tests.rs (also asserts the output is JPEG-LS after
     recompression and that this is lossless).
   - The settings are carried as `DefaceConfig` (`enabled`, `backend`
-    Geometric/Segmentation, segmentation `region`, `brain_protect_mm`) via
+    Geometric/Segmentation, segmentation `region`, `include_orbits`,
+    `include_ears`, `include_zygoma`, `vertex_strip`, `brain_protect_mm`,
+    `deflesh_all`, `deflesh_smooth_mm`) via
     `QueueItem.deface` -> `enqueue_export_processing`; `DefaceConfig::to_options()`
     builds the `diface_rs::DefaceOptions` (always in place, `min_slices: 3`).
     Kept in sync with the Settings controls through
     `AppState.shared_deface: Arc<Mutex<DefaceConfig>>` for the IPC ("loaded")
-    path. The Settings panel exposes the Deface checkbox + Backend/Region/Safety
-    band. Tested by `deface_config_maps_to_backend_options` in
+    path. The Settings panel exposes the Deface checkbox + Backend/Region/all
+    segmentation options/Safety band. Tested by
+    `deface_config_maps_to_backend_options` in
     uploader_rs/src/processing_workflow_tests.rs.
-- diviz-rs tests: `mod tests` in diviz-rs/src/lib.rs (67 tests). Covers MPR
+- diviz-rs tests: `mod tests` in diviz-rs/src/lib.rs (78 tests). Covers MPR
   construction (incl. gantry tilt), defacing (incl. largest-orientation-group
   selection), viewport sync, geometry helpers, file discovery, real on-disk
   DICOM decode, and headless `eframe` UI frames via `run_headless_frame[_with]`
@@ -413,16 +437,23 @@ Current status
 - The diface-rs crate and its diviz-rs/uploader_rs integration are **committed**
   (see `git log --oneline`). Working tree is clean apart from ignored build
   artifacts.
-- Test counts: diface-rs 37, diviz-rs 67, uploader_rs 12 (11 unit + 1
+- Test counts: diface-rs 52, diviz-rs 78, uploader_rs 15 (14 unit + 1
   anonymiser integration). All green.
 - Recent fixes worth knowing:
   - `build_deface_volume` groups by `ImageOrientationPatient` and keeps the
     largest group, so the viewer matches the CLI/uploader on mixed series.
   - `--brain-protect` (segmentation safety band) is wired; the dead
     `DefaceOptions.brain_protect_mm` field was removed.
-  - The viewer Align panel exposes segmentation **Cut at** and **Safety band**.
-  - The uploader Settings panel exposes backend/region/safety band/deflesh
-    smooth via `DefaceConfig`.
+  - The viewer Align panel exposes segmentation **Cut at**, **Safety band**,
+    **Include orbits/ears**, **Remove zygoma** and **Strip vertex bone**. The
+    Re-apply button now runs on the same worker thread as the toolbar button.
+  - The uploader Settings panel exposes backend/region/orbits/ears/zygoma/vertex
+    strip/safety band/deflesh-all/smooth via `DefaceConfig`; its defaults match
+    the viewer's anonymisation defaults.
+  - Fail-closed defacing: `DefaceReport::skipped_files` is quarantined by the
+    uploader to `<root>/defacing_failed`.
+  - The deface segmentation cache is keyed by the base **series UID** (dims +
+    modality could collide across series).
   - `.github/workflows/release.yml` builds Windows and Linux bundles
     (uploader/diviz/divue/diface/notify) and publishes them on `v*` tags.
 
@@ -444,4 +475,4 @@ Next recommended work (metadata anonymiser)
 - Documentation (README) describing anonymisation policy
 
 Recorded: 2026-03-16 (metadata-anonymiser notes)
-Updated: 2026-10-04 (diface-rs + diviz/uploader defacing integration)
+Updated: 2026-11-23 (fail-closed defacing, uploader/viewer default alignment, safety-band guard)

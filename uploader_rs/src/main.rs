@@ -11,7 +11,7 @@ use dicom_viewer::{read_metadata, read_metadata_all};
 use divue_rs::run_meta_viewer;
 use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
@@ -251,6 +251,68 @@ struct QueueItem {
     tx: std_mpsc::Sender<String>,
 }
 
+/// Move files that could not be defaced out of the upload directory.
+///
+/// Defacing is fail-closed when enabled: an anonymised file whose pixels were
+/// not actually defaced must never be uploaded. Files are moved to
+/// `<root>/defacing_failed` (a sibling of `<root>/anon`), keeping them available
+/// for inspection, and a `skipped.txt` manifest is written there.
+///
+/// Returns `(quarantine_dir, moved_count, errors)`. A file that cannot be moved
+/// is deleted as a last resort (privacy over retaining an undefaced copy); if
+/// even that fails, the error is returned so the UI can warn loudly.
+fn quarantine_undefaced_files(anon_dir: &Path, files: &[PathBuf]) -> (PathBuf, usize, Vec<String>) {
+    let root = anon_dir.parent().unwrap_or_else(|| Path::new("."));
+    let quarantine = root.join("defacing_failed");
+    let mut moved = 0usize;
+    let mut errors = Vec::new();
+    let mut manifest = String::new();
+    for path in files {
+        if !path.is_file() {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(anon_dir)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| {
+                PathBuf::from(path.file_name().unwrap_or_else(|| std::ffi::OsStr::new("file")))
+            });
+        let dest = quarantine.join(&rel);
+        if let Some(parent) = dest.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                errors.push(format!("{}: {}", path.display(), e));
+                continue;
+            }
+        }
+        // Replacing an older quarantined copy is fine: this is the newest failure.
+        let _ = fs::remove_file(&dest);
+        let outcome = fs::rename(path, &dest).or_else(|_| {
+            // Normally the same filesystem; copy + delete covers mount points.
+            fs::copy(path, &dest).and_then(|_| fs::remove_file(path))
+        });
+        match outcome {
+            Ok(()) => {
+                manifest.push_str(&format!("{}\n", rel.display()));
+                moved += 1;
+            }
+            Err(_) => {
+                // Never leave an undefaced file where it can be uploaded.
+                match fs::remove_file(path) {
+                    Ok(()) => {
+                        manifest.push_str(&format!("{} (deleted)\n", rel.display()));
+                        moved += 1;
+                    }
+                    Err(e) => errors.push(format!("{}: {}", path.display(), e)),
+                }
+            }
+        }
+    }
+    if !manifest.is_empty() {
+        let _ = fs::write(quarantine.join("skipped.txt"), manifest);
+    }
+    (quarantine, moved, errors)
+}
+
 // Global processing queue + worker. Debounce is set to 2 seconds to coalesce
 // multiple quick imports into a single processing window (user requested).
 static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
@@ -391,89 +453,115 @@ static PROCESS_QUEUE: Lazy<std_mpsc::Sender<QueueItem>> = Lazy::new(|| {
                     // with the ORIGINAL pixel hash so duplicate detection is
                     // unaffected by the (intentionally) changed pixels.
                     //
-                    // TODO(fail-closed): this pass is currently fail-open. A
-                    // series that cannot be defaced (e.g. a scout/topogram,
-                    // multi-frame series, mixed-orientation group, secondary
-                    // capture/photo, SEG/RTSTRUCT) is reported as a warning and
-                    // its anonymised pixels remain uploadable. Before release we
-                    // must exclude every file that was not actually defaced (or
-                    // block the export) and surface that per file.
+                    // Fail closed: any file the defacer could not process (scout,
+                    // multi-frame, secondary capture, SEG/RTSTRUCT, the
+                    // non-largest orientation group, or a series below
+                    // `min_slices`) is moved out of the anon directory to
+                    // `<root>/defacing_failed` and therefore never uploaded.
                     if deface_cfg.enabled {
                         let _ = tx.send("PROC:STEP:Defacing facial voxels".to_string());
                         let records = hash_records.lock().map(|g| g.clone()).unwrap_or_default();
-                        let mut defaced_ok = true;
                         let deface_opts = deface_cfg.to_options();
-                        match diface_rs::deface_dir_in_place(&anon_dir, &deface_opts) {
-                            Ok(report) => {
-                                let removed: usize =
-                                    report.series.iter().map(|s| s.removed_voxels).sum();
-                                let series_n = report.series.len();
-                                for w in &report.warnings {
-                                    let _ = tx.send(format!("Deface warning: {w}"));
+                        let skipped: Vec<PathBuf> =
+                            match diface_rs::deface_dir_in_place(&anon_dir, &deface_opts) {
+                                Ok(report) => {
+                                    let removed: usize =
+                                        report.series.iter().map(|s| s.removed_voxels).sum();
+                                    let series_n = report.series.len();
+                                    for w in &report.warnings {
+                                        let _ = tx.send(format!("Deface warning: {w}"));
+                                    }
+                                    let _ = tx.send(format!(
+                                        "Defaced {series_n} series with the {} backend ({removed} voxels blanked); duplicate hashes kept from original pixels",
+                                        deface_cfg.backend.label()
+                                    ));
+                                    report.skipped_files
                                 }
-                                let _ = tx.send(format!(
-                                    "Defaced {series_n} series with the {} backend ({removed} voxels blanked); duplicate hashes kept from original pixels",
-                                    deface_cfg.backend.label()
+                                Err(e) => {
+                                    let _ = tx.send(format!("Defacing failed: {e}"));
+                                    // Fail closed: if the pass could not complete,
+                                    // no file in the anonymised directory can be
+                                    // trusted.
+                                    upload::collect_files_recursive(&anon_dir)
+                                        .into_iter()
+                                        .filter(|p| p.is_file())
+                                        .collect()
+                                }
+                            };
+
+                        if !skipped.is_empty() {
+                            let mut skipped = skipped;
+                            skipped.sort();
+                            skipped.dedup();
+                            for p in &skipped {
+                                upload::log_rpc_warn(&format!(
+                                    "Defacing skipped {}; excluded from upload",
+                                    p.display()
                                 ));
                             }
-                            Err(e) => {
-                                defaced_ok = false;
-                                let _ = tx.send(format!("Defacing failed, keeping anonymised pixels: {e}"));
+                            let (quarantine, moved, errors) =
+                                quarantine_undefaced_files(&anon_dir, &skipped);
+                            if moved > 0 {
+                                let _ = tx.send(format!(
+                                    "Defacing skipped {moved} file(s); moved to {} and excluded from upload",
+                                    quarantine.display()
+                                ));
+                            }
+                            for e in errors {
+                                let _ = tx.send(format!("Defacing quarantine error: {e}"));
                             }
                         }
-                        if defaced_ok {
-                            // Defacing rewrites pixels uncompressed; recompress
-                            // each output to JPEG-LS lossless to match the
-                            // anonymise step's output size.
-                            let _ = tx.send("PROC:STEP:Compressing defaced files".to_string());
-                            let outputs: Vec<PathBuf> = records
-                                .iter()
-                                .map(|(p, _)| p.clone())
-                                .filter(|p| p.exists())
-                                .collect();
-                            outputs.par_iter().for_each(|path| {
-                                match dicom_object::open_file(path) {
-                                    Ok(mut obj) => {
-                                        match dicor_rs::compress_to_jpegls(&mut obj) {
-                                            Ok(true) | Ok(false) => {
-                                                if let Err(e) = obj.write_to_file(path) {
-                                                    upload::log_rpc_debug(&format!(
-                                                        "recompress write failed for {}: {}",
-                                                        path.display(),
-                                                        e
-                                                    ));
-                                                }
+                        // Defacing rewrites pixels uncompressed; recompress
+                        // each output that is still present (quarantined files
+                        // were moved out above).
+                        let _ = tx.send("PROC:STEP:Compressing defaced files".to_string());
+                        let outputs: Vec<PathBuf> = records
+                            .iter()
+                            .map(|(p, _)| p.clone())
+                            .filter(|p| p.exists())
+                            .collect();
+                        outputs.par_iter().for_each(|path| {
+                            match dicom_object::open_file(path) {
+                                Ok(mut obj) => {
+                                    match dicor_rs::compress_to_jpegls(&mut obj) {
+                                        Ok(true) | Ok(false) => {
+                                            if let Err(e) = obj.write_to_file(path) {
+                                                upload::log_rpc_debug(&format!(
+                                                    "recompress write failed for {}: {}",
+                                                    path.display(),
+                                                    e
+                                                ));
                                             }
-                                            Err(e) => upload::log_rpc_debug(&format!(
-                                                "recompress failed for {}: {}",
-                                                path.display(),
-                                                e
-                                            )),
                                         }
+                                        Err(e) => upload::log_rpc_debug(&format!(
+                                            "recompress failed for {}: {}",
+                                            path.display(),
+                                            e
+                                        )),
                                     }
-                                    Err(e) => upload::log_rpc_debug(&format!(
-                                        "recompress open failed for {}: {}",
-                                        path.display(),
-                                        e
-                                    )),
                                 }
-                            });
+                                Err(e) => upload::log_rpc_debug(&format!(
+                                    "recompress open failed for {}: {}",
+                                    path.display(),
+                                    e
+                                )),
+                            }
+                        });
 
-                            // Re-cache each output's ORIGINAL pixel hash against
-                            // the defaced+recompressed file's new size/mtime. A
-                            // subsequent scan then keeps the original hash
-                            // (duplicate detection is unaffected by defacing or
-                            // recompression: JPEG-LS is lossless).
-                            for (path, hash) in records.iter() {
-                                if let Some(h) = hash {
-                                    if path.exists() {
-                                        upload::cache_pixel_hash(path, h);
-                                    }
+                        // Re-cache each output's ORIGINAL pixel hash against the
+                        // defaced+recompressed file's new size/mtime. A subsequent
+                        // scan then keeps the original hash (duplicate detection is
+                        // unaffected by defacing or recompression: JPEG-LS is
+                        // lossless).
+                        for (path, hash) in records.iter() {
+                            if let Some(h) = hash {
+                                if path.exists() {
+                                    upload::cache_pixel_hash(path, h);
                                 }
                             }
-                            // Rebuild ready metadata from the defaced files.
-                            let _ = upload::request_scan(&anon_dir, Some(tx.clone()));
                         }
+                        // Rebuild ready metadata from the defaced files only.
+                        let _ = upload::request_scan(&anon_dir, Some(tx.clone()));
                     }
                 }
 
@@ -1835,6 +1923,38 @@ impl eframe::App for AppState {
                         ready_total_files,
                         human_size(ready_total_bytes)
                     ));
+                    let pending_descriptive = self
+                        .ready_series
+                        .iter()
+                        .filter(|s| {
+                            s.descriptive_review_required
+                                && !self.descriptive_series_confirmed.contains(&s.series_uid)
+                        })
+                        .count();
+                    if pending_descriptive > 0 {
+                        if ui
+                            .button(format!(
+                                "Approve all {pending_descriptive} flagged descriptive field(s)"
+                            ))
+                            .on_hover_text(
+                                "Approve the preserved study/series/protocol text for every \
+                                 flagged series at once. Review the values shown under each \
+                                 series first.",
+                            )
+                            .clicked()
+                        {
+                            let uids: Vec<String> = self
+                                .ready_series
+                                .iter()
+                                .filter(|s| s.descriptive_review_required)
+                                .map(|s| s.series_uid.clone())
+                                .collect();
+                            self.descriptive_series_confirmed.extend(uids);
+                            self.last_msg = format!(
+                                "Approved descriptive fields for {pending_descriptive} series"
+                            );
+                        }
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("Collapse all").clicked() {
                             self.studies_collapsed = Some(false);

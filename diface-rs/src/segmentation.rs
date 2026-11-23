@@ -554,6 +554,13 @@ fn vault_from_cavity(cavity: &[u8], skull: &[u8], cd: [usize; 3], radius: u32) -
 /// a thick-slice CT does not turn a 2 mm margin into a whole-slice (~5 mm) or
 /// multi-slice band. That was leaving a shell of renderable scalp around the
 /// vault.
+///
+/// The brain/cavity seed itself is always padded by at least one coarse cell on
+/// every axis. A coordinate grid can under-estimate the brain by up to one cell;
+/// on a thick-slice scan `protect_mm` can round to zero cells along Z, so without
+/// this guard a slice of brain could become removable. Padding the seed (rather
+/// than the vault) keeps the guard inside the skull and does not reintroduce the
+/// scalp shell.
 fn protected_core(
     cavity: &[u8],
     vault: &[u8],
@@ -573,14 +580,23 @@ fn protected_core(
             core[i] = 1;
         }
     }
+    // At least one cell around the intracranial contents, independent of how the
+    // physical band rounds on this axis.
+    let seed_guard = dilate_axes(seed, cd, [1, 1, 1]);
+    for (i, &g) in seed_guard.iter().enumerate() {
+        if g != 0 {
+            core[i] = 1;
+        }
+    }
     // `0` means no extra padding (the caller wants the tightest core); a
     // positive value widens it by that many millimetres.
     let band_mm = protect_mm.max(0.0);
     dilate_axes(&core, cd, cell_radius(band_mm, stride, spacing))
 }
 
-/// Per-axis cell counts for a physical distance (nearest cell, not rounded up,
-/// so a band cannot balloon on thick slices).
+/// Per-axis cell counts for a physical distance (nearest cell). A small margin
+/// on a thick slice maps to zero cells; [`protected_core`] adds its own one-cell
+/// seed guard so the brain is still padded.
 fn cell_radius(mm: f64, stride: [usize; 3], spacing: [f64; 3]) -> [usize; 3] {
     let mut r = [0usize; 3];
     for a in 0..3 {
@@ -2061,9 +2077,10 @@ pub fn masks_to_volume(seg: &Segmentation, volume: &Volume) -> (Mask, Mask) {
 
 /// Build a full-resolution [`Mask`] of the **protected intracranial core**:
 /// the segmented cavity ∪ vault (plus the brain if there is no cavity/vault),
-/// padded by a physical `protect_mm` safety band so the cut keeps clear of the
-/// brain and vault. The padding is per-axis in millimetres, so thick CT slices do
-/// not turn a 2 mm margin into a whole-slice band.
+/// padded by a physical `protect_mm` safety band (and always by at least one
+/// coarse cell around the brain/cavity) so the cut keeps clear of the brain and
+/// vault. The padding is per-axis in millimetres, so thick CT slices do not turn
+/// a 2 mm margin into a whole-slice band.
 ///
 /// A defacing mask from *any* backend can be made brain-safe by clearing the
 /// voxels set here. Returns `Ok(None)` when no brain could be segmented (so the
@@ -2189,6 +2206,9 @@ pub struct SegBackendParams {
     /// (except for the explicit vertex strip, which removes superior vault bone
     /// while still guarding the brain/CSF). Larger values are safer (and remove
     /// slightly less face); `0` disables the extra band. Default `2.0`.
+    /// Independently of this value, the brain/cavity seed is always padded by at
+    /// least one coarse cell on every axis, so a band that rounds to zero on a
+    /// thick-slice scan cannot expose the brain.
     pub brain_protect_mm: f64,
     /// Feather width (mm) for [`MaskRegion::ExternalSoftTissue`] ("deflesh").
     /// Instead of a hard binary wall at the keep boundary, removed voxels within
@@ -2802,7 +2822,7 @@ pub fn brain_anterior_axis(stats_anterior: V3) -> V3 {
 
 #[cfg(test)]
 mod morph_tests {
-    use super::{dilate, erode};
+    use super::{cell_radius, dilate, erode, protected_core};
 
     /// Straightforward per-cell reference implementation of the 6-connected
     /// (L1/diamond) morphology the distance-transform passes must reproduce.
@@ -2881,6 +2901,32 @@ mod morph_tests {
         grid[(2 * 5 + 2) * 5 + 2] = 1;
         let out = dilate(&grid, cd, 1);
         assert_eq!(out.iter().filter(|&&v| v != 0).count(), 7);
+    }
+
+    #[test]
+    fn protected_core_pads_the_brain_on_a_thick_slice_axis() {
+        let cd = [5, 5, 5];
+        let idx = |x: usize, y: usize, z: usize| (z * cd[1] + y) * cd[0] + x;
+        let mut brain = vec![0u8; 125];
+        brain[idx(2, 2, 2)] = 1;
+        let cavity = vec![0u8; 125];
+        let vault = vec![0u8; 125];
+
+        // A 2 mm band on 5 mm through-plane cells rounds to zero cells; the
+        // seed guard must still keep one cell above and below the brain.
+        assert_eq!(cell_radius(2.0, [1, 1, 1], [1.0, 1.0, 5.0])[2], 0);
+        let core = protected_core(
+            &cavity,
+            &vault,
+            &brain,
+            cd,
+            [1, 1, 1],
+            [1.0, 1.0, 5.0],
+            2.0,
+        );
+        assert_eq!(core[idx(2, 2, 1)], 1, "one cell below the brain is guarded");
+        assert_eq!(core[idx(2, 2, 3)], 1, "one cell above the brain is guarded");
+        assert_eq!(core[idx(2, 2, 0)], 0, "the guard stays local");
     }
 
     #[test]
