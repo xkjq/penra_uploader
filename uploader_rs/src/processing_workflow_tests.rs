@@ -129,8 +129,8 @@ fn test_multiple_files_and_repeated_exports() {
     // Batch A
     let a1 = export.join("a1.dcm");
     let a2 = export.join("a2.dcm");
-    make_minimal_dcm(&a1, "2.25.A1", "Alice^A");
-    make_minimal_dcm(&a2, "2.25.A2", "Alice^B");
+    make_minimal_dcm(&a1, "2.25.1001", "Alice^A");
+    make_minimal_dcm(&a2, "2.25.1002", "Alice^B");
 
     // Prepare AppState and channel
     let mut app = AppState::default();
@@ -145,8 +145,8 @@ fn test_multiple_files_and_repeated_exports() {
     std::thread::sleep(Duration::from_millis(300));
     let b1 = export.join("b1.dcm");
     let b2 = export.join("b2.dcm");
-    make_minimal_dcm(&b1, "2.25.B1", "Bob^A");
-    make_minimal_dcm(&b2, "2.25.B2", "Bob^B");
+    make_minimal_dcm(&b1, "2.25.2001", "Bob^A");
+    make_minimal_dcm(&b2, "2.25.2002", "Bob^B");
     app.trigger_process_export();
 
     // Wait up to 30s for anonymizations
